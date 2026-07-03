@@ -11,8 +11,9 @@ Changes v3:
   - All previous features preserved
 """
 
-import os, math, sqlite3, hashlib, secrets, calendar, smtplib, base64, io, zipfile, csv, re, tempfile
+import os, math, sqlite3, hashlib, secrets, calendar, smtplib, base64, io, zipfile, csv, re, tempfile, html
 import requests as http_req
+from urllib.parse import quote as urlquote
 from datetime import date, datetime, timezone, timedelta
 from functools import wraps
 from email.mime.text import MIMEText
@@ -407,6 +408,17 @@ def init_db():
     CREATE TABLE IF NOT EXISTS Users (
         user_id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE, pw_hash TEXT, role TEXT, created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS FollowUp (
+        followup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        loan_id INTEGER,
+        follow_up_date TEXT,
+        remarks TEXT,
+        status TEXT DEFAULT 'Pending',
+        created_by TEXT,
+        created_at TEXT,
+        resolved_at TEXT,
+        FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
     )
     """)
     for m in [
@@ -451,6 +463,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_loan_vehicle_number ON LoanEntry(vehicle_number)",
         "CREATE INDEX IF NOT EXISTS idx_customers_loan_id ON Customers(loan_id)",
         "CREATE INDEX IF NOT EXISTS idx_customers_status ON Customers(status)",
+        "CREATE INDEX IF NOT EXISTS idx_followup_loan_id ON FollowUp(loan_id)",
+        "CREATE INDEX IF NOT EXISTS idx_followup_status ON FollowUp(status)",
     ]:
         try: cur.execute(idx)
         except: pass
@@ -655,6 +669,58 @@ def group_alerts_by_loan(emi_list):
         if e["due_date"] < grouped[ln]["oldest_due"]:
             grouped[ln]["oldest_due"] = e["due_date"]
     return list(grouped.values())
+
+def _location_link(loc):
+    """Render a saved GPS/location string as a clickable Google Maps link."""
+    loc = (loc or "").strip()
+    if not loc: return "—"
+    if re.match(r'^-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+$', loc):
+        url = f"https://www.google.com/maps?q={urlquote(loc)}"
+    else:
+        url = f"https://www.google.com/maps/search/{urlquote(loc)}"
+    return f'<a href="{url}" target="_blank" rel="noopener">📍 {html.escape(loc)}</a>'
+
+# ── Follow Up (customer-requested collection date) ──────────────────────────────
+def add_follow_up(loan_id, follow_up_date, remarks, created_by):
+    c = get_cur(); now = datetime.now(timezone.utc).isoformat()
+    c.execute("""INSERT INTO FollowUp (loan_id,follow_up_date,remarks,status,created_by,created_at)
+                 VALUES (?,?,?,?,?,?)""",
+              (loan_id, follow_up_date, remarks.strip(), "Pending", created_by, now))
+    get_db().commit()
+
+def resolve_follow_up(followup_id):
+    c = get_cur(); now = datetime.now(timezone.utc).isoformat()
+    c.execute("UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE followup_id=?", (now, followup_id))
+    get_db().commit()
+
+def get_active_follow_ups_map():
+    """Latest PENDING follow-up per loan_id — used to badge the Alerts page."""
+    c = get_cur()
+    c.execute("""SELECT f.* FROM FollowUp f
+                 INNER JOIN (SELECT loan_id, MAX(created_at) as mx FROM FollowUp
+                             WHERE status='Pending' GROUP BY loan_id) latest
+                 ON f.loan_id=latest.loan_id AND f.created_at=latest.mx""")
+    return {r["loan_id"]: dict(r) for r in c.fetchall()}
+
+def list_follow_ups(search=""):
+    q = f"%{search}%"; c = get_cur()
+    c.execute("""SELECT f.followup_id, f.loan_id, f.follow_up_date, f.remarks, f.status,
+                        f.created_by, f.created_at, f.resolved_at,
+                        le.loan_number, le.customer_name, le.customer_mobile,
+                        le.customer_address, le.customer_location
+                 FROM FollowUp f JOIN LoanEntry le ON f.loan_id=le.id
+                 WHERE le.loan_number LIKE ? OR le.customer_name LIKE ? OR le.customer_mobile LIKE ?
+                 ORDER BY (f.status='Pending') DESC, f.follow_up_date ASC""", (q, q, q))
+    rows = [dict(r) for r in c.fetchall()]
+    today_s = date.today().isoformat()
+    for r in rows:
+        c2 = get_cur()
+        c2.execute("""SELECT SUM(COALESCE(remaining_amount,emi_amount)) as amt FROM EMI
+                      WHERE loan_id=? AND (status='Overdue' OR (status IN ('Pending','Partial') AND due_date<?))""",
+                   (r["loan_id"], today_s))
+        row2 = c2.fetchone()
+        r["overdue_amount"] = float(((row2["amt"] if row2 else 0) or 0))
+    return rows
 
 def get_loan_summary_counts():
     today = date.today().isoformat()
@@ -1061,6 +1127,14 @@ tr.row-paid td{opacity:.65;}
 .alert-info{background:#dbeafe;color:#1e40af;border:1px solid #93c5fd;}
 .alert-warning{background:#fef3c7;color:#92400e;border:1px solid #fde68a;}
 
+/* ── FOLLOW-UP MODAL ── */
+.fu-modal-overlay{position:fixed;inset:0;background:rgba(15,23,42,.55);
+  z-index:500;display:none;align-items:center;justify-content:center;padding:16px;}
+.fu-modal-overlay.open{display:flex;}
+.fu-modal{background:var(--surface);border-radius:12px;padding:22px;
+  width:100%;max-width:420px;box-shadow:0 10px 40px rgba(0,0,0,.3);}
+.fu-modal h3{font-size:16px;margin-bottom:4px;color:var(--accent);}
+
 /* ── DUE PREVIEW ── */
 .due-preview{background:linear-gradient(135deg,#1a4fad,#1d6fdb);color:#fff;
              border-radius:10px;padding:16px 20px;margin:14px 0;display:none;}
@@ -1232,6 +1306,7 @@ def _nav_links(role, active):
     if can_approve: links += lnk("/approval","✅","Approval","approval")
     links += lnk("/customers","👥","Customers","customers")
     links += lnk("/alerts","🔔","Alerts","alerts")
+    links += lnk("/followup","📞","Follow Up","followup")
     links += lnk("/closed","🔒","Closed","closed")
     links += lnk("/rejected","❌","Rejected","rejected")
     links += lnk("/calculator","🧮","Calculator","calculator")
@@ -2689,6 +2764,23 @@ def alerts():
     # Group overdue by loan number
     od_grouped = group_alerts_by_loan(od)
     up_grouped = group_alerts_by_loan(up)
+    fu_map = get_active_follow_ups_map()
+
+    def fu_cell(loan_id, loan_number, customer_name):
+        fu = fu_map.get(loan_id)
+        btn = (f'<button type="button" class="btn btn-sm fu-btn" '
+               f'style="background:var(--surface2);color:var(--text);margin-top:4px;" '
+               f'data-loan-id="{loan_id}" data-loan-number="{html.escape(loan_number)}" '
+               f'data-customer="{html.escape(customer_name)}">'
+               f'{"✏️ Update" if fu else "📅 Follow Up"}</button>')
+        if not fu:
+            return btn
+        fu_date = parse_date(fu["follow_up_date"])
+        overdue_badge = ' <span class="badge badge-overdue">missed</span>' if fu_date < today else ''
+        return (f'<div style="font-size:11.5px;max-width:180px;">'
+                f'<span class="badge badge-partial">📅 {fu["follow_up_date"]}</span>{overdue_badge}'
+                f'<div style="color:var(--muted);margin-top:2px;white-space:normal;">{html.escape(fu["remarks"])}</div>'
+                f'{btn}</div>')
 
     od_rows = ""
     for g in od_grouped:
@@ -2700,6 +2792,7 @@ def alerts():
           <td>{g['oldest_due']}</td>
           <td><b style="color:var(--red);">₹{g['total_due']:,.2f}</b></td>
           <td><b style="color:var(--red);">{oldest_days} days</b></td>
+          <td>{fu_cell(g['loan_id'], g['loan_number'], g['customer_name'])}</td>
           <td><a class="btn btn-sm btn-danger" href="/emis/{g['lid']}">💳 Pay</a></td>
         </tr>"""
 
@@ -2713,6 +2806,7 @@ def alerts():
           <td>{g['oldest_due']}</td>
           <td><b style="color:var(--amber);">₹{g['total_due']:,.2f}</b></td>
           <td><b style="color:var(--amber);">in {days_left} days</b></td>
+          <td>{fu_cell(g['loan_id'], g['loan_number'], g['customer_name'])}</td>
           <td><a class="btn btn-sm btn-amber" href="/emis/{g['lid']}">📋 View</a></td>
         </tr>"""
 
@@ -2724,11 +2818,12 @@ def alerts():
         <small style="font-size:13px;color:var(--muted);">Total: ₹{sum(g['total_due'] for g in od_grouped):,.2f}</small></h2>
       <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">
         Each row = one loan. Amount shown is cumulative of all overdue EMIs for that loan.
+        Use <b>Follow Up</b> if the customer asked to collect on another date — it will also appear on the Follow Up tab.
       </p>
       <div class="table-wrap"><table>
         <tr><th>Loan #</th><th>Customer</th><th>EMIs Due</th><th>Oldest Due</th>
-            <th>Total Due Amt</th><th>Days Overdue</th><th>Action</th></tr>
-        {od_rows or '<tr><td colspan="7" style="color:var(--green);text-align:center;background:#d1fae5;">✅ No overdue EMIs!</td></tr>'}
+            <th>Total Due Amt</th><th>Days Overdue</th><th>Follow Up</th><th>Action</th></tr>
+        {od_rows or '<tr><td colspan="8" style="color:var(--green);text-align:center;background:#d1fae5;">✅ No overdue EMIs!</td></tr>'}
       </table></div>
     </div>
     <div class="card">
@@ -2739,11 +2834,122 @@ def alerts():
       </p>
       <div class="table-wrap"><table>
         <tr><th>Loan #</th><th>Customer</th><th>EMIs</th><th>First Due</th>
-            <th>Total Amount</th><th>Due In</th><th>Action</th></tr>
-        {up_rows or '<tr><td colspan="7" style="color:var(--green);text-align:center;background:#d1fae5;">✅ No upcoming EMIs in 10 days.</td></tr>'}
+            <th>Total Amount</th><th>Due In</th><th>Follow Up</th><th>Action</th></tr>
+        {up_rows or '<tr><td colspan="8" style="color:var(--green);text-align:center;background:#d1fae5;">✅ No upcoming EMIs in 10 days.</td></tr>'}
+      </table></div>
+    </div>
+
+    <!-- Follow Up modal -->
+    <div class="fu-modal-overlay" id="fuModal">
+      <div class="fu-modal">
+        <h3>📅 Follow Up</h3>
+        <p id="fuModalLoanInfo" style="font-size:12px;color:var(--muted);margin-bottom:12px;"></p>
+        <form method="POST" action="/followup/add">
+          <input type="hidden" name="loan_id" id="fu_loan_id">
+          <input type="hidden" name="next" value="/alerts">
+          <div class="form-group">
+            <label>Date Customer Asked To Collect *</label>
+            <input type="date" name="follow_up_date" id="fu_date" required min="{today.isoformat()}">
+          </div>
+          <div class="form-group" style="margin-top:12px;">
+            <label>Remarks *</label>
+            <textarea name="remarks" rows="3" required placeholder="e.g. Customer asked to collect next Monday, salary delayed"></textarea>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">
+            <button type="button" class="btn" style="background:var(--surface2);color:var(--text);" onclick="fuCloseModal()">Cancel</button>
+            <button class="btn btn-primary">💾 Save Follow Up</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <script>
+    function fuCloseModal(){{ document.getElementById('fuModal').classList.remove('open'); }}
+    document.querySelectorAll('.fu-btn').forEach(function(btn){{
+      btn.addEventListener('click', function(){{
+        document.getElementById('fu_loan_id').value = btn.dataset.loanId;
+        document.getElementById('fuModalLoanInfo').textContent = btn.dataset.loanNumber + ' — ' + btn.dataset.customer;
+        document.getElementById('fuModal').classList.add('open');
+      }});
+    }});
+    document.getElementById('fuModal').addEventListener('click', function(e){{
+      if(e.target === this) fuCloseModal();
+    }});
+    </script>"""
+    return page("Alerts", content, "alerts")
+
+@app.route("/followup/add", methods=["POST"])
+@login_required
+def followup_add():
+    loan_id = int(request.form["loan_id"])
+    fdate   = request.form.get("follow_up_date","").strip()
+    remarks = request.form.get("remarks","").strip()
+    nxt     = request.form.get("next") or "/followup"
+    if not fdate or not remarks:
+        flash("Follow-up date and remarks are required.","danger")
+        return redirect(nxt)
+    add_follow_up(loan_id, fdate, remarks, session.get("username",""))
+    flash("Follow-up saved.","success")
+    return redirect(nxt)
+
+@app.route("/followup/resolve/<int:followup_id>", methods=["POST"])
+@login_required
+def followup_resolve(followup_id):
+    resolve_follow_up(followup_id)
+    flash("Follow-up marked as resolved.","success")
+    return redirect(request.form.get("next") or url_for("followups"))
+
+# ── Follow Up (all customers, all loans) ────────────────────────────────────────
+@app.route("/followup")
+@login_required
+def followups():
+    q = request.args.get("q","")
+    items = list_follow_ups(q)
+    today = date.today()
+    rows = ""
+    for r in items:
+        fu_date = parse_date(r["follow_up_date"])
+        if r["status"] == "Resolved":
+            status_badge = '<span class="badge badge-closed">✅ Resolved</span>'
+        elif fu_date < today:
+            status_badge = '<span class="badge badge-overdue">⏰ Missed</span>'
+        else:
+            status_badge = '<span class="badge badge-pending">📅 Pending</span>'
+        resolve_btn = "" if r["status"] == "Resolved" else f"""
+          <form method="POST" action="/followup/resolve/{r['followup_id']}" style="display:inline;">
+            <input type="hidden" name="next" value="/followup?q={q}">
+            <button class="btn btn-sm btn-success">✔ Resolve</button>
+          </form>"""
+        rows += f"""<tr>
+          <td><b><a href="/emis/{r['loan_id']}" style="color:var(--accent);">{r['loan_number']}</a></b></td>
+          <td>{r['customer_name']}</td>
+          <td>{r.get('customer_mobile') or '—'}</td>
+          <td style="white-space:normal;max-width:180px;">{r.get('customer_address') or '—'}</td>
+          <td>{_location_link(r.get('customer_location'))}</td>
+          <td><b style="color:var(--red);">₹{r['overdue_amount']:,.2f}</b></td>
+          <td>{r['follow_up_date']}</td>
+          <td style="white-space:normal;max-width:220px;">{r['remarks']}</td>
+          <td>{status_badge}</td>
+          <td>{r.get('created_by') or ''}</td>
+          <td>{resolve_btn}</td>
+        </tr>"""
+    content = f"""
+    <h1>📞 Follow Up</h1>
+    <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;">
+      <input name="q" value="{q}" placeholder="Search loan / customer / mobile…" style="max-width:280px;">
+      <button class="btn btn-primary btn-sm">Search</button>
+    </form>
+    <div class="card">
+      <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">
+        Every follow-up saved from the Alerts page — customer-requested collection dates and remarks,
+        with contact, address and location, across all loans.
+      </p>
+      <div class="table-wrap"><table>
+        <tr><th>Loan #</th><th>Customer</th><th>Mobile</th><th>Address</th><th>Location</th>
+            <th>Overdue Amt</th><th>Follow-up Date</th><th>Remarks</th><th>Status</th><th>By</th><th>Action</th></tr>
+        {rows or '<tr><td colspan="11" style="text-align:center;color:var(--muted);">No follow-ups recorded yet.</td></tr>'}
       </table></div>
     </div>"""
-    return page("Alerts", content, "alerts")
+    return page("Follow Up", content, "followup")
 
 # ── Closed / Rejected ──────────────────────────────────────────────────────────
 @app.route("/closed")
@@ -4064,7 +4270,7 @@ def emi_edit(emi_id):
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATABASE MANAGER (Super Admin only)
 # ══════════════════════════════════════════════════════════════════════════════
-DB_TABLES = ["LoanEntry","Customers","EMI","RejectedLoans","ClosedLoans","Users"]
+DB_TABLES = ["LoanEntry","Customers","EMI","RejectedLoans","ClosedLoans","Users","FollowUp"]
 
 @app.route("/database")
 @login_required
