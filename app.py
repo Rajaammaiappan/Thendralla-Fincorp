@@ -361,6 +361,7 @@ def init_db():
         interest_rate REAL,
         tenure INTEGER,
         start_date TEXT,
+        loan_date TEXT,
         status TEXT,
         created_at TEXT,
         attachment TEXT,
@@ -441,6 +442,7 @@ def init_db():
         "ALTER TABLE LoanEntry ADD COLUMN custom_emi_amount REAL",
         "ALTER TABLE LoanEntry ADD COLUMN aadhar_number TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN vehicle_name TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN loan_date TEXT",
     ]:
         try: cur.execute(m)
         except: pass
@@ -491,20 +493,20 @@ def create_loan(ln, cname, cmobile, caddr, cloc,
                 vtype, vnum, vmodel, vname, eng, chas, vcol,
                 amt, rate_raw, tenure, sdate, aadhar="", cemail="",
                 gname="", gaddr="", gmob="", is_reloan=0, reloan_ref="",
-                remarks="", attachment="", custom_emi_amount=None):
+                remarks="", attachment="", custom_emi_amount=None, loan_date=None):
     r = normalize_interest(rate_raw)
     if r is None: raise ValueError("Invalid interest rate")
     c = get_cur()
     c.execute("""INSERT INTO LoanEntry
                  (loan_number,customer_name,customer_mobile,customer_address,customer_location,
                   vehicle_type,vehicle_number,vehicle_model,vehicle_name,engine_number,chassis_number,vehicle_colour,
-                  loan_amount,interest_rate,tenure,start_date,status,created_at,
+                  loan_amount,interest_rate,tenure,start_date,loan_date,status,created_at,
                   attachment,aadhar_number,customer_email,guarantor_name,guarantor_address,guarantor_mobile,
                   is_reloan,reloan_ref,remarks,custom_emi_amount)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
               (ln,cname,cmobile,caddr,cloc,
                vtype,vnum,vmodel,vname,eng,chas,vcol,
-               float(amt),float(r),int(tenure),sdate,"PendingApproval",
+               float(amt),float(r),int(tenure),sdate,loan_date or sdate,"PendingApproval",
                datetime.now(timezone.utc).isoformat(),
                attachment or None,aadhar,cemail,gname,gaddr,gmob,int(is_reloan),reloan_ref,
                remarks,
@@ -1854,6 +1856,22 @@ def add_loan():
         attachment = f.get("attachment","").strip()
         # Back-compat: if someone somehow posted a file, ignore it gracefully
 
+        # Validate Loan Date (disbursal date) — mandatory, cannot be a future date
+        loan_date_str = f.get("loan_date","").strip()
+        if not loan_date_str:
+            flash("Loan Date is mandatory.","danger")
+            return redirect(url_for("add_loan"))
+        try:
+            loan_date_val = datetime.strptime(loan_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            flash("Invalid Loan Date.","danger")
+            return redirect(url_for("add_loan"))
+        if loan_date_val > date.today():
+            flash("Loan Date cannot be a future date.","danger")
+            return redirect(url_for("add_loan"))
+        # EMI Start Date is always one month after the Loan Date (same day)
+        emi_start_date = add_months(loan_date_val, 1)
+
         # Resolve interest rate depending on calc_mode
         calc_mode = f.get("calc_mode","rate")
         if calc_mode == "emi":
@@ -1873,12 +1891,13 @@ def add_loan():
                 f["customer_address"], f.get("customer_location",""),
                 f["vehicle_type"], vehicle_number_clean, f["vehicle_model"], f.get("vehicle_name",""),
                 f["engine_number"], f["chassis_number"], f["vehicle_colour"],
-                f["loan_amount"], interest_rate_val, f["tenure"], f["start_date"],
+                f["loan_amount"], interest_rate_val, f["tenure"], emi_start_date.isoformat(),
                 aadhar, f.get("customer_email",""),
                 f.get("guarantor_name",""), f.get("guarantor_address",""), f.get("guarantor_mobile",""),
                 1 if f.get("is_reloan")=="yes" else 0, f.get("reloan_ref",""),
                 f.get("remarks",""), attachment,
-                f.get("custom_emi_amount","") if f.get("emi_mode")=="manual" else None
+                f.get("custom_emi_amount","") if f.get("emi_mode")=="manual" else None,
+                loan_date_val.isoformat()
             )
             flash("Loan submitted for approval.","success")
             return redirect(url_for("loans"))
@@ -1900,8 +1919,13 @@ def add_loan():
           <input name="loan_number" value="{next_ln}" readonly>
         </div>
         <div class="form-group">
-          <label>Start Date *</label>
-          <input type="date" name="start_date" value="{date.today().isoformat()}" required>
+          <label>Loan Date * <span style="font-size:10px;color:var(--muted);">(date loan disbursed — cannot be future)</span></label>
+          <input type="date" name="loan_date" id="loan_date" value="{date.today().isoformat()}"
+                 max="{date.today().isoformat()}" required oninput="updateEmiStartDate()">
+        </div>
+        <div class="form-group">
+          <label>EMI Start Date <span style="font-size:10px;color:var(--muted);">(auto: 1 month after Loan Date)</span></label>
+          <input type="date" id="emi_start_date_display" readonly style="background:var(--surface2);color:var(--muted);">
         </div>
 
         <!-- EMI Smart Calculator Mode -->
@@ -2195,6 +2219,24 @@ def add_loan():
         document.getElementById('gps_status').textContent = '';
       }}
     }}
+
+    /* ── EMI Start Date auto-calc (Loan Date + 1 month, same day) ─────────── */
+    function addMonthsJS(dateStr, months){{
+      const d = new Date(dateStr + 'T00:00:00');
+      const day = d.getDate();
+      d.setDate(1);
+      d.setMonth(d.getMonth() + months);
+      const lastDay = new Date(d.getFullYear(), d.getMonth()+1, 0).getDate();
+      d.setDate(Math.min(day, lastDay));
+      return d.toISOString().slice(0,10);
+    }}
+    function updateEmiStartDate(){{
+      const ld = document.getElementById('loan_date').value;
+      if(ld){{
+        document.getElementById('emi_start_date_display').value = addMonthsJS(ld, 1);
+      }}
+    }}
+    updateEmiStartDate();
 
     /* ── Reloan helpers ───────────────────────────────────────────────────── */
     function toggleReloan(v){{
