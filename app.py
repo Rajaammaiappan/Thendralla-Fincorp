@@ -710,7 +710,7 @@ def list_follow_ups(search=""):
                         le.customer_address, le.customer_location
                  FROM FollowUp f JOIN LoanEntry le ON f.loan_id=le.id
                  WHERE le.loan_number LIKE ? OR le.customer_name LIKE ? OR le.customer_mobile LIKE ?
-                 ORDER BY (f.status='Pending') DESC, f.follow_up_date ASC""", (q, q, q))
+                 ORDER BY f.follow_up_date ASC""", (q, q, q))
     rows = [dict(r) for r in c.fetchall()]
     today_s = date.today().isoformat()
     for r in rows:
@@ -2912,10 +2912,16 @@ def followups():
     rows = ""
     for r in items:
         fu_date = parse_date(r["follow_up_date"])
+        days_left = (fu_date - today).days
+        row_cls = ""
         if r["status"] == "Resolved":
             status_badge = '<span class="badge badge-closed">✅ Resolved</span>'
         elif fu_date < today:
             status_badge = '<span class="badge badge-overdue">⏰ Missed</span>'
+            row_cls = "row-overdue"
+        elif days_left <= 2:
+            status_badge = '<span class="badge badge-pending">📅 Pending</span>'
+            row_cls = "row-upcoming"
         else:
             status_badge = '<span class="badge badge-pending">📅 Pending</span>'
         resolve_btn = "" if r["status"] == "Resolved" else f"""
@@ -2924,7 +2930,7 @@ def followups():
             <button class="btn btn-sm btn-success">✔ Resolve</button>
           </form>"""
         pay_btn = f'<a class="btn btn-sm btn-danger" href="/emis/{r["loan_id"]}">💳 Pay</a>'
-        rows += f"""<tr>
+        rows += f"""<tr class="{row_cls}">
           <td><b><a href="/emis/{r['loan_id']}" style="color:var(--accent);">{r['loan_number']}</a></b></td>
           <td>{r['customer_name']}</td>
           <td>{r.get('customer_mobile') or '—'}</td>
@@ -2937,6 +2943,15 @@ def followups():
           <td>{r.get('created_by') or ''}</td>
           <td style="white-space:nowrap;display:flex;gap:6px;">{pay_btn}{resolve_btn}</td>
         </tr>"""
+    legend = """
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px;font-size:12px;">
+      <span style="display:flex;align-items:center;gap:4px;">
+        <span style="width:14px;height:14px;background:#fee2e2;border-left:3px solid #dc2626;display:inline-block;"></span> Missed (date passed)
+      </span>
+      <span style="display:flex;align-items:center;gap:4px;">
+        <span style="width:14px;height:14px;background:#fef9c3;border-left:3px solid #d97706;display:inline-block;"></span> Due within 2 days
+      </span>
+    </div>"""
     content = f"""
     <h1>📞 Follow Up</h1>
     <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;">
@@ -2946,8 +2961,9 @@ def followups():
     <div class="card">
       <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">
         Every follow-up saved from the Alerts page — customer-requested collection dates and remarks,
-        with contact, address and location, across all loans.
+        with contact, address and location, across all loans. Rows are ordered by follow-up date.
       </p>
+      {legend}
       <div class="table-wrap"><table>
         <tr><th>Loan #</th><th>Customer</th><th>Mobile</th><th>Address</th><th>Location</th>
             <th>Overdue Amt</th><th>Follow-up Date</th><th>Remarks</th><th>Status</th><th>By</th><th>Action</th></tr>
