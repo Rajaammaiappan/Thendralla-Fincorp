@@ -11,7 +11,7 @@ Changes v3:
   - All previous features preserved
 """
 
-import os, math, sqlite3, hashlib, secrets, calendar, smtplib, base64, io, zipfile, csv, re
+import os, math, sqlite3, hashlib, secrets, calendar, smtplib, base64, io, zipfile, csv, re, tempfile
 import requests as http_req
 from datetime import date, datetime, timezone, timedelta
 from functools import wraps
@@ -724,7 +724,7 @@ def _send_sms(mobile, message):
         resp = http_req.post(
             "https://www.fast2sms.com/dev/bulkV2",
             headers={
-                "authorization": SMS_CONFIG["api_key"],
+                "authorization": _get_sms_key(),
                 "Content-Type":  "application/x-www-form-urlencoded",
                 "Cache-Control": "no-cache",
             },
@@ -757,7 +757,7 @@ def _send_sms_bulk(mobiles, message):
         resp = http_req.post(
             "https://www.fast2sms.com/dev/bulkV2",
             headers={
-                "authorization": SMS_CONFIG["api_key"],
+                "authorization": _get_sms_key(),
                 "Content-Type":  "application/x-www-form-urlencoded",
                 "Cache-Control": "no-cache",
             },
@@ -1709,7 +1709,7 @@ def loans():
 # ── Add Loan ───────────────────────────────────────────────────────────────────
 @app.route("/loan/add", methods=["GET","POST"])
 @login_required
-@role_required("admin","manager","fieldpia")
+@role_required("superadmin","admin","manager","fieldpia")
 def add_loan():
     if request.method == "POST":
         f = request.form
@@ -2237,7 +2237,7 @@ def api_next_loan_number():
 # ── Approval ───────────────────────────────────────────────────────────────────
 @app.route("/approval", methods=["GET","POST"])
 @login_required
-@role_required("admin")
+@role_required("superadmin","admin")
 def approval():
     if request.method == "POST":
         lid = int(request.form["loan_id"]); action = request.form["action"]
@@ -2665,7 +2665,7 @@ def emis(loan_id):
 
 @app.route("/emi/pay", methods=["POST"])
 @login_required
-@role_required("admin","manager","fieldpia")
+@role_required("superadmin","admin","manager","fieldpia")
 def emi_pay():
     emi_id  = int(request.form["emi_id"])
     loan_id = int(request.form["loan_id"])
@@ -2789,7 +2789,7 @@ def rejected():
 @app.route("/calculator", methods=["GET"])
 @login_required
 def calculator():
-    content = """
+    content = f"""
     <h1>🧮 Loan Calculator</h1>
 
     <div class="card">
@@ -3044,13 +3044,13 @@ def calculator():
 # ── Report ─────────────────────────────────────────────────────────────────────
 @app.route("/report", methods=["GET","POST"])
 @login_required
-@role_required("admin","manager","viewer")
+@role_required("superadmin","admin","manager","viewer")
 def report():
     if request.method == "POST":
         if not REPORTLAB_AVAILABLE:
             flash("reportlab not installed. Run: pip install reportlab","danger")
             return redirect(url_for("report"))
-        path = "/tmp/tfc_loan_report.pdf"
+        path = os.path.join(tempfile.gettempdir(), "tfc_loan_report.pdf")
         try:
             generate_pdf(path)
             return send_file(path, as_attachment=True, download_name="tfc_loan_report.pdf", mimetype="application/pdf")
