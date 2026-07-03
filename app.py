@@ -1367,6 +1367,9 @@ const TFC_TOPICS = [
   {label:"📅 Today Summary",     needs:null, direct:"today summary"},
   {label:"📆 This Week Insights", needs:null, direct:"this week insights"},
   {label:"👥 Customer Stats",    needs:null, direct:"how many customers"},
+  {label:"📞 Follow Up Summary", needs:null, direct:"follow up summary"},
+  {label:"📅 Follow Ups Today",  needs:null, direct:"follow ups today"},
+  {label:"⏰ Missed Follow Ups", needs:null, direct:"missed follow ups"},
 ];
 const TFC_PERIODS = ["This Week","This Month","Next Month","Last Month","This Quarter","Next Quarter","Last Quarter","This Year","Next Year"];
 const TFC_COUNTS = ["3","5","10","20"];
@@ -1521,6 +1524,7 @@ document.querySelectorAll('.sidebar nav a').forEach(a=>{{
     <button onclick="tfcAsk('Upcoming EMI')">⏳ Upcoming EMI</button>
     <button onclick="tfcAsk('Overdue loans')">🔴 Overdue</button>
     <button onclick="tfcAsk('This week insights')">📈 This Week</button>
+    <button onclick="tfcAsk('Follow up summary')">📞 Follow Ups</button>
   </div>
   <form id="tfcChatForm" class="chatbot-input-row" onsubmit="return tfcSendMsg(event)">
     <input id="tfcChatInput" placeholder="Ask Thendralla anything..." autocomplete="off">
@@ -3427,6 +3431,7 @@ CHATBOT_VOCAB = [
     "hi","hey","help","menu","hello",
     "average","avg","customers","vehicle","type","two","four","wheeler","commercial",
     "highest","lowest","interest","rate","worst","reloan","new","applications","next","this","last","quarter","profit","overall","collected","disbursed","compare","comparison","get","will","end","now","from","till","year",
+    "follow","followup","missed","resolved","completed","remarks","promise","promised","collect","salary",
 ]
 
 CHATBOT_ALIASES = {
@@ -3566,6 +3571,7 @@ def _chatbot_intent(msg, low):
                 f"• \"Most overdue customer\", \"new loans this month\"\n"
                 f"• \"This year how much will get collected\"\n"
                 f"• \"Compare this month and last month profit\"\n"
+                f"• \"Follow ups today\", \"missed follow ups\", \"follow up summary\"\n"
                 f"• Or just type a loan number / customer name / vehicle number.")
 
     if any(g == low for g in ["hi","hello","hey","help","hii","hlo","menu"]) or "what can you do" in low:
@@ -3576,6 +3582,7 @@ def _chatbot_intent(msg, low):
                 f"• Upcoming / overdue EMIs\n"
                 f"• Collections / outstanding amounts\n"
                 f"• Top high-amount loans (e.g. \"top 5 high amount loans\")\n"
+                f"• Follow-ups (\"follow ups today\", \"missed follow ups\")\n"
                 f"• Or search by loan number, customer name, vehicle number, mobile.")
 
     # ── Total loan count / "how many loans" ──
@@ -3976,6 +3983,66 @@ def _chatbot_intent(msg, low):
         c.execute("SELECT COUNT(*) as n FROM LoanEntry WHERE is_reloan=1")
         n = c.fetchone()["n"] or 0
         return f"🔄 Reloans: {n} loan(s) marked as reloan."
+
+    # ── Follow Up ──
+    if "follow up" in low or "followup" in low or "follow-up" in low:
+        today_s = today.isoformat()
+        c.execute("SELECT COUNT(*) as n FROM FollowUp WHERE status='Pending'")
+        pending_n = c.fetchone()["n"] or 0
+        c.execute("SELECT COUNT(*) as n FROM FollowUp WHERE status='Pending' AND follow_up_date<?", (today_s,))
+        missed_n = c.fetchone()["n"] or 0
+        c.execute("SELECT COUNT(*) as n FROM FollowUp WHERE status='Pending' AND follow_up_date=?", (today_s,))
+        today_n = c.fetchone()["n"] or 0
+        c.execute("SELECT COUNT(*) as n FROM FollowUp WHERE status='Resolved'")
+        resolved_n = c.fetchone()["n"] or 0
+
+        if "today" in low:
+            c.execute("""SELECT f.follow_up_date, f.remarks, le.loan_number, le.customer_name, le.customer_mobile
+                         FROM FollowUp f JOIN LoanEntry le ON f.loan_id=le.id
+                         WHERE f.status='Pending' AND f.follow_up_date=?
+                         ORDER BY le.loan_number""", (today_s,))
+            rows = c.fetchall()
+            if not rows:
+                return "📞 No follow-ups scheduled for today."
+            lines = [f"📞 Follow-ups due TODAY — {len(rows)}:\n"]
+            for r in rows:
+                lines.append(f"• {r['loan_number']} — {_na(r['customer_name'])} ({_na(r['customer_mobile'])}): {r['remarks']}")
+            return "\n".join(lines)
+
+        if "missed" in low or ("overdue" in low and "follow" in low):
+            c.execute("""SELECT f.follow_up_date, f.remarks, le.loan_number, le.customer_name, le.customer_mobile
+                         FROM FollowUp f JOIN LoanEntry le ON f.loan_id=le.id
+                         WHERE f.status='Pending' AND f.follow_up_date<?
+                         ORDER BY f.follow_up_date ASC""", (today_s,))
+            rows = c.fetchall()
+            if not rows:
+                return "✅ No missed follow-ups — every customer promise date is still current."
+            lines = [f"⏰ Missed Follow-ups (promised date already passed) — {len(rows)}:\n"]
+            for r in rows[:8]:
+                days_late = (today - parse_date(r["follow_up_date"])).days
+                lines.append(f"• {r['loan_number']} — {_na(r['customer_name'])} ({_na(r['customer_mobile'])}), {days_late}d late: {r['remarks']}")
+            if len(rows) > 8:
+                lines.append(f"...and {len(rows)-8} more. Check the Follow Up page for full list.")
+            return "\n".join(lines)
+
+        if "resolved" in low or "completed" in low or "done" in low:
+            return f"✅ Resolved follow-ups so far: {resolved_n}"
+
+        c.execute("""SELECT f.follow_up_date, f.remarks, le.loan_number, le.customer_name
+                     FROM FollowUp f JOIN LoanEntry le ON f.loan_id=le.id
+                     WHERE f.status='Pending'
+                     ORDER BY f.follow_up_date ASC LIMIT 8""")
+        rows = c.fetchall()
+        lines = [f"📞 Follow-Up Summary:\n"
+                 f"• Pending: {pending_n}\n"
+                 f"• Due today: {today_n}\n"
+                 f"• Missed (promised date passed): {missed_n}\n"
+                 f"• Resolved: {resolved_n}"]
+        if rows:
+            lines.append("\nUpcoming follow-ups:")
+            for r in rows:
+                lines.append(f"• {r['loan_number']} — {_na(r['customer_name'])} on {r['follow_up_date']}: {r['remarks']}")
+        return "\n".join(lines)
 
     return None  # fall through to search
 
