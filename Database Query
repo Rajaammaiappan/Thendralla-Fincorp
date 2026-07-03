@@ -1,0 +1,18 @@
+CREATE TABLE IF NOT EXISTS FollowUp (
+    followup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    loan_id INTEGER,
+    follow_up_date TEXT,
+    remarks TEXT,
+    status TEXT DEFAULT 'Pending',
+    created_by TEXT,
+    created_at TEXT,
+    resolved_at TEXT,
+    FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_followup_loan_id ON FollowUp(loan_id);
+CREATE INDEX IF NOT EXISTS idx_followup_status ON FollowUp(status);
+-- Snippets are stored in browser storage.
+-- You can create new snippets by clicking the "+" button and group them in folders.
+
+ALTER TABLE LoanEntry ADD COLUMN loan_date TEXT;
