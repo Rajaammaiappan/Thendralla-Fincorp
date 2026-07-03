@@ -2919,6 +2919,7 @@ def followups():
             <input type="hidden" name="next" value="/followup?q={q}">
             <button class="btn btn-sm btn-success">✔ Resolve</button>
           </form>"""
+        pay_btn = f'<a class="btn btn-sm btn-danger" href="/emis/{r["loan_id"]}">💳 Pay</a>'
         rows += f"""<tr>
           <td><b><a href="/emis/{r['loan_id']}" style="color:var(--accent);">{r['loan_number']}</a></b></td>
           <td>{r['customer_name']}</td>
@@ -2930,7 +2931,7 @@ def followups():
           <td style="white-space:normal;max-width:220px;">{r['remarks']}</td>
           <td>{status_badge}</td>
           <td>{r.get('created_by') or ''}</td>
-          <td>{resolve_btn}</td>
+          <td style="white-space:nowrap;display:flex;gap:6px;">{pay_btn}{resolve_btn}</td>
         </tr>"""
     content = f"""
     <h1>📞 Follow Up</h1>
