@@ -23,7 +23,7 @@ from flask import (Flask, request, redirect, url_for, session,
 from werkzeug.utils import secure_filename
 
 try:
-    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
                                     Table, TableStyle, PageBreak)
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -977,6 +977,41 @@ def generate_pdf(path):
             ("GRID",(0,0),(-1,-1),0.4,colors.grey)]))
         story.append(lt)
     doc=SimpleDocTemplate(path,pagesize=A4,leftMargin=1.5*cm,rightMargin=1.5*cm,topMargin=2*cm,bottomMargin=2*cm)
+    doc.build(story)
+
+def generate_followup_pdf(path, items):
+    if not REPORTLAB_AVAILABLE: raise RuntimeError("reportlab not installed.")
+    styles = getSampleStyleSheet()
+    ts = ParagraphStyle("T", parent=styles["Title"], fontSize=16, spaceAfter=10)
+    story = [Paragraph("Thendralla Fincorp — Follow Up Report", ts),
+             Paragraph(f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')}", styles["Normal"]),
+             Spacer(1, 0.4*cm)]
+    today = date.today()
+    data = [["Loan #","Customer","Mobile","Address","Follow-up Date","Status","Overdue Amt","Remarks","By"]]
+    for r in items:
+        fu_date = parse_date(r["follow_up_date"])
+        if r["status"] == "Resolved": status = "Resolved"
+        elif fu_date < today: status = "Missed"
+        else: status = "Pending"
+        data.append([
+            r["loan_number"], r.get("customer_name") or "", r.get("customer_mobile") or "",
+            (r.get("customer_address") or "")[:40], r["follow_up_date"], status,
+            f"Rs {r['overdue_amount']:,.2f}", (r.get("remarks") or "")[:60], r.get("created_by") or ""
+        ])
+    tbl = Table(data, repeatRows=1,
+                colWidths=[1.9*cm,2.6*cm,2.2*cm,3.4*cm,2.2*cm,1.8*cm,2.4*cm,5.5*cm,1.8*cm])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#1a4fad")),
+        ("TEXTCOLOR",(0,0),(-1,0),colors.white),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1),7.5),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#e8f0fb")]),
+        ("GRID",(0,0),(-1,-1),0.4,colors.grey),
+        ("VALIGN",(0,0),(-1,-1),"TOP"),
+    ]))
+    story.append(tbl)
+    doc = SimpleDocTemplate(path, pagesize=landscape(A4),
+                             leftMargin=1*cm, rightMargin=1*cm, topMargin=1.2*cm, bottomMargin=1.2*cm)
     doc.build(story)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2952,11 +2987,14 @@ def followups():
         <span style="width:14px;height:14px;background:#fef9c3;border-left:3px solid #d97706;display:inline-block;"></span> Due within 2 days
       </span>
     </div>"""
+    q_url = urlquote(q)
     content = f"""
     <h1>📞 Follow Up</h1>
-    <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;">
+    <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;">
       <input name="q" value="{q}" placeholder="Search loan / customer / mobile…" style="max-width:280px;">
       <button class="btn btn-primary btn-sm">Search</button>
+      <a href="/followup/export/csv?q={q_url}" class="btn btn-success btn-sm">📊 Export Excel (CSV)</a>
+      <a href="/followup/export/pdf?q={q_url}" class="btn btn-danger btn-sm">📄 Export PDF</a>
     </form>
     <div class="card">
       <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">
@@ -2971,6 +3009,46 @@ def followups():
       </table></div>
     </div>"""
     return page("Follow Up", content, "followup")
+
+@app.route("/followup/export/csv")
+@login_required
+def followup_export_csv():
+    q = request.args.get("q","")
+    items = list_follow_ups(q)
+    today = date.today()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Loan Number","Customer","Mobile","Address","Location",
+                      "Overdue Amount","Follow-up Date","Remarks","Status","Created By"])
+    for r in items:
+        fu_date = parse_date(r["follow_up_date"])
+        if r["status"] == "Resolved": status = "Resolved"
+        elif fu_date < today: status = "Missed"
+        else: status = "Pending"
+        writer.writerow([
+            r["loan_number"], r.get("customer_name") or "", r.get("customer_mobile") or "",
+            r.get("customer_address") or "", r.get("customer_location") or "",
+            f"{r['overdue_amount']:.2f}", r["follow_up_date"], r.get("remarks") or "",
+            status, r.get("created_by") or ""
+        ])
+    return send_file(io.BytesIO(buf.getvalue().encode("utf-8-sig")), as_attachment=True,
+                      download_name="followups.csv", mimetype="text/csv")
+
+@app.route("/followup/export/pdf")
+@login_required
+def followup_export_pdf():
+    q = request.args.get("q","")
+    if not REPORTLAB_AVAILABLE:
+        flash("reportlab not installed. Run: pip install reportlab","danger")
+        return redirect(url_for("followups", q=q))
+    items = list_follow_ups(q)
+    path = os.path.join(tempfile.gettempdir(), "tfc_followup_report.pdf")
+    try:
+        generate_followup_pdf(path, items)
+        return send_file(path, as_attachment=True, download_name="followups.pdf", mimetype="application/pdf")
+    except Exception as e:
+        flash(str(e),"danger")
+        return redirect(url_for("followups", q=q))
 
 # ── Closed / Rejected ──────────────────────────────────────────────────────────
 @app.route("/closed")
