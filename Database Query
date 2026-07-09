@@ -1,18 +1,89 @@
-CREATE TABLE IF NOT EXISTS FollowUp (
-    followup_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    loan_id INTEGER,
-    follow_up_date TEXT,
-    remarks TEXT,
-    status TEXT DEFAULT 'Pending',
-    created_by TEXT,
-    created_at TEXT,
-    resolved_at TEXT,
-    FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
+CREATE TABLE `LoanEntry` (
+	`id` integer PRIMARY KEY AUTOINCREMENT,
+	`loan_number` text UNIQUE,
+	`customer_name` text,
+	`vehicle_type` text,
+	`loan_amount` real,
+	`interest_rate` real,
+	`tenure` integer,
+	`start_date` text,
+	`status` text,
+	`created_at` text,
+	`attachment` text,
+	`customer_email` text,
+	`customer_mobile` text,
+	`customer_address` text,
+	`customer_location` text,
+	`vehicle_number` text,
+	`vehicle_model` text,
+	`engine_number` text,
+	`chassis_number` text,
+	`vehicle_colour` text,
+	`guarantor_name` text,
+	`guarantor_address` text,
+	`guarantor_mobile` text,
+	`is_reloan` integer DEFAULT 0,
+	`reloan_ref` text,
+	`remarks` text,
+	`attachment_path` text,
+	`custom_emi_amount` real
 );
-
-CREATE INDEX IF NOT EXISTS idx_followup_loan_id ON FollowUp(loan_id);
-CREATE INDEX IF NOT EXISTS idx_followup_status ON FollowUp(status);
--- Snippets are stored in browser storage.
--- You can create new snippets by clicking the "+" button and group them in folders.
-
-ALTER TABLE LoanEntry ADD COLUMN loan_date TEXT;
+CREATE TABLE `Customers` (
+	`customer_id` integer PRIMARY KEY AUTOINCREMENT,
+	`loan_id` integer UNIQUE,
+	`name` text,
+	`vehicle_type` text,
+	`loan_amount` real,
+	`emi_amount` real,
+	`status` text,
+	`created_at` text,
+	CONSTRAINT `fk_Customers_loan_id_LoanEntry_id_fk` FOREIGN KEY (`loan_id`) REFERENCES `LoanEntry`(`id`)
+);
+CREATE TABLE `EMI` (
+	`emi_id` integer PRIMARY KEY AUTOINCREMENT,
+	`loan_id` integer,
+	`installment_no` integer,
+	`due_date` text,
+	`emi_amount` real,
+	`status` text,
+	`paid_at` text,
+	`amount_paid` real,
+	`remaining_amount` real,
+	`extra_interest` real,
+	`bill_number` text,
+	CONSTRAINT `fk_EMI_loan_id_LoanEntry_id_fk` FOREIGN KEY (`loan_id`) REFERENCES `LoanEntry`(`id`)
+);
+CREATE TABLE `RejectedLoans` (
+	`reject_id` integer PRIMARY KEY AUTOINCREMENT,
+	`loan_id` integer UNIQUE,
+	`reason` text,
+	`created_at` text,
+	CONSTRAINT `fk_RejectedLoans_loan_id_LoanEntry_id_fk` FOREIGN KEY (`loan_id`) REFERENCES `LoanEntry`(`id`)
+);
+CREATE TABLE `ClosedLoans` (
+	`close_id` integer PRIMARY KEY AUTOINCREMENT,
+	`loan_id` integer UNIQUE,
+	`closure_date` text,
+	`created_at` text,
+	CONSTRAINT `fk_ClosedLoans_loan_id_LoanEntry_id_fk` FOREIGN KEY (`loan_id`) REFERENCES `LoanEntry`(`id`)
+);
+CREATE TABLE `Users` (
+	`user_id` integer PRIMARY KEY AUTOINCREMENT,
+	`username` text UNIQUE,
+	`pw_hash` text,
+	`role` text,
+	`created_at` text
+);
+CREATE INDEX `idx_loan_vehicle_number` ON `LoanEntry` (`vehicle_number`);
+CREATE INDEX `idx_loan_customer_mobile` ON `LoanEntry` (`customer_mobile`);
+CREATE INDEX `idx_loan_customer_name` ON `LoanEntry` (`customer_name`);
+CREATE INDEX `idx_loan_created` ON `LoanEntry` (`created_at`);
+CREATE INDEX `idx_loan_status` ON `LoanEntry` (`status`);
+CREATE INDEX `idx_loan_number` ON `LoanEntry` (`loan_number`);
+CREATE INDEX `idx_customers_status` ON `Customers` (`status`);
+CREATE INDEX `idx_customers_loan_id` ON `Customers` (`loan_id`);
+CREATE INDEX `idx_emi_paid_at` ON `EMI` (`paid_at`);
+CREATE INDEX `idx_emi_status_due` ON `EMI` (`status`,`due_date`);
+CREATE INDEX `idx_emi_due_date` ON `EMI` (`due_date`);
+CREATE INDEX `idx_emi_status` ON `EMI` (`status`);
+CREATE INDEX `idx_emi_loan_id` ON `EMI` (`loan_id`);
