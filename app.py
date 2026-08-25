@@ -2562,14 +2562,27 @@ def customer_edit(loan_id):
     if request.method == "POST":
         f = request.form
         try:
+            new_ln = f.get("loan_number","").strip()
+            if not new_ln:
+                flash("Loan Number is mandatory.", "danger")
+                return redirect(url_for("customer_edit", loan_id=loan_id))
+            c.execute("SELECT id FROM LoanEntry WHERE loan_number=? AND id!=?", (new_ln, loan_id))
+            if c.fetchone():
+                flash(f"Loan Number '{new_ln}' is already in use by another loan.", "danger")
+                return redirect(url_for("customer_edit", loan_id=loan_id))
+
+            new_start_date = f.get("start_date","")
+            old_start_date = loan.get("start_date","")
+
             c.execute("""UPDATE LoanEntry SET
-                customer_name=?, customer_mobile=?, customer_address=?, customer_location=?,
+                loan_number=?, customer_name=?, customer_mobile=?, customer_address=?, customer_location=?,
                 customer_email=?, vehicle_type=?, vehicle_number=?, vehicle_model=?,
                 engine_number=?, chassis_number=?, vehicle_colour=?,
                 guarantor_name=?, guarantor_address=?, guarantor_mobile=?,
                 loan_amount=?, interest_rate=?, tenure=?, start_date=?, remarks=?
                 WHERE id=?""",
-                (f.get("customer_name","").strip(),
+                (new_ln,
+                 f.get("customer_name","").strip(),
                  f.get("customer_mobile","").strip(),
                  f.get("customer_address","").strip(),
                  f.get("customer_location","").strip(),
@@ -2586,9 +2599,24 @@ def customer_edit(loan_id):
                  float(f.get("loan_amount",0)),
                  float(f.get("interest_rate",0))/100 if float(f.get("interest_rate",0))>1 else float(f.get("interest_rate",0)),
                  int(f.get("tenure",0)),
-                 f.get("start_date",""),
+                 new_start_date,
                  f.get("remarks","").strip(),
                  loan_id))
+
+            # Start Date drives the EMI schedule — if it changed, shift every
+            # not-yet-fully-paid installment's due date to keep the schedule
+            # consistent with the new start date. Paid installments are left
+            # alone since they're already settled history.
+            if new_start_date and new_start_date != old_start_date:
+                try:
+                    new_sd = parse_date(new_start_date)
+                    c.execute("SELECT emi_id, installment_no FROM EMI WHERE loan_id=? AND status!='Paid'", (loan_id,))
+                    for row in c.fetchall():
+                        c.execute("UPDATE EMI SET due_date=? WHERE emi_id=?",
+                                  (add_months(new_sd, row["installment_no"]-1).isoformat(), row["emi_id"]))
+                except ValueError:
+                    pass
+
             # Also update Customers summary table
             new_amt = float(f.get("loan_amount",0))
             rate_raw = float(f.get("interest_rate",0))
@@ -2614,11 +2642,11 @@ def customer_edit(loan_id):
       <div class="form-grid">
         <div class="section-title">📄 Loan Details</div>
         <div class="form-group">
-          <label>Loan Number</label>
-          <input value="{loan.get('loan_number','')}" readonly>
+          <label>Loan Number *</label>
+          <input name="loan_number" value="{loan.get('loan_number','')}" required>
         </div>
         <div class="form-group">
-          <label>Start Date *</label>
+          <label>Start Date * <span style="font-size:10px;color:var(--muted);">(changing this shifts all unpaid EMI due dates)</span></label>
           <input type="date" name="start_date" value="{loan.get('start_date','')}" required>
         </div>
         <div class="form-group">
