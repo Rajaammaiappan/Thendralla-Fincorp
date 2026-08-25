@@ -1869,8 +1869,30 @@ def add_loan():
         if loan_date_val > date.today():
             flash("Loan Date cannot be a future date.","danger")
             return redirect(url_for("add_loan"))
-        # EMI Start Date is always one month after the Loan Date (same day)
-        emi_start_date = add_months(loan_date_val, 1)
+
+        # EMI Start Date — entered manually by the user (pre-filled as a
+        # suggestion of Loan Date + 1 month, but editable)
+        emi_start_date_str = f.get("emi_start_date","").strip()
+        if not emi_start_date_str:
+            flash("EMI Start Date is mandatory.","danger")
+            return redirect(url_for("add_loan"))
+        try:
+            emi_start_date = datetime.strptime(emi_start_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            flash("Invalid EMI Start Date.","danger")
+            return redirect(url_for("add_loan"))
+
+        # Loan Number — entered manually by the user (pre-filled as a
+        # suggestion, but editable); must be unique
+        loan_number_val = f.get("loan_number","").strip()
+        if not loan_number_val:
+            flash("Loan Number is mandatory.","danger")
+            return redirect(url_for("add_loan"))
+        c = get_cur()
+        c.execute("SELECT id FROM LoanEntry WHERE loan_number=?", (loan_number_val,))
+        if c.fetchone():
+            flash(f"Loan Number '{loan_number_val}' already exists. Please use a different number.","danger")
+            return redirect(url_for("add_loan"))
 
         # Resolve interest rate depending on calc_mode
         calc_mode = f.get("calc_mode","rate")
@@ -1887,7 +1909,7 @@ def add_loan():
                 return redirect(url_for("add_loan"))
         try:
             create_loan(
-                f["loan_number"], f["customer_name"], mob,
+                loan_number_val, f["customer_name"], mob,
                 f["customer_address"], f.get("customer_location",""),
                 f["vehicle_type"], vehicle_number_clean, f["vehicle_model"], f.get("vehicle_name",""),
                 f["engine_number"], f["chassis_number"], f["vehicle_colour"],
@@ -1916,7 +1938,7 @@ def add_loan():
         <div class="section-title">📄 Loan Details</div>
         <div class="form-group">
           <label>Loan Number *</label>
-          <input name="loan_number" value="{next_ln}" readonly>
+          <input name="loan_number" value="{next_ln}" required>
         </div>
         <div class="form-group">
           <label>Loan Date * <span style="font-size:10px;color:var(--muted);">(date loan disbursed — cannot be future)</span></label>
@@ -1924,8 +1946,8 @@ def add_loan():
                  max="{date.today().isoformat()}" required oninput="updateEmiStartDate()">
         </div>
         <div class="form-group">
-          <label>EMI Start Date <span style="font-size:10px;color:var(--muted);">(auto: 1 month after Loan Date)</span></label>
-          <input type="date" id="emi_start_date_display" readonly style="background:var(--surface2);color:var(--muted);">
+          <label>EMI Start Date * <span style="font-size:10px;color:var(--muted);">(suggested: 1 month after Loan Date — edit if needed)</span></label>
+          <input type="date" name="emi_start_date" id="emi_start_date_display" required>
         </div>
 
         <!-- EMI Smart Calculator Mode -->
@@ -2230,12 +2252,18 @@ def add_loan():
       d.setDate(Math.min(day, lastDay));
       return d.toISOString().slice(0,10);
     }}
+    /* Only suggests a value — never overwrites a date the user already typed in manually. */
     function updateEmiStartDate(){{
+      const emiField = document.getElementById('emi_start_date_display');
+      if(emiField.dataset.userEdited === 'true') return;
       const ld = document.getElementById('loan_date').value;
       if(ld){{
-        document.getElementById('emi_start_date_display').value = addMonthsJS(ld, 1);
+        emiField.value = addMonthsJS(ld, 1);
       }}
     }}
+    document.getElementById('emi_start_date_display').addEventListener('input', function(){{
+      this.dataset.userEdited = 'true';
+    }});
     updateEmiStartDate();
 
     /* ── Reloan helpers ───────────────────────────────────────────────────── */
