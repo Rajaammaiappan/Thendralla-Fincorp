@@ -1869,8 +1869,26 @@ def add_loan():
         if loan_date_val > date.today():
             flash("Loan Date cannot be a future date.","danger")
             return redirect(url_for("add_loan"))
-        # EMI Start Date is always one month after the Loan Date (same day)
-        emi_start_date = add_months(loan_date_val, 1)
+
+        # EMI Start Date — user-editable; defaults to 1 month after Loan Date if left blank
+        emi_start_date_str = f.get("emi_start_date","").strip()
+        if emi_start_date_str:
+            try:
+                emi_start_date = datetime.strptime(emi_start_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                flash("Invalid EMI Start Date.","danger")
+                return redirect(url_for("add_loan"))
+        else:
+            emi_start_date = add_months(loan_date_val, 1)
+
+        # Loan Number — user-editable; auto-suggested but can be overridden
+        loan_number_val = f.get("loan_number","").strip()
+        if not loan_number_val:
+            try:
+                loan_number_val = next_loan_number()
+            except Exception:
+                flash("Could not generate loan number. Please try again.","danger")
+                return redirect(url_for("add_loan"))
 
         # Resolve interest rate depending on calc_mode
         calc_mode = f.get("calc_mode","rate")
@@ -1887,7 +1905,7 @@ def add_loan():
                 return redirect(url_for("add_loan"))
         try:
             create_loan(
-                f["loan_number"], f["customer_name"], mob,
+                loan_number_val, f["customer_name"], mob,
                 f["customer_address"], f.get("customer_location",""),
                 f["vehicle_type"], vehicle_number_clean, f["vehicle_model"], f.get("vehicle_name",""),
                 f["engine_number"], f["chassis_number"], f["vehicle_colour"],
@@ -1902,7 +1920,10 @@ def add_loan():
             flash("Loan submitted for approval.","success")
             return redirect(url_for("loans"))
         except Exception as e:
-            flash(str(e),"danger")
+            if "UNIQUE" in str(e).upper() and "loan_number" in str(e):
+                flash(f"Loan Number '{loan_number_val}' is already in use. Please choose a different one.","danger")
+            else:
+                flash(str(e),"danger")
 
     try: next_ln = next_loan_number()
     except: next_ln = f"LN-{datetime.now().year}-01"
@@ -1915,8 +1936,8 @@ def add_loan():
 
         <div class="section-title">📄 Loan Details</div>
         <div class="form-group">
-          <label>Loan Number *</label>
-          <input name="loan_number" value="{next_ln}" readonly>
+          <label>Loan Number * <span style="font-size:10px;color:var(--muted);">(auto-suggested — edit if needed)</span></label>
+          <input name="loan_number" id="loan_number" value="{next_ln}" required>
         </div>
         <div class="form-group">
           <label>Loan Date * <span style="font-size:10px;color:var(--muted);">(date loan disbursed — cannot be future)</span></label>
@@ -1924,8 +1945,8 @@ def add_loan():
                  max="{date.today().isoformat()}" required oninput="updateEmiStartDate()">
         </div>
         <div class="form-group">
-          <label>EMI Start Date <span style="font-size:10px;color:var(--muted);">(auto: 1 month after Loan Date)</span></label>
-          <input type="date" id="emi_start_date_display" readonly style="background:var(--surface2);color:var(--muted);">
+          <label>EMI Start Date * <span style="font-size:10px;color:var(--muted);">(auto-suggested: 1 month after Loan Date — edit if needed)</span></label>
+          <input type="date" name="emi_start_date" id="emi_start_date_display" required>
         </div>
 
         <!-- EMI Smart Calculator Mode -->
@@ -2230,12 +2251,17 @@ def add_loan():
       d.setDate(Math.min(day, lastDay));
       return d.toISOString().slice(0,10);
     }}
+    let emiDateManuallyEdited = false;
     function updateEmiStartDate(){{
+      if(emiDateManuallyEdited) return;
       const ld = document.getElementById('loan_date').value;
       if(ld){{
         document.getElementById('emi_start_date_display').value = addMonthsJS(ld, 1);
       }}
     }}
+    document.getElementById('emi_start_date_display').addEventListener('input', function(){{
+      emiDateManuallyEdited = true;
+    }});
     updateEmiStartDate();
 
     /* ── Reloan helpers ───────────────────────────────────────────────────── */
@@ -2562,27 +2588,14 @@ def customer_edit(loan_id):
     if request.method == "POST":
         f = request.form
         try:
-            new_ln = f.get("loan_number","").strip()
-            if not new_ln:
-                flash("Loan Number is mandatory.", "danger")
-                return redirect(url_for("customer_edit", loan_id=loan_id))
-            c.execute("SELECT id FROM LoanEntry WHERE loan_number=? AND id!=?", (new_ln, loan_id))
-            if c.fetchone():
-                flash(f"Loan Number '{new_ln}' is already in use by another loan.", "danger")
-                return redirect(url_for("customer_edit", loan_id=loan_id))
-
-            new_start_date = f.get("start_date","")
-            old_start_date = loan.get("start_date","")
-
             c.execute("""UPDATE LoanEntry SET
-                loan_number=?, customer_name=?, customer_mobile=?, customer_address=?, customer_location=?,
+                customer_name=?, customer_mobile=?, customer_address=?, customer_location=?,
                 customer_email=?, vehicle_type=?, vehicle_number=?, vehicle_model=?,
                 engine_number=?, chassis_number=?, vehicle_colour=?,
                 guarantor_name=?, guarantor_address=?, guarantor_mobile=?,
                 loan_amount=?, interest_rate=?, tenure=?, start_date=?, remarks=?
                 WHERE id=?""",
-                (new_ln,
-                 f.get("customer_name","").strip(),
+                (f.get("customer_name","").strip(),
                  f.get("customer_mobile","").strip(),
                  f.get("customer_address","").strip(),
                  f.get("customer_location","").strip(),
@@ -2599,24 +2612,9 @@ def customer_edit(loan_id):
                  float(f.get("loan_amount",0)),
                  float(f.get("interest_rate",0))/100 if float(f.get("interest_rate",0))>1 else float(f.get("interest_rate",0)),
                  int(f.get("tenure",0)),
-                 new_start_date,
+                 f.get("start_date",""),
                  f.get("remarks","").strip(),
                  loan_id))
-
-            # Start Date drives the EMI schedule — if it changed, shift every
-            # not-yet-fully-paid installment's due date to keep the schedule
-            # consistent with the new start date. Paid installments are left
-            # alone since they're already settled history.
-            if new_start_date and new_start_date != old_start_date:
-                try:
-                    new_sd = parse_date(new_start_date)
-                    c.execute("SELECT emi_id, installment_no FROM EMI WHERE loan_id=? AND status!='Paid'", (loan_id,))
-                    for row in c.fetchall():
-                        c.execute("UPDATE EMI SET due_date=? WHERE emi_id=?",
-                                  (add_months(new_sd, row["installment_no"]-1).isoformat(), row["emi_id"]))
-                except ValueError:
-                    pass
-
             # Also update Customers summary table
             new_amt = float(f.get("loan_amount",0))
             rate_raw = float(f.get("interest_rate",0))
@@ -2642,11 +2640,11 @@ def customer_edit(loan_id):
       <div class="form-grid">
         <div class="section-title">📄 Loan Details</div>
         <div class="form-group">
-          <label>Loan Number *</label>
-          <input name="loan_number" value="{loan.get('loan_number','')}" required>
+          <label>Loan Number</label>
+          <input value="{loan.get('loan_number','')}" readonly>
         </div>
         <div class="form-group">
-          <label>Start Date * <span style="font-size:10px;color:var(--muted);">(changing this shifts all unpaid EMI due dates)</span></label>
+          <label>Start Date *</label>
           <input type="date" name="start_date" value="{loan.get('start_date','')}" required>
         </div>
         <div class="form-group">
