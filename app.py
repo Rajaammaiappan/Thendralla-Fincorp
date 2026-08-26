@@ -563,8 +563,17 @@ def reject_loan(loan_id, reason):
               (loan_id, reason, datetime.now(timezone.utc).isoformat()))
     get_db().commit()
 
-def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number=""):
+def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number="", paid_on=None):
     c = get_cur(); now = datetime.now(timezone.utc).isoformat()
+    paid_at_val = now
+    if paid_on:
+        try:
+            d = datetime.strptime(paid_on, "%Y-%m-%d").date()
+        except ValueError:
+            raise ValueError("Invalid Paid On date.")
+        if d > date.today():
+            raise ValueError("Paid On date cannot be in the future.")
+        paid_at_val = datetime.combine(d, datetime.now(timezone.utc).timetz()).isoformat()
     c.execute("SELECT * FROM EMI WHERE emi_id=?", (emi_id,))
     emi = c.fetchone()
     if not emi: raise ValueError("EMI not found")
@@ -584,7 +593,7 @@ def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number=""):
         return f"Partial payment recorded. Remaining: {fmt_inr(total_due-pay_amount)}"
     else:
         c.execute("UPDATE EMI SET status='Paid',paid_at=?,amount_paid=?,remaining_amount=0,extra_interest=0,bill_number=? WHERE emi_id=?",
-                  (now, amount_paid+pay_amount, bill_number.strip(), emi_id))
+                  (paid_at_val, amount_paid+pay_amount, bill_number.strip(), emi_id))
         get_db().commit()
         lid = emi["loan_id"]
         c.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status='Paid' THEN 1 ELSE 0 END) as pc FROM EMI WHERE loan_id=?", (lid,))
@@ -1833,17 +1842,20 @@ def add_loan():
         if len(mob) != 10:
             flash("Customer mobile number must be exactly 10 digits.","danger")
             return redirect(url_for("add_loan"))
+        # Vehicle details are only mandatory for a reloan
+        is_reloan_flag = f.get("is_reloan") == "yes"
         # Trim vehicle number spaces
         vehicle_number_clean = f.get("vehicle_number","").strip().replace(" ","").upper()
-        if not vehicle_number_clean:
-            flash("Vehicle Number is mandatory.","danger")
-            return redirect(url_for("add_loan"))
-        # Validate mandatory vehicle fields
-        for field,label in [("vehicle_model","Vehicle Model"),("vehicle_name","Vehicle Name"),
-                             ("engine_number","Engine Number"),("chassis_number","Chassis Number"),("vehicle_colour","Vehicle Colour")]:
-            if not f.get(field,"").strip():
-                flash(f"{label} is mandatory.","danger")
+        if is_reloan_flag:
+            if not vehicle_number_clean:
+                flash("Vehicle Number is mandatory for a reloan.","danger")
                 return redirect(url_for("add_loan"))
+            # Validate mandatory vehicle fields
+            for field,label in [("vehicle_type","Vehicle Type"),("vehicle_model","Vehicle Model"),("vehicle_name","Vehicle Name"),
+                                 ("engine_number","Engine Number"),("chassis_number","Chassis Number"),("vehicle_colour","Vehicle Colour")]:
+                if not f.get(field,"").strip():
+                    flash(f"{label} is mandatory for a reloan.","danger")
+                    return redirect(url_for("add_loan"))
         if not f.get("customer_address","").strip():
             flash("Customer address is mandatory.","danger")
             return redirect(url_for("add_loan"))
@@ -2052,39 +2064,39 @@ def add_loan():
           <div id="risk_box" class="risk-box"></div>
         </div>
 
-        <div class="section-title">🚗 Vehicle Details (all mandatory)</div>
+        <div class="section-title">🚗 Vehicle Details <span id="vehicle_mandatory_note">(optional unless Reloan = Yes)</span></div>
         <div class="form-group">
-          <label>Vehicle Type *</label>
-          <select name="vehicle_type" required>
+          <label>Vehicle Type</label>
+          <select name="vehicle_type" id="vehicle_type" class="vehicle-req-field">
             <option value="">-- Select --</option>
             <option>Two Wheeler</option><option>Three Wheeler</option>
             <option>Four Wheeler</option><option>Commercial Vehicle</option><option>Other</option>
           </select>
         </div>
         <div class="form-group">
-          <label>Vehicle Number * <span style="font-size:10px;color:var(--muted);">(spaces auto-removed)</span></label>
-          <input name="vehicle_number" id="vehicle_number" placeholder="TN01AB1234" required
+          <label>Vehicle Number <span style="font-size:10px;color:var(--muted);">(spaces auto-removed)</span></label>
+          <input name="vehicle_number" id="vehicle_number" class="vehicle-req-field" placeholder="TN01AB1234"
                  oninput="this.value=this.value.replace(/ /g,'').toUpperCase()">
         </div>
         <div class="form-group">
-          <label>Vehicle Name * <span style="font-size:10px;color:var(--muted);">(brand &amp; variant)</span></label>
-          <input name="vehicle_name" placeholder="e.g. Honda Activa" required>
+          <label>Vehicle Name <span style="font-size:10px;color:var(--muted);">(brand &amp; variant)</span></label>
+          <input name="vehicle_name" id="vehicle_name" class="vehicle-req-field" placeholder="e.g. Honda Activa">
         </div>
         <div class="form-group">
-          <label>Vehicle Model * <span style="font-size:10px;color:var(--muted);">(model/year)</span></label>
-          <input name="vehicle_model" placeholder="e.g. 6G 2023" required>
+          <label>Vehicle Model <span style="font-size:10px;color:var(--muted);">(model/year)</span></label>
+          <input name="vehicle_model" id="vehicle_model" class="vehicle-req-field" placeholder="e.g. 6G 2023">
         </div>
         <div class="form-group">
-          <label>Engine Number *</label>
-          <input name="engine_number" required>
+          <label>Engine Number</label>
+          <input name="engine_number" id="engine_number" class="vehicle-req-field">
         </div>
         <div class="form-group">
-          <label>Chassis Number *</label>
-          <input name="chassis_number" required>
+          <label>Chassis Number</label>
+          <input name="chassis_number" id="chassis_number" class="vehicle-req-field">
         </div>
         <div class="form-group">
-          <label>Vehicle Colour *</label>
-          <input name="vehicle_colour" required>
+          <label>Vehicle Colour</label>
+          <input name="vehicle_colour" id="vehicle_colour" class="vehicle-req-field">
         </div>
 
         <div class="section-title">🛡️ Guarantor Details (optional)</div>
@@ -2145,14 +2157,50 @@ def add_loan():
     </form>
     </div>
 
+    <div class="fu-modal-overlay" id="loanConfirmModal">
+      <div class="fu-modal">
+        <h3>Confirm Loan Application</h3>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">Please review before submitting:</p>
+        <div id="loanConfirmSummary" style="font-size:13px;line-height:1.9;"></div>
+        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
+          <button type="button" class="btn" style="background:var(--surface2);color:var(--text);" onclick="closeLoanConfirm()">✎ Edit</button>
+          <button type="button" class="btn btn-primary" onclick="confirmLoanSubmit()">✅ Confirm &amp; Submit</button>
+        </div>
+      </div>
+    </div>
+
     <script>
     /* ── Unsaved-data tab-switch warning ─────────────────────────────────── */
     let _loanFormDirty = false;
+    let _loanConfirmed = false;
     const _loanForm = document.getElementById('loanForm');
     if(_loanForm){{
       _loanForm.addEventListener('input', ()=>{{ _loanFormDirty = true; }});
       _loanForm.addEventListener('change', ()=>{{ _loanFormDirty = true; }});
-      _loanForm.addEventListener('submit', ()=>{{ _loanFormDirty = false; }});
+      _loanForm.addEventListener('submit', function(e){{
+        if(_loanConfirmed){{ _loanFormDirty = false; return; }}
+        e.preventDefault();
+        const gn = name => {{ const el = _loanForm.querySelector('[name="'+name+'"]'); return el ? el.value : ''; }};
+        const amt = parseFloat(gn('loan_amount')||0);
+        document.getElementById('loanConfirmSummary').innerHTML = `
+          <div><b>Loan Number:</b> ${{gn('loan_number')||'—'}}</div>
+          <div><b>Customer:</b> ${{gn('customer_name')||'—'}}</div>
+          <div><b>Mobile:</b> ${{gn('customer_mobile')||'—'}}</div>
+          <div><b>Loan Amount:</b> ₹${{amt.toLocaleString('en-IN')}}</div>
+          <div><b>Tenure:</b> ${{gn('tenure')||'—'}} months</div>
+          <div><b>Loan Date:</b> ${{gn('loan_date')||'—'}}</div>
+          <div><b>EMI Start Date:</b> ${{gn('emi_start_date')||'—'}}</div>
+        `;
+        document.getElementById('loanConfirmModal').classList.add('open');
+      }});
+    }}
+    function closeLoanConfirm(){{
+      document.getElementById('loanConfirmModal').classList.remove('open');
+    }}
+    function confirmLoanSubmit(){{
+      _loanConfirmed = true;
+      document.getElementById('loanConfirmModal').classList.remove('open');
+      if(_loanForm.requestSubmit) _loanForm.requestSubmit(); else _loanForm.submit();
     }}
     // Intercept sidebar / nav link clicks
     document.addEventListener('DOMContentLoaded', ()=>{{
@@ -2267,7 +2315,15 @@ def add_loan():
     /* ── Reloan helpers ───────────────────────────────────────────────────── */
     function toggleReloan(v){{
       document.getElementById('reloan_section').style.display=v==='yes'?'block':'none';
+      const mandatory = v==='yes';
+      document.querySelectorAll('.vehicle-req-field').forEach(function(el){{
+        if(mandatory){{ el.setAttribute('required','required'); }}
+        else{{ el.removeAttribute('required'); }}
+      }});
+      document.getElementById('vehicle_mandatory_note').textContent =
+        mandatory ? '(mandatory for a reloan)' : '(optional unless Reloan = Yes)';
     }}
+    toggleReloan(document.querySelector('[name=is_reloan]').value);
     function checkReloan(){{
       const ref=document.getElementById('reloan_ref').value.trim();
       if(!ref){{alert('Enter previous loan number first.');return;}}
@@ -2778,6 +2834,8 @@ def emis(loan_id):
                      style="width:90px;font-size:12px;padding:5px 6px;">
               <input type="number" name="pay_amount" value="{remaining:.2f}"
                      min="1" step="0.01" style="width:90px;font-size:12px;padding:5px 6px;" required>
+              <input type="date" name="paid_on" value="{today.isoformat()}" max="{today.isoformat()}"
+                     title="Paid On" style="width:130px;font-size:12px;padding:5px 6px;" required>
               <button class="btn btn-success btn-sm" onclick="return chkBill(this)">Pay</button>
             </form>"""
 
@@ -2853,8 +2911,9 @@ def emi_pay():
     loan_id = int(request.form["loan_id"])
     pay_amt = float(request.form.get("pay_amount",0) or 0)
     bill_no = request.form.get("bill_number","").strip()
+    paid_on = request.form.get("paid_on","").strip()
     try:
-        msg = pay_emi(emi_id, pay_amt, bill_number=bill_no)
+        msg = pay_emi(emi_id, pay_amt, bill_number=bill_no, paid_on=paid_on or None)
         flash(msg,"success")
     except Exception as e:
         flash(str(e),"danger")
