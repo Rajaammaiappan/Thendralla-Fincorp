@@ -396,6 +396,18 @@ def init_db():
         bill_number TEXT,
         FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
     );
+    CREATE TABLE IF NOT EXISTS EMIPayments (
+        payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        emi_id INTEGER,
+        loan_id INTEGER,
+        amount REAL,
+        extra_interest REAL,
+        bill_number TEXT,
+        paid_at TEXT,
+        paid_by TEXT,
+        FOREIGN KEY(emi_id) REFERENCES EMI(emi_id),
+        FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
+    );
     CREATE TABLE IF NOT EXISTS RejectedLoans (
         reject_id INTEGER PRIMARY KEY AUTOINCREMENT,
         loan_id INTEGER UNIQUE, reason TEXT, created_at TEXT,
@@ -467,6 +479,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_customers_status ON Customers(status)",
         "CREATE INDEX IF NOT EXISTS idx_followup_loan_id ON FollowUp(loan_id)",
         "CREATE INDEX IF NOT EXISTS idx_followup_status ON FollowUp(status)",
+        "CREATE INDEX IF NOT EXISTS idx_emipayments_emi_id ON EMIPayments(emi_id)",
+        "CREATE INDEX IF NOT EXISTS idx_emipayments_loan_id ON EMIPayments(loan_id)",
     ]:
         try: cur.execute(idx)
         except: pass
@@ -563,7 +577,7 @@ def reject_loan(loan_id, reason):
               (loan_id, reason, datetime.now(timezone.utc).isoformat()))
     get_db().commit()
 
-def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number="", paid_on=None):
+def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number="", paid_on=None, paid_by=None):
     c = get_cur(); now = datetime.now(timezone.utc).isoformat()
     paid_at_val = now
     if paid_on:
@@ -589,11 +603,15 @@ def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number="", paid_on
     if pay_amount < total_due:
         c.execute("UPDATE EMI SET amount_paid=?,remaining_amount=?,extra_interest=?,status=?,bill_number=? WHERE emi_id=?",
                   (amount_paid+pay_amount, total_due-pay_amount, extra_interest, "Partial", bill_number.strip(), emi_id))
+        c.execute("INSERT INTO EMIPayments (emi_id,loan_id,amount,extra_interest,bill_number,paid_at,paid_by) VALUES (?,?,?,?,?,?,?)",
+                  (emi_id, emi["loan_id"], pay_amount, extra_interest, bill_number.strip(), paid_at_val, paid_by))
         get_db().commit()
         return f"Partial payment recorded. Remaining: {fmt_inr(total_due-pay_amount)}"
     else:
         c.execute("UPDATE EMI SET status='Paid',paid_at=?,amount_paid=?,remaining_amount=0,extra_interest=0,bill_number=? WHERE emi_id=?",
                   (paid_at_val, amount_paid+pay_amount, bill_number.strip(), emi_id))
+        c.execute("INSERT INTO EMIPayments (emi_id,loan_id,amount,extra_interest,bill_number,paid_at,paid_by) VALUES (?,?,?,?,?,?,?)",
+                  (emi_id, emi["loan_id"], pay_amount, extra_interest, bill_number.strip(), paid_at_val, paid_by))
         get_db().commit()
         lid = emi["loan_id"]
         c.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status='Paid' THEN 1 ELSE 0 END) as pc FROM EMI WHERE loan_id=?", (lid,))
@@ -619,11 +637,18 @@ def list_all_loans(search=""):
 
 def list_customers(search=""):
     q=f"%{search}%"; c=get_cur()
-    c.execute("SELECT * FROM Customers WHERE name LIKE ? OR vehicle_type LIKE ? OR status LIKE ? ORDER BY created_at DESC",(q,q,q))
+    c.execute("""SELECT cu.*, le.loan_number FROM Customers cu
+                 LEFT JOIN LoanEntry le ON le.id = cu.loan_id
+                 WHERE cu.name LIKE ? OR cu.vehicle_type LIKE ? OR cu.status LIKE ? OR le.loan_number LIKE ?
+                 ORDER BY cu.created_at DESC""",(q,q,q,q))
     return [dict(r) for r in c.fetchall()]
 
 def get_emis_for_loan(loan_id):
     c=get_cur(); c.execute("SELECT * FROM EMI WHERE loan_id=? ORDER BY installment_no ASC",(loan_id,))
+    return [dict(r) for r in c.fetchall()]
+
+def get_payments_for_emi(emi_id):
+    c=get_cur(); c.execute("SELECT * FROM EMIPayments WHERE emi_id=? ORDER BY payment_id ASC",(emi_id,))
     return [dict(r) for r in c.fetchall()]
 
 def list_closed_loans(search=""):
@@ -1584,8 +1609,31 @@ document.querySelectorAll('.sidebar nav a').forEach(a=>{{
 # ══════════════════════════════════════════════════════════════════════════════
 #  FLASK APP
 # ══════════════════════════════════════════════════════════════════════════════
+def _get_secret_key():
+    """Stable secret key across restarts (a fresh random key on every restart would
+    invalidate every logged-in session, forcing surprise logouts mid-entry)."""
+    env_key = os.environ.get("SECRET_KEY", "").strip()
+    if env_key:
+        return env_key
+    key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".flask_secret_key")
+    try:
+        with open(key_file, "r") as f:
+            existing = f.read().strip()
+            if existing:
+                return existing
+    except FileNotFoundError:
+        pass
+    new_key = secrets.token_hex(32)
+    try:
+        with open(key_file, "w") as f:
+            f.write(new_key)
+    except OSError:
+        pass
+    return new_key
+
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+app.secret_key = _get_secret_key()
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
 
 @app.teardown_appcontext
 def close_db(e=None):
@@ -1624,6 +1672,7 @@ def login():
     if request.method == "POST":
         user = authenticate_user(request.form["username"], request.form["password"])
         if user:
+            session.permanent = True
             session["username"] = user["username"]; session["role"] = user["role"]
             flash(f"Welcome, {user['username']}!","success")
             return redirect(url_for("dashboard"))
@@ -2064,6 +2113,20 @@ def add_loan():
           <div id="risk_box" class="risk-box"></div>
         </div>
 
+        <div class="section-title">🛡️ Guarantor Details (optional)</div>
+        <div class="form-group">
+          <label>Guarantor Name</label><input name="guarantor_name">
+        </div>
+        <div class="form-group">
+          <label>Guarantor Mobile</label>
+          <input name="guarantor_mobile" maxlength="10"
+                 oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)">
+        </div>
+        <div class="form-group full">
+          <label>Guarantor Address</label>
+          <textarea name="guarantor_address" rows="2"></textarea>
+        </div>
+
         <div class="section-title">🚗 Vehicle Details <span id="vehicle_mandatory_note">(optional unless Reloan = Yes)</span></div>
         <div class="form-group">
           <label>Vehicle Type</label>
@@ -2097,20 +2160,6 @@ def add_loan():
         <div class="form-group">
           <label>Vehicle Colour</label>
           <input name="vehicle_colour" id="vehicle_colour" class="vehicle-req-field">
-        </div>
-
-        <div class="section-title">🛡️ Guarantor Details (optional)</div>
-        <div class="form-group">
-          <label>Guarantor Name</label><input name="guarantor_name">
-        </div>
-        <div class="form-group">
-          <label>Guarantor Mobile</label>
-          <input name="guarantor_mobile" maxlength="10"
-                 oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)">
-        </div>
-        <div class="form-group full">
-          <label>Guarantor Address</label>
-          <textarea name="guarantor_address" rows="2"></textarea>
         </div>
 
         <div class="section-title">📎 Documents & Remarks</div>
@@ -2177,6 +2226,14 @@ def add_loan():
     if(_loanForm){{
       _loanForm.addEventListener('input', ()=>{{ _loanFormDirty = true; }});
       _loanForm.addEventListener('change', ()=>{{ _loanFormDirty = true; }});
+      // Pressing Enter in any field (e.g. while typing the Aadhaar number) must NOT
+      // submit this long multi-section form early — a failed server-side check
+      // redirects to a blank form and wipes everything already typed.
+      _loanForm.addEventListener('keydown', function(e){{
+        if(e.key === 'Enter' && e.target.tagName !== 'TEXTAREA' && e.target.type !== 'submit'){{
+          e.preventDefault();
+        }}
+      }});
       _loanForm.addEventListener('submit', function(e){{
         if(_loanConfirmed){{ _loanFormDirty = false; return; }}
         e.preventDefault();
@@ -2608,8 +2665,9 @@ def customers():
         sc = {"Active":"approved","Closed":"closed"}.get(c["status"],"pending")
         lid = c["loan_id"]
         edit_btn = f'<a class="btn btn-sm btn-amber" href="/customer/edit/{lid}">&#9998; Edit</a>' if can_edit else ""
+        loan_no = c.get('loan_number') or '—'
         rows += f"""<tr>
-          <td><b>{c['name']}</b></td><td>{c['vehicle_type']}</td>
+          <td><b style="color:var(--accent);">{loan_no}</b> — {c['name']}</td><td>{c['vehicle_type']}</td>
           <td>₹{c['loan_amount']:,.2f}</td><td><b>₹{c['emi_amount']:,.2f}</b></td>
           <td><span class="badge badge-{sc}">{c['status']}</span></td>
           <td style="white-space:nowrap;">
@@ -2624,7 +2682,7 @@ def customers():
       <button class="btn btn-primary btn-sm">Search</button>
     </form>
     <div class="card"><div class="table-wrap"><table>
-      <tr><th>Name</th><th>Vehicle</th><th>Loan Amt</th><th>EMI/mo</th><th>Status</th><th>Actions</th></tr>
+      <tr><th>Loan # — Name</th><th>Vehicle</th><th>Loan Amt</th><th>EMI/mo</th><th>Status</th><th>Actions</th></tr>
       {rows or '<tr><td colspan="6" style="text-align:center;color:var(--muted);">No customers found</td></tr>'}
     </table></div></div>"""
     return page("Customers", content, "customers")
@@ -2900,7 +2958,8 @@ def emis(loan_id):
     const h=window.location.hash;
     if(h){{const el=document.querySelector(h);if(el){{el.scrollIntoView({{behavior:'smooth',block:'center'}});}}}}
     </script>
-    <a href="/customers" class="btn" style="background:var(--surface2);color:var(--text);">← Back</a>"""
+    <a href="/loans" class="btn" style="background:var(--surface2);color:var(--text);"
+       onclick="if(document.referrer && document.referrer.indexOf(window.location.host)!==-1){{history.back();return false;}}">← Back</a>"""
     return page("EMIs", content, "emis")
 
 @app.route("/emi/pay", methods=["POST"])
@@ -2913,7 +2972,7 @@ def emi_pay():
     bill_no = request.form.get("bill_number","").strip()
     paid_on = request.form.get("paid_on","").strip()
     try:
-        msg = pay_emi(emi_id, pay_amt, bill_number=bill_no, paid_on=paid_on or None)
+        msg = pay_emi(emi_id, pay_amt, bill_number=bill_no, paid_on=paid_on or None, paid_by=session.get("username"))
         flash(msg,"success")
     except Exception as e:
         flash(str(e),"danger")
@@ -4501,9 +4560,27 @@ def emi_edit(emi_id):
     loan_row = c.fetchone() or {}
     status_options = ["Pending","Paid","Partial","Overdue"]
 
+    payments = get_payments_for_emi(emi_id)
+    payment_rows = "".join(f"""<tr>
+          <td>{i+1}</td><td>{fmt_inr(p.get('amount') or 0)}</td>
+          <td>{fmt_inr(p.get('extra_interest') or 0)}</td>
+          <td>{p.get('bill_number') or '—'}</td>
+          <td>{(p.get('paid_at') or '')[:10]}</td>
+          <td>{p.get('paid_by') or '—'}</td>
+        </tr>""" for i, p in enumerate(payments))
+    payment_history_card = f"""
+    <div class="card" style="margin-bottom:12px;">
+      <h3 style="font-size:14px;margin-bottom:10px;">💳 Payment History <span style="font-size:11px;font-weight:400;color:var(--muted);">(each payment recorded separately)</span></h3>
+      <div class="table-wrap"><table>
+        <tr><th>#</th><th>Amount</th><th>Extra Interest</th><th>Bill No</th><th>Paid On</th><th>Paid By</th></tr>
+        {payment_rows or '<tr><td colspan="6" style="text-align:center;color:var(--muted);">No payments recorded yet for this installment.</td></tr>'}
+      </table></div>
+    </div>"""
+
     content = f"""
     <h1>✏️ Edit EMI #{emi.get('installment_no','')} — {dict(loan_row).get('loan_number','')}</h1>
     <div class="alert alert-warning">⚠️ <b>Super Admin Edit:</b> Direct database update. Use carefully.</div>
+    {payment_history_card}
     <div class="card">
     <form method="POST">
       <input type="hidden" name="loan_id" value="{loan_id}">
