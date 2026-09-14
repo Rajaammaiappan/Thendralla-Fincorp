@@ -46,6 +46,10 @@ def allowed_file(fn):
 TURSO_URL     = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN   = os.environ.get("TURSO_TOKEN", "")
 UPCOMING_DAYS = 10
+# Public link to the hosted user_guide.html (e.g. GitHub Pages). Defaults to the copy
+# served locally by this app; once uploaded to GitHub, set the USER_GUIDE_URL
+# environment variable to that public link — no code change needed either way.
+USER_GUIDE_URL = os.environ.get("USER_GUIDE_URL", "/user-guide")
 
 EMAIL_CONFIG = {
     "smtp_host": os.environ.get("SMTP_HOST", "smtp.gmail.com"),
@@ -1341,6 +1345,16 @@ tr.row-paid td{opacity:.65;}
   transition:transform .15s ease,box-shadow .15s ease;
 }
 .chatbot-fab:hover{transform:scale(1.08);box-shadow:0 6px 18px rgba(26,79,173,.5);}
+/* ── USER GUIDE CORNER BUTTON ── */
+.guide-fab{
+  position:fixed;top:16px;right:16px;z-index:210;
+  display:flex;align-items:center;gap:6px;
+  background:var(--green);color:#fff;border:none;text-decoration:none;
+  padding:0 16px;height:40px;border-radius:20px;font-size:13px;font-weight:700;
+  box-shadow:0 4px 14px rgba(5,150,105,.4);
+  transition:transform .15s ease,box-shadow .15s ease;
+}
+.guide-fab:hover{transform:scale(1.05);box-shadow:0 6px 18px rgba(5,150,105,.5);color:#fff;}
 .chatbot-window{
   position:fixed;bottom:88px;right:20px;z-index:500;
   width:360px;max-width:92vw;height:480px;max-height:72vh;
@@ -1385,6 +1399,7 @@ tr.row-paid td{opacity:.65;}
 @media(max-width:480px){
   .chatbot-window{width:94vw;right:3vw;bottom:80px;height:65vh;}
   .chatbot-fab{bottom:14px;right:14px;}
+  .guide-fab{top:62px;right:10px;padding:0 12px;height:34px;font-size:12px;}
 }
 </style>
 """
@@ -1608,6 +1623,8 @@ document.querySelectorAll('.sidebar nav a').forEach(a=>{{
   }});
 }});
 </script>
+<!-- User Guide corner button (all roles) -->
+<a class="guide-fab" href="{USER_GUIDE_URL}" target="_blank" rel="noopener" title="User Guide">📘 Guide</a>
 <!-- Chatbot Widget (Admin / Super Admin only) -->
 {f'''<button class="chatbot-fab" onclick="tfcChatToggle()" title="Ask Thendralla">💬</button>
 <div class="chatbot-window" id="tfcChatWindow">
@@ -1691,6 +1708,16 @@ def role_required(*roles):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route("/")
 def index(): return redirect(url_for("dashboard"))
+
+@app.route("/user-guide")
+def user_guide_page():
+    """Serves the local picture guide. Once the same file is uploaded to GitHub,
+    point USER_GUIDE_URL at that link instead and this route becomes an unused fallback."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_guide.html")
+    if os.path.exists(path):
+        return send_file(path)
+    flash("User guide not found.", "danger")
+    return redirect(url_for("dashboard"))
 
 # ── Login ──────────────────────────────────────────────────────────────────────
 @app.route("/login", methods=["GET","POST"])
