@@ -600,13 +600,16 @@ def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number="", paid_on
     remaining   = emi["remaining_amount"] if emi["remaining_amount"] is not None else emi["emi_amount"]
     if pay_amount is None: pay_amount = remaining
     total_due   = remaining + (extra_interest or 0.0)
-    if pay_amount < total_due:
+    # Guard against float drift (e.g. three partial payments summing to 2.8e-14 short of
+    # total_due) so a fully-paid installment doesn't get stuck in "Partial" forever.
+    if pay_amount < total_due - 0.005:
+        new_remaining = round(total_due - pay_amount, 2)
         c.execute("UPDATE EMI SET amount_paid=?,remaining_amount=?,extra_interest=?,status=?,bill_number=? WHERE emi_id=?",
-                  (amount_paid+pay_amount, total_due-pay_amount, extra_interest, "Partial", bill_number.strip(), emi_id))
+                  (amount_paid+pay_amount, new_remaining, extra_interest, "Partial", bill_number.strip(), emi_id))
         c.execute("INSERT INTO EMIPayments (emi_id,loan_id,amount,extra_interest,bill_number,paid_at,paid_by) VALUES (?,?,?,?,?,?,?)",
                   (emi_id, emi["loan_id"], pay_amount, extra_interest, bill_number.strip(), paid_at_val, paid_by))
         get_db().commit()
-        return f"Partial payment recorded. Remaining: {fmt_inr(total_due-pay_amount)}"
+        return f"Partial payment recorded. Remaining: {fmt_inr(new_remaining)}"
     else:
         c.execute("UPDATE EMI SET status='Paid',paid_at=?,amount_paid=?,remaining_amount=0,extra_interest=0,bill_number=? WHERE emi_id=?",
                   (paid_at_val, amount_paid+pay_amount, bill_number.strip(), emi_id))
@@ -650,6 +653,31 @@ def get_emis_for_loan(loan_id):
 def get_payments_for_emi(emi_id):
     c=get_cur(); c.execute("SELECT * FROM EMIPayments WHERE emi_id=? ORDER BY payment_id ASC",(emi_id,))
     return [dict(r) for r in c.fetchall()]
+
+def get_payments_by_emi_for_loan(loan_id):
+    """All payments for a loan, grouped by emi_id, in payment order — used to build the
+    X.1 / X.2 / X.3 per-installment payment reference trail."""
+    c=get_cur(); c.execute("SELECT * FROM EMIPayments WHERE loan_id=? ORDER BY payment_id ASC",(loan_id,))
+    grouped = {}
+    for r in c.fetchall():
+        r = dict(r)
+        grouped.setdefault(r["emi_id"], []).append(r)
+    return grouped
+
+def format_bill_ref(installment_no, payments, is_paid):
+    """Render the Bill No cell: a single payment shows its bill number plainly;
+    multiple partial payments against the same installment are tagged 3.1, 3.2, 3.3…
+    so each one stays traceable, and once fully paid the row closes back under
+    the plain installment number."""
+    if not payments:
+        return "—"
+    if len(payments) == 1:
+        return html.escape(str(payments[0].get("bill_number") or "—"))
+    lines = [f"<b>{installment_no}.{i+1}</b>: {html.escape(str(p.get('bill_number') or '—'))}"
+             for i, p in enumerate(payments)]
+    if is_paid:
+        lines.append(f'<span style="color:var(--green);">✅ <b>{installment_no}</b> (Closed)</span>')
+    return "<br>".join(lines)
 
 def list_closed_loans(search=""):
     q=f"%{search}%"; c=get_cur()
@@ -2859,6 +2887,7 @@ def customer_edit(loan_id):
 def emis(loan_id):
     c = get_cur(); c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
     loan = dict(c.fetchone() or {}); emi_list = get_emis_for_loan(loan_id)
+    payments_by_emi = get_payments_by_emi_for_loan(loan_id)
     role = session.get("role",""); can_pay = ROLES.get(role,{}).get("can_pay", False)
     can_edit_emi = ROLES.get(role,{}).get("can_edit", False)
     today = date.today(); upcoming_limit = today + timedelta(days=UPCOMING_DAYS)
@@ -2878,8 +2907,8 @@ def emis(loan_id):
         elif is_paid:    row_class = "row-paid"
 
         sc = {"Paid":"paid","Partial":"partial","Overdue":"overdue"}.get(e["status"],"pending")
-        remaining = float(e.get("remaining_amount") or e["emi_amount"])
-        bill_no   = e.get("bill_number") or "—"
+        remaining = 0.0 if is_paid else float(e.get("remaining_amount") if e.get("remaining_amount") is not None else e["emi_amount"])
+        bill_no   = format_bill_ref(e["installment_no"], payments_by_emi.get(e["emi_id"], []), is_paid)
         paid_at   = (e.get("paid_at") or "")[:10]
 
         pay_form = ""
@@ -4561,18 +4590,23 @@ def emi_edit(emi_id):
     status_options = ["Pending","Paid","Partial","Overdue"]
 
     payments = get_payments_for_emi(emi_id)
+    inst_no = emi.get('installment_no','?')
     payment_rows = "".join(f"""<tr>
-          <td>{i+1}</td><td>{fmt_inr(p.get('amount') or 0)}</td>
+          <td><b>{inst_no}.{i+1}</b></td><td>{fmt_inr(p.get('amount') or 0)}</td>
           <td>{fmt_inr(p.get('extra_interest') or 0)}</td>
           <td>{p.get('bill_number') or '—'}</td>
           <td>{(p.get('paid_at') or '')[:10]}</td>
           <td>{p.get('paid_by') or '—'}</td>
         </tr>""" for i, p in enumerate(payments))
+    if payments and emi.get("status") == "Paid":
+        payment_rows += f"""<tr>
+          <td colspan="6" style="color:var(--green);"><b>✅ {inst_no} (Closed)</b></td>
+        </tr>"""
     payment_history_card = f"""
     <div class="card" style="margin-bottom:12px;">
-      <h3 style="font-size:14px;margin-bottom:10px;">💳 Payment History <span style="font-size:11px;font-weight:400;color:var(--muted);">(each payment recorded separately)</span></h3>
+      <h3 style="font-size:14px;margin-bottom:10px;">💳 Payment History <span style="font-size:11px;font-weight:400;color:var(--muted);">(each payment recorded separately — Ref # = installment.payment)</span></h3>
       <div class="table-wrap"><table>
-        <tr><th>#</th><th>Amount</th><th>Extra Interest</th><th>Bill No</th><th>Paid On</th><th>Paid By</th></tr>
+        <tr><th>Ref #</th><th>Amount</th><th>Extra Interest</th><th>Bill No</th><th>Paid On</th><th>Paid By</th></tr>
         {payment_rows or '<tr><td colspan="6" style="text-align:center;color:var(--muted);">No payments recorded yet for this installment.</td></tr>'}
       </table></div>
     </div>"""
