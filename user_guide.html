@@ -159,5 +159,26 @@
   </div>
 
 </div>
+<style>img.emoji{height:1.1em;width:1.1em;margin:0 .05em 0 .1em;vertical-align:-0.15em;display:inline-block;}</style>
+<script>
+/* Old computers without an emoji font show emoji as "?" — swap them for pictures when that happens. */
+(function(){
+  function emojiOK(){
+    try{
+      var c=document.createElement('canvas'); c.width=c.height=32;
+      var x=c.getContext('2d'); x.textBaseline='top'; x.font='24px sans-serif'; x.fillStyle='#000';
+      x.fillText('😀',0,0);
+      var d=x.getImageData(0,0,32,32).data;
+      for(var i=0;i<d.length;i+=4){ if(d[i+3]>0 && (d[i]!==d[i+1]||d[i+1]!==d[i+2])) return true; }
+      return false;
+    }catch(e){ return true; }
+  }
+  if(emojiOK() && location.search.indexOf('emoji=1')<0) return;
+  var s=document.createElement('script');
+  s.src='https://cdn.jsdelivr.net/npm/@twemoji/api@15.0.3/dist/twemoji.min.js';
+  s.onload=function(){ try{ twemoji.parse(document.body,{folder:'svg',ext:'.svg',className:'emoji'}); }catch(e){} };
+  document.head.appendChild(s);
+})();
+</script>
 </body>
 </html>

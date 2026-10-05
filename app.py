@@ -11,7 +11,7 @@ Changes v3:
   - All previous features preserved
 """
 
-import os, math, sqlite3, hashlib, secrets, calendar, smtplib, base64, io, zipfile, csv, re, tempfile, html
+import os, math, sqlite3, hashlib, secrets, calendar, smtplib, base64, io, zipfile, csv, re, tempfile, html, json
 import requests as http_req
 from urllib.parse import quote as urlquote
 from datetime import date, datetime, timezone, timedelta
@@ -189,6 +189,84 @@ def fmt_inr(v):
     try: return f"₹{float(v):,.2f}"
     except: return "₹0.00"
 
+MAX_EXTRA_NUMBERS = 2   # numbers allowed in addition to the primary one, per person
+
+def parse_extra_numbers_form(f, prefix, label):
+    """Reads <prefix>_extra_mobile_N / <prefix>_extra_name_N from a form into a JSON string
+    of [{"number","name"}]. Raises ValueError on a bad number or a missing 'belongs to' name."""
+    out = []
+    for i in range(1, MAX_EXTRA_NUMBERS + 1):
+        num  = re.sub(r"\D", "", f.get(f"{prefix}_extra_mobile_{i}", "") or "")
+        name = (f.get(f"{prefix}_extra_name_{i}", "") or "").strip()
+        if not num and not name: continue
+        if len(num) != 10:
+            raise ValueError(f"{label} additional number {i} must be exactly 10 digits.")
+        if not name:
+            raise ValueError(f"{label} additional number {i}: please enter whom the number belongs to.")
+        out.append({"number": num, "name": name})
+    return json.dumps(out) if out else ""
+
+def _extra_numbers(raw):
+    try: data = json.loads(raw) if raw else []
+    except (ValueError, TypeError): return []
+    return [x for x in data if isinstance(x, dict) and x.get("number")]
+
+def contact_numbers_html(primary, primary_title, extras_raw, owner_word):
+    """Click-to-call numbers; hovering a number shows whose it is."""
+    def one(num, title):
+        return (f'<a href="tel:{html.escape(num)}" title="{html.escape(title)}" '
+                f'style="color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted);'
+                f'cursor:help;white-space:nowrap;">{html.escape(num)}</a>')
+    parts = []
+    if (primary or "").strip():
+        parts.append(one(primary.strip(), primary_title))
+    for x in _extra_numbers(extras_raw):
+        parts.append(one(x["number"], f"{x.get('name','')} ({owner_word}'s other number)"))
+    return "<br>".join(parts) if parts else "—"
+
+def contact_numbers_text(extras_raw):
+    return "; ".join(f"{x['number']} ({x.get('name','')})" for x in _extra_numbers(extras_raw))
+
+_EXTRA_NUMBERS_JS = """<script>
+if(!window.addExtraNumber){window.addExtraNumber=function(prefix,btn){
+  var rows=document.querySelectorAll('[data-extra-row="'+prefix+'"]'),left=0,shown=false;
+  for(var i=0;i<rows.length;i++){
+    if(!shown && rows[i].style.display==='none'){rows[i].style.display='flex';shown=true;}
+    else if(rows[i].style.display==='none'){left++;}
+  }
+  if(left===0) btn.style.display='none';
+};}
+</script>"""
+
+def extra_numbers_block(prefix, raw=None):
+    """Form block: up to MAX_EXTRA_NUMBERS additional mobile numbers, each with a 'belongs to' name."""
+    existing = _extra_numbers(raw)
+    rows = ""
+    for i in range(1, MAX_EXTRA_NUMBERS + 1):
+        x = existing[i-1] if i <= len(existing) else {}
+        rows += (f'<div data-extra-row="{prefix}" style="display:{"flex" if x else "none"};gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
+                 f'<input name="{prefix}_extra_mobile_{i}" value="{html.escape(x.get("number",""))}" maxlength="10" '
+                 f'placeholder="Mobile number" style="flex:1;min-width:150px;" '
+                 f'oninput="this.value=this.value.replace(/[^0-9]/g,\'\').slice(0,10)">'
+                 f'<input name="{prefix}_extra_name_{i}" value="{html.escape(x.get("name",""))}" '
+                 f'placeholder="Belongs to (e.g. Wife)" style="flex:1;min-width:150px;"></div>')
+    hide_btn = "display:none;" if len(existing) >= MAX_EXTRA_NUMBERS else ""
+    return (f'<div class="form-group full"><label>Additional Numbers '
+            f'<span style="font-size:10px;color:var(--muted);">(optional — up to {MAX_EXTRA_NUMBERS} more; '
+            f'type whose number it is)</span></label>{rows}'
+            f'<button type="button" class="btn btn-sm btn-amber" style="{hide_btn}width:fit-content;" '
+            f'onclick="addExtraNumber(\'{prefix}\',this)">➕ Add another number</button></div>' + _EXTRA_NUMBERS_JS)
+
+def customer_numbers_html(row):
+    name = row.get("customer_name") or row.get("name") or "Customer"
+    return contact_numbers_html(row.get("customer_mobile"), f"Primary — {name} (Customer)",
+                                row.get("customer_extra_numbers"), "Customer")
+
+def guarantor_numbers_html(row):
+    name = row.get("guarantor_name") or "Guarantor"
+    return contact_numbers_html(row.get("guarantor_mobile"), f"Primary — {name} (Guarantor)",
+                                row.get("guarantor_extra_numbers"), "Guarantor")
+
 def next_loan_number():
     START_SEQ = 2201   # T0101–T2200 already used; new loans start from T2201
     c = get_cur()
@@ -354,6 +432,7 @@ def init_db():
         customer_name TEXT,
         customer_mobile TEXT,
         customer_address TEXT,
+        customer_permanent_address TEXT,
         customer_location TEXT,
         vehicle_type TEXT,
         vehicle_number TEXT,
@@ -373,6 +452,7 @@ def init_db():
         customer_email TEXT,
         guarantor_name TEXT,
         guarantor_address TEXT,
+        guarantor_location TEXT,
         guarantor_mobile TEXT,
         is_reloan INTEGER DEFAULT 0,
         reloan_ref TEXT,
@@ -412,6 +492,46 @@ def init_db():
         FOREIGN KEY(emi_id) REFERENCES EMI(emi_id),
         FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
     );
+    CREATE TABLE IF NOT EXISTS Receipts (
+        receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        receipt_no TEXT,
+        loan_id INTEGER,
+        emi_id INTEGER,
+        installment_no INTEGER,
+        installment_label TEXT,
+        received_from TEXT,
+        receipt_date TEXT,
+        vehicle_number TEXT,
+        loan_number TEXT,
+        cash REAL,
+        online REAL,
+        total REAL,
+        amount_words TEXT,
+        cashier TEXT,
+        recorded_on_emi INTEGER DEFAULT 0,
+        created_at TEXT,
+        FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
+    );
+    CREATE TABLE IF NOT EXISTS PreClosure (
+        preclose_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        loan_id INTEGER,
+        status TEXT,
+        requested_by TEXT,
+        requested_at TEXT,
+        original_rate REAL,
+        new_rate REAL,
+        months_elapsed INTEGER,
+        paid_before REAL,
+        settlement_amount REAL,
+        approved_by TEXT,
+        approved_at TEXT,
+        decision_remarks TEXT,
+        bill_number TEXT,
+        paid_on TEXT,
+        closed_by TEXT,
+        closed_at TEXT,
+        FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
+    );
     CREATE TABLE IF NOT EXISTS RejectedLoans (
         reject_id INTEGER PRIMARY KEY AUTOINCREMENT,
         loan_id INTEGER UNIQUE, reason TEXT, created_at TEXT,
@@ -435,6 +555,8 @@ def init_db():
         created_by TEXT,
         created_at TEXT,
         resolved_at TEXT,
+        category TEXT DEFAULT 'Loans',
+        item TEXT,
         FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
     )
     """)
@@ -449,6 +571,22 @@ def init_db():
         "ALTER TABLE LoanEntry ADD COLUMN vehicle_colour TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN guarantor_name TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN guarantor_address TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN guarantor_location TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN customer_permanent_address TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN field_visit TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN field_visit_date TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN field_visit_remark TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN field_visited_by TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN customer_extra_numbers TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN guarantor_extra_numbers TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN key_received TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN key_received_date TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN rc_received TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN rc_received_date TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN docs_received TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN docs_received_date TEXT",
+        "ALTER TABLE FollowUp ADD COLUMN category TEXT DEFAULT 'Loans'",
+        "ALTER TABLE FollowUp ADD COLUMN item TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN guarantor_mobile TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN is_reloan INTEGER DEFAULT 0",
         "ALTER TABLE LoanEntry ADD COLUMN reloan_ref TEXT",
@@ -483,6 +621,10 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_customers_status ON Customers(status)",
         "CREATE INDEX IF NOT EXISTS idx_followup_loan_id ON FollowUp(loan_id)",
         "CREATE INDEX IF NOT EXISTS idx_followup_status ON FollowUp(status)",
+        "CREATE INDEX IF NOT EXISTS idx_receipts_no ON Receipts(receipt_no)",
+        "CREATE INDEX IF NOT EXISTS idx_receipts_loan_id ON Receipts(loan_id)",
+        "CREATE INDEX IF NOT EXISTS idx_preclosure_loan_id ON PreClosure(loan_id)",
+        "CREATE INDEX IF NOT EXISTS idx_preclosure_status ON PreClosure(status)",
         "CREATE INDEX IF NOT EXISTS idx_emipayments_emi_id ON EMIPayments(emi_id)",
         "CREATE INDEX IF NOT EXISTS idx_emipayments_loan_id ON EMIPayments(loan_id)",
     ]:
@@ -511,7 +653,7 @@ def create_loan(ln, cname, cmobile, caddr, cloc,
                 vtype, vnum, vmodel, vname, eng, chas, vcol,
                 amt, rate_raw, tenure, sdate, aadhar="", cemail="",
                 gname="", gaddr="", gmob="", is_reloan=0, reloan_ref="",
-                remarks="", attachment="", custom_emi_amount=None, loan_date=None):
+                remarks="", attachment="", custom_emi_amount=None, loan_date=None, gloc="", paddr=""):
     r = normalize_interest(rate_raw)
     if r is None: raise ValueError("Invalid interest rate")
     c = get_cur()
@@ -520,16 +662,256 @@ def create_loan(ln, cname, cmobile, caddr, cloc,
                   vehicle_type,vehicle_number,vehicle_model,vehicle_name,engine_number,chassis_number,vehicle_colour,
                   loan_amount,interest_rate,tenure,start_date,loan_date,status,created_at,
                   attachment,aadhar_number,customer_email,guarantor_name,guarantor_address,guarantor_mobile,
-                  is_reloan,reloan_ref,remarks,custom_emi_amount)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  is_reloan,reloan_ref,remarks,custom_emi_amount,guarantor_location,customer_permanent_address)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
               (ln,cname,cmobile,caddr,cloc,
                vtype,vnum,vmodel,vname,eng,chas,vcol,
                float(amt),float(r),int(tenure),sdate,loan_date or sdate,"PendingApproval",
                datetime.now(timezone.utc).isoformat(),
                attachment or None,aadhar,cemail,gname,gaddr,gmob,int(is_reloan),reloan_ref,
                remarks,
-               float(custom_emi_amount) if custom_emi_amount not in (None,"","0") else None))
+               float(custom_emi_amount) if custom_emi_amount not in (None,"","0") else None,
+               gloc, paddr))
     get_db().commit(); return c.lastrowid
+
+def record_handover_details(loan_id, loan_date_val, field_visit, field_visit_date,
+                            field_visit_remark, answers, username, visited_by=""):
+    """Saves the field-visit / key / RC / documents answers. 'Yes' items are stamped with the
+    loan date; 'No' items get an automatic follow-up (key 3 days, proof & documents 3 days,
+    RC 15 days after the loan date)."""
+    loan_iso = loan_date_val.isoformat()
+    c = get_cur()
+    c.execute("""UPDATE LoanEntry SET field_visit=?, field_visit_date=?, field_visit_remark=?, field_visited_by=?,
+                    key_received=?, key_received_date=?, rc_received=?, rc_received_date=?,
+                    docs_received=?, docs_received_date=? WHERE id=?""",
+              (field_visit, field_visit_date, field_visit_remark or None, visited_by or None,
+               answers["key_received"],  loan_iso if answers["key_received"]  == "yes" else None,
+               answers["rc_received"],   loan_iso if answers["rc_received"]   == "yes" else None,
+               answers["docs_received"], loan_iso if answers["docs_received"] == "yes" else None,
+               loan_id))
+    get_db().commit()
+    plan = (("key_received",  "key",  "Key Collection",    3,  "Collect vehicle key from customer"),
+            ("rc_received",   "rc",   "Proof & Documents", 15, "Collect RC book from customer"),
+            ("docs_received", "docs", "Proof & Documents", 3,  "Collect proof & documents from customer"))
+    for field, item, category, days, remark in plan:
+        if answers[field] == "no":
+            add_follow_up(loan_id, (loan_date_val + timedelta(days=days)).isoformat(),
+                          remark, username, category, item)
+
+# ── Billing (printed-style receipts) ────────────────────────────────────────────
+_ONES = ["","One","Two","Three","Four","Five","Six","Seven","Eight","Nine","Ten","Eleven","Twelve",
+         "Thirteen","Fourteen","Fifteen","Sixteen","Seventeen","Eighteen","Nineteen"]
+_TENS = ["","","Twenty","Thirty","Forty","Fifty","Sixty","Seventy","Eighty","Ninety"]
+
+def _words_below_1000(n):
+    out = []
+    if n >= 100:
+        out.append(_ONES[n // 100] + " Hundred"); n %= 100
+    if n >= 20:
+        out.append(_TENS[n // 10] + ((" " + _ONES[n % 10]) if n % 10 else ""))
+    elif n > 0:
+        out.append(_ONES[n])
+    return " ".join(out)
+
+def amount_in_words(amount):
+    """Indian-style words: 2850 -> 'Two Thousand Eight Hundred Fifty Rupees Only'."""
+    amount = round(float(amount or 0), 2)
+    rupees, paise = int(amount), int(round((amount - int(amount)) * 100))
+    if rupees == 0 and paise == 0: return "Zero Rupees Only"
+    unit = "Rupee" if rupees == 1 else "Rupees"
+    parts = []
+    for div, name in ((10000000, "Crore"), (100000, "Lakh"), (1000, "Thousand")):
+        if rupees >= div:
+            parts.append(_words_below_1000(rupees // div) + " " + name); rupees %= div
+    if rupees: parts.append(_words_below_1000(rupees))
+    text = " ".join(parts) + " " + unit if parts else ""
+    if paise: text += (" and " if text else "") + _words_below_1000(paise) + " Paise"
+    return text.strip() + " Only"
+
+def ordinal_due(n):
+    n = int(n)
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix} due"
+
+def generate_receipt_pdf(r):
+    """One receipt on an A5 page, laid out like the printed receipt book."""
+    if not REPORTLAB_AVAILABLE: raise RuntimeError("reportlab not installed.")
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.pagesizes import A5
+    from reportlab.lib.utils import ImageReader
+    buf = io.BytesIO()
+    W, H = A5
+    c = rl_canvas.Canvas(buf, pagesize=A5)
+    blue = colors.HexColor("#1a4fad")
+    m = 0.8 * cm
+    c.setStrokeColor(blue); c.setLineWidth(1.4)
+    c.rect(m, m, W - 2*m, H - 2*m)
+    top = H - m
+    # header block: logo + name/address, receipt no box on the right
+    hdr_bottom = top - 3.3*cm
+    c.line(m, hdr_bottom, W - m, hdr_bottom)
+    box_x = W - m - 4.2*cm
+    c.line(box_x, top, box_x, hdr_bottom)
+    c.line(box_x, top - 1.1*cm, W - m, top - 1.1*cm)
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+    if os.path.exists(logo_path):
+        try: c.drawImage(ImageReader(logo_path), m + 0.25*cm, hdr_bottom + 0.35*cm, 2.3*cm, 2.3*cm, mask="auto", preserveAspectRatio=True)
+        except Exception: pass
+    c.setFillColor(blue)
+    c.setFont("Helvetica-Bold", 17); c.drawString(m + 3.0*cm, top - 1.3*cm, "Thendralla Fincorp")
+    c.setFont("Helvetica", 7.6)
+    c.drawString(m + 3.0*cm, top - 1.85*cm, "12/360 - 1, Anbu Nagar, Madukkarai Market,")
+    c.drawString(m + 3.0*cm, top - 2.3*cm, "Coimbatore - 641 105.  Ph : +91 63697 52877")
+    c.setFont("Helvetica-Bold", 9); c.drawCentredString(box_x + 2.1*cm, top - 0.75*cm, "RECEIPT NO")
+    c.setFont("Helvetica-Bold", 17); c.drawCentredString(box_x + 2.1*cm, top - 2.3*cm, str(r["receipt_no"]))
+    # field rows
+    y = hdr_bottom - 1.5*cm
+    c.setFillColor(colors.black)
+    def field(label, value, x_label, x_value, y, size=11):
+        c.setFont("Helvetica-Bold", 8.5); c.setFillColor(blue); c.drawString(x_label, y, label)
+        c.setFillColor(colors.black); c.setFont("Helvetica", size); c.drawString(x_value, y, str(value or ""))
+        c.setDash(1, 2); c.setStrokeColor(colors.grey); c.setLineWidth(0.6)
+        c.line(x_value - 0.1*cm, y - 0.15*cm, W - m - 0.5*cm, y - 0.15*cm); c.setDash(); c.setStrokeColor(blue); c.setLineWidth(1.4)
+    xl, xv = m + 0.4*cm, m + 3.6*cm
+    field("Received From", r["received_from"], xl, xv, y); y -= 1.45*cm
+    field("Date", datetime.strptime(r["receipt_date"], "%Y-%m-%d").strftime("%d/%m/%y"), xl, xv, y); y -= 1.45*cm
+    field("Vehicle No.", r["vehicle_number"], xl, xv, y); y -= 1.45*cm
+    c.setFont("Helvetica-Bold", 8.5); c.setFillColor(blue); c.drawString(xl, y, "Installment No.")
+    c.setFillColor(colors.black); c.setFont("Helvetica", 11); c.drawString(xv, y, str(r["installment_label"] or ""))
+    c.setFont("Helvetica-Bold", 8.5); c.setFillColor(blue); c.drawString(W/2 + 0.2*cm, y, "Loan No.")
+    c.setFillColor(colors.black); c.setFont("Helvetica", 11); c.drawString(W/2 + 1.9*cm, y, str(r["loan_number"] or ""))
+    y -= 0.7*cm
+    # amount block
+    block_top = y; block_bottom = block_top - 4.6*cm; mid = W/2 + 0.3*cm
+    c.setStrokeColor(blue); c.setLineWidth(1.4)
+    c.line(m, block_top, W - m, block_top); c.line(m, block_bottom, W - m, block_bottom); c.line(mid, block_top, mid, block_bottom)
+    row_y = block_top - 1.0*cm
+    for label, val in (("CASH :", r["cash"]), ("ONLINE :", r["online"])):
+        c.setFont("Helvetica-Bold", 9); c.setFillColor(blue); c.drawString(m + 0.5*cm, row_y, label)
+        c.setFillColor(colors.black); c.setFont("Helvetica", 11)
+        c.drawString(m + 2.6*cm, row_y, f"Rs. {float(val):,.2f}" if val else "Rs.")
+        row_y -= 1.1*cm
+    c.setStrokeColor(blue); c.line(m, block_bottom + 1.3*cm, mid, block_bottom + 1.3*cm)
+    c.setFont("Helvetica-Bold", 12); c.setFillColor(blue); c.drawString(m + 0.5*cm, block_bottom + 0.45*cm, "Total")
+    c.setFillColor(colors.black); c.setFont("Helvetica-Bold", 13); c.drawString(m + 2.6*cm, block_bottom + 0.45*cm, f"Rs. {float(r['total']):,.2f}")
+    c.setFont("Helvetica-Bold", 9.5); c.setFillColor(blue); c.drawString(mid + 0.4*cm, block_top - 0.8*cm, "For Thendralla Fincorp")
+    c.setFillColor(colors.black); c.setFont("Helvetica", 9); c.drawCentredString((mid + W - m)/2, block_bottom + 1.0*cm, str(r.get("cashier") or ""))
+    c.setFont("Helvetica-Bold", 8); c.setFillColor(blue); c.drawCentredString((mid + W - m)/2, block_bottom + 0.4*cm, "CASHIER")
+    # amount in words
+    y = block_bottom - 0.9*cm
+    c.setFont("Helvetica-Bold", 9); c.drawString(xl, y, "Rupees :");
+    c.setFont("Helvetica", 6.5); c.drawString(xl, y - 0.35*cm, "(Amount in Words)")
+    c.setFillColor(colors.black); c.setFont("Helvetica", 10.5)
+    words = r["amount_words"]; line, lines = "", []
+    for w in words.split():
+        if c.stringWidth((line + " " + w).strip(), "Helvetica", 10.5) > W - 2*m - 3.6*cm: lines.append(line); line = w
+        else: line = (line + " " + w).strip()
+    lines.append(line)
+    for i, ln in enumerate(lines[:3]): c.drawString(m + 3.1*cm, y - i*0.55*cm, ln)
+    c.showPage(); c.save()
+    buf.seek(0)
+    return buf
+
+# ── Pre-closure (early closure at a reduced interest rate, admin-approved) ──────
+def preclosure_months(loan, as_of=None):
+    """Months from the loan date to `as_of`, a part month counting as a full month
+    (minimum 1, never more than the tenure)."""
+    as_of = as_of or date.today()
+    try:
+        ld = parse_date(loan.get("loan_date") or add_months(parse_date(loan["start_date"]), -1).isoformat())
+    except Exception:
+        ld = as_of
+    m = (as_of.year - ld.year) * 12 + (as_of.month - ld.month)
+    if as_of.day > ld.day: m += 1
+    return max(1, min(m, int(loan.get("tenure") or m)))
+
+def preclosure_figures(loan, new_rate_dec, as_of=None):
+    """Settlement = loan amount + interest at the NEW rate for the elapsed months
+    minus what the customer has already paid (never below 0)."""
+    months = preclosure_months(loan, as_of)
+    principal = float(loan["loan_amount"])
+    interest = round(principal * new_rate_dec * months / 12.0, 2)
+    c = get_cur()
+    c.execute("SELECT COALESCE(SUM(amount_paid),0) as p FROM EMI WHERE loan_id=?", (loan["id"],))
+    paid = float(c.fetchone()["p"] or 0)
+    settlement = max(0.0, round(principal + interest - paid, 2))
+    return {"months": months, "interest": interest, "paid": round(paid, 2), "settlement": settlement}
+
+def get_preclosure(loan_id):
+    """Latest pre-closure record of a loan (or None)."""
+    c = get_cur()
+    c.execute("SELECT * FROM PreClosure WHERE loan_id=? ORDER BY preclose_id DESC LIMIT 1", (loan_id,))
+    r = c.fetchone()
+    return dict(r) if r else None
+
+def preclosure_in_progress(loan_id):
+    pc = get_preclosure(loan_id)
+    return bool(pc and pc["status"] in ("Pending", "Approved"))
+
+def request_preclosure(loan_id, username):
+    c = get_cur()
+    c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
+    loan = c.fetchone()
+    if not loan: raise ValueError("Loan not found")
+    if loan["status"] != "Approved": raise ValueError("Only active (approved) loans can be pre-closed.")
+    if preclosure_in_progress(loan_id): raise ValueError("A pre-closure request is already open for this loan.")
+    c.execute("""INSERT INTO PreClosure (loan_id,status,requested_by,requested_at,original_rate)
+                 VALUES (?,?,?,?,?)""",
+              (loan_id, "Pending", username, datetime.now(timezone.utc).isoformat(), float(loan["interest_rate"])))
+    get_db().commit()
+
+def approve_preclosure(preclose_id, new_rate_pct, username):
+    c = get_cur()
+    c.execute("SELECT * FROM PreClosure WHERE preclose_id=?", (preclose_id,))
+    pc = c.fetchone()
+    if not pc or pc["status"] != "Pending": raise ValueError("This pre-closure request is not pending.")
+    c.execute("SELECT * FROM LoanEntry WHERE id=?", (pc["loan_id"],))
+    loan = dict(c.fetchone())
+    try: new_rate = float(new_rate_pct) / 100.0
+    except (TypeError, ValueError): raise ValueError("Enter a valid interest rate.")
+    if new_rate < 0: raise ValueError("Interest rate cannot be negative.")
+    if new_rate > float(pc["original_rate"]) + 1e-9:
+        raise ValueError(f"The reduced rate cannot be higher than the loan's rate ({float(pc['original_rate'])*100:.2f}%).")
+    fig = preclosure_figures(loan, new_rate)
+    c.execute("""UPDATE PreClosure SET status='Approved', new_rate=?, months_elapsed=?, paid_before=?,
+                 settlement_amount=?, approved_by=?, approved_at=? WHERE preclose_id=?""",
+              (new_rate, fig["months"], fig["paid"], fig["settlement"], username,
+               datetime.now(timezone.utc).isoformat(), preclose_id))
+    get_db().commit()
+
+def reject_preclosure(preclose_id, reason, username):
+    c = get_cur()
+    c.execute("SELECT status FROM PreClosure WHERE preclose_id=?", (preclose_id,))
+    pc = c.fetchone()
+    if not pc or pc["status"] != "Pending": raise ValueError("This pre-closure request is not pending.")
+    c.execute("""UPDATE PreClosure SET status='Rejected', approved_by=?, approved_at=?, decision_remarks=?
+                 WHERE preclose_id=?""",
+              (username, datetime.now(timezone.utc).isoformat(), (reason or "").strip() or "No reason given", preclose_id))
+    get_db().commit()
+
+def complete_preclosure(preclose_id, bill_number, paid_on, username):
+    """Records the single closing bill and closes the loan: unpaid EMIs become 'PreClosed'."""
+    c = get_cur()
+    c.execute("SELECT * FROM PreClosure WHERE preclose_id=?", (preclose_id,))
+    pc = c.fetchone()
+    if not pc or pc["status"] != "Approved": raise ValueError("This pre-closure has not been approved.")
+    if float(pc["settlement_amount"] or 0) > 0 and not (bill_number or "").strip():
+        raise ValueError("Bill number is mandatory for the closing payment.")
+    bill_number = (bill_number or "").strip()
+    try: pd = datetime.strptime((paid_on or "").strip(), "%Y-%m-%d").date()
+    except ValueError: raise ValueError("Enter a valid Paid On date.")
+    if pd > date.today(): raise ValueError("Paid On date cannot be in the future.")
+    lid = pc["loan_id"]; now = datetime.now(timezone.utc).isoformat()
+    c.execute("UPDATE EMI SET status='PreClosed', remaining_amount=0 WHERE loan_id=? AND status!='Paid'", (lid,))
+    c.execute("UPDATE LoanEntry SET status='Closed' WHERE id=?", (lid,))
+    c.execute("UPDATE Customers SET status='Closed' WHERE loan_id=?", (lid,))
+    c.execute("INSERT OR REPLACE INTO ClosedLoans (loan_id,closure_date,created_at) VALUES (?,?,?)",
+              (lid, pd.isoformat(), now))
+    c.execute("""UPDATE FollowUp SET status='Resolved', resolved_at=?
+                 WHERE loan_id=? AND status='Pending' AND COALESCE(category,'Loans')='Loans'""", (now, lid))
+    c.execute("""UPDATE PreClosure SET status='Completed', bill_number=?, paid_on=?, closed_by=?, closed_at=?
+                 WHERE preclose_id=?""", (bill_number, pd.isoformat(), username, now, preclose_id))
+    get_db().commit()
 
 def approve_loan(loan_id, override_emi=None):
     c = get_cur()
@@ -577,6 +959,8 @@ def approve_loan(loan_id, override_emi=None):
 def reject_loan(loan_id, reason):
     c = get_cur()
     c.execute("UPDATE LoanEntry SET status='Rejected' WHERE id=?", (loan_id,))
+    # drop the automatic key / RC / proof follow-ups that were created at submission
+    c.execute("DELETE FROM FollowUp WHERE loan_id=? AND item IS NOT NULL AND status='Pending'", (loan_id,))
     c.execute("INSERT OR REPLACE INTO RejectedLoans (loan_id,reason,created_at) VALUES (?,?,?)",
               (loan_id, reason, datetime.now(timezone.utc).isoformat()))
     get_db().commit()
@@ -596,6 +980,10 @@ def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number="", paid_on
     emi = c.fetchone()
     if not emi: raise ValueError("EMI not found")
     if emi["status"] == "Paid": raise ValueError("EMI already paid")
+    if emi["status"] == "PreClosed": raise ValueError("This loan has been pre-closed.")
+    if preclosure_in_progress(emi["loan_id"]):
+        raise ValueError("A pre-closure is in progress for this loan, so EMI payments are paused. "
+                         "Finish or reject the pre-closure first.")
     if not can_pay_emi(emi["loan_id"], emi["installment_no"]):
         raise ValueError(f"Cannot pay installment {emi['installment_no']}. Complete previous first.")
     if not bill_number or not bill_number.strip():
@@ -644,10 +1032,14 @@ def list_all_loans(search=""):
 
 def list_customers(search=""):
     q=f"%{search}%"; c=get_cur()
-    c.execute("""SELECT cu.*, le.loan_number FROM Customers cu
+    c.execute("""SELECT cu.*, le.loan_number, le.customer_name, le.customer_mobile, le.customer_extra_numbers,
+                        le.guarantor_name, le.guarantor_mobile, le.guarantor_extra_numbers
+                 FROM Customers cu
                  LEFT JOIN LoanEntry le ON le.id = cu.loan_id
                  WHERE cu.name LIKE ? OR cu.vehicle_type LIKE ? OR cu.status LIKE ? OR le.loan_number LIKE ?
-                 ORDER BY cu.created_at DESC""",(q,q,q,q))
+                       OR le.customer_mobile LIKE ? OR le.customer_extra_numbers LIKE ?
+                       OR le.guarantor_mobile LIKE ? OR le.guarantor_extra_numbers LIKE ?
+                 ORDER BY cu.created_at DESC""",(q,q,q,q,q,q,q,q))
     return [dict(r) for r in c.fetchall()]
 
 def get_emis_for_loan(loan_id):
@@ -667,6 +1059,71 @@ def get_payments_by_emi_for_loan(loan_id):
         r = dict(r)
         grouped.setdefault(r["emi_id"], []).append(r)
     return grouped
+
+def delay_badge(due_s, paid_s):
+    """On time (paid on/before the EMI due date) or 'N days late', coloured green / red."""
+    d = (parse_date(paid_s) - parse_date(due_s)).days
+    if d <= 0:
+        return '<span style="color:var(--green);font-weight:600;">✅ On time</span>'
+    return f'<span style="color:var(--red);font-weight:600;">⏰ {d} day{"s" if d != 1 else ""} late</span>'
+
+def paid_on_and_status(e, payments, is_paid, today):
+    """Builds the 'Paid On' and 'Payment Status' cells for an EMI row: each sub-bill (5.1, 5.2 …)
+    gets its own payment date and delay; once closed, a final line gives the closing payment's delay.
+    Unpaid / part-paid rows past their due date also show how many days overdue."""
+    inst, due = e["installment_no"], e["due_date"]
+    on_lines, st_lines = [], []
+    if payments:
+        multi = len(payments) > 1
+        for i, p in enumerate(payments):
+            pd = (p.get("paid_at") or "")[:10]
+            tag = f"<b>{inst}.{i+1}</b>: " if multi else ""
+            on_lines.append(f"{tag}{pd or '—'}")
+            st_lines.append(f"{tag}{delay_badge(due, pd) if pd else '—'}")
+        if is_paid and multi:
+            last = (payments[-1].get("paid_at") or "")[:10]
+            if last:
+                on_lines.append(f'<span style="color:var(--green);">✅ <b>{inst}</b></span>: {last}')
+                st_lines.append(f"<b>{inst}</b>: {delay_badge(due, last)}")
+    elif is_paid and e.get("paid_at"):
+        pd = e["paid_at"][:10]
+        on_lines.append(pd)
+        st_lines.append(delay_badge(due, pd))
+    if not is_paid and e.get("status") != "PreClosed":
+        overdue_days = (today - parse_date(due)).days
+        if overdue_days > 0:
+            st_lines.append(f'<span style="color:var(--red);font-weight:600;">🔴 Overdue {overdue_days} day{"s" if overdue_days != 1 else ""}</span>')
+    return "<br>".join(on_lines), "<br>".join(st_lines)
+
+def paid_amount_cell(e, payments):
+    """Paid column: one line per sub-bill amount (5.1, 5.2 …) plus the installment total;
+    a single payment just shows its amount."""
+    total = float(e.get("amount_paid") or 0)
+    if len(payments) > 1:
+        inst = e["installment_no"]
+        lines = [f"<b>{inst}.{i+1}</b>: {fmt_inr(p.get('amount') or 0)}" for i, p in enumerate(payments)]
+        lines.append(f"<b>Total {fmt_inr(total)}</b>")
+        return "<br>".join(lines)
+    return fmt_inr(total)
+
+def late_payment_days(e, payments, is_paid):
+    """Days between the EMI due date and the date of the payment that closed the bill
+    (0 if paid on/before the due date). None while the bill is still open."""
+    if not is_paid: return None
+    if payments and payments[-1].get("paid_at"):
+        closing = payments[-1]["paid_at"][:10]
+    elif e.get("paid_at"):
+        closing = e["paid_at"][:10]
+    else:
+        return None
+    return max(0, (parse_date(closing) - parse_date(e["due_date"])).days)
+
+def late_days_cell(e, payments, is_paid):
+    days = late_payment_days(e, payments, is_paid)
+    if days is None: return "—"
+    color = "var(--green)" if days == 0 else "var(--red)"
+    pad = "<br>" * len(payments) if len(payments) > 1 else ""   # sit on the bill's closing line
+    return f'{pad}<b style="color:{color};">{days}</b>'
 
 def format_bill_ref(installment_no, payments, is_paid):
     """Render the Bill No cell: a single payment shows its bill number plainly;
@@ -688,7 +1145,14 @@ def list_closed_loans(search=""):
     c.execute("""SELECT le.id as loan_id,le.loan_number,le.customer_name,le.vehicle_type,le.loan_amount,cl.closure_date
                  FROM LoanEntry le JOIN ClosedLoans cl ON cl.loan_id=le.id
                  WHERE le.loan_number LIKE ? OR le.customer_name LIKE ? ORDER BY cl.created_at DESC""",(q,q))
-    return [dict(r) for r in c.fetchall()]
+    rows = [dict(r) for r in c.fetchall()]
+    for r in rows:
+        c2 = get_cur()
+        c2.execute("""SELECT new_rate, original_rate, settlement_amount, bill_number FROM PreClosure
+                      WHERE loan_id=? AND status='Completed' ORDER BY preclose_id DESC LIMIT 1""", (r["loan_id"],))
+        pc = c2.fetchone()
+        r["preclosure"] = dict(pc) if pc else None
+    return rows
 
 def list_rejected_loans(search=""):
     q=f"%{search}%"; c=get_cur()
@@ -749,45 +1213,102 @@ def _location_link(loc):
     return f'<a href="{url}" target="_blank" rel="noopener">📍 {html.escape(loc)}</a>'
 
 # ── Follow Up (customer-requested collection date) ──────────────────────────────
-def add_follow_up(loan_id, follow_up_date, remarks, created_by):
+FU_CATEGORIES = ["Loans", "Key Collection", "Proof & Documents"]
+# follow-up "item" -> (LoanEntry received column, LoanEntry received-date column)
+FU_ITEM_COLUMNS = {"key": ("key_received", "key_received_date"),
+                   "rc":  ("rc_received",  "rc_received_date"),
+                   "docs":("docs_received","docs_received_date")}
+
+def add_follow_up(loan_id, follow_up_date, remarks, created_by, category="Loans", item=None):
     c = get_cur(); now = datetime.now(timezone.utc).isoformat()
-    c.execute("""INSERT INTO FollowUp (loan_id,follow_up_date,remarks,status,created_by,created_at)
-                 VALUES (?,?,?,?,?,?)""",
-              (loan_id, follow_up_date, remarks.strip(), "Pending", created_by, now))
+    c.execute("""INSERT INTO FollowUp (loan_id,follow_up_date,remarks,status,created_by,created_at,category,item)
+                 VALUES (?,?,?,?,?,?,?,?)""",
+              (loan_id, follow_up_date, remarks.strip(), "Pending", created_by, now, category, item))
     get_db().commit()
 
 def resolve_follow_up(followup_id):
+    """Closes the follow-up. For Key / RC / Proof follow-ups it also marks that item as
+    received (with today's date) on the loan record."""
     c = get_cur(); now = datetime.now(timezone.utc).isoformat()
+    c.execute("SELECT loan_id, item FROM FollowUp WHERE followup_id=?", (followup_id,))
+    row = c.fetchone()
     c.execute("UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE followup_id=?", (now, followup_id))
+    if row and row["item"] in FU_ITEM_COLUMNS:
+        col, col_date = FU_ITEM_COLUMNS[row["item"]]
+        c.execute(f"UPDATE LoanEntry SET {col}='yes', {col_date}=? WHERE id=?",
+                  (date.today().isoformat(), row["loan_id"]))
     get_db().commit()
 
+def reschedule_follow_up(followup_id, new_date, remarks, created_by):
+    """Adds one more follow-up (same loan / category / item) and retires the old one."""
+    c = get_cur()
+    c.execute("SELECT * FROM FollowUp WHERE followup_id=?", (followup_id,))
+    old = c.fetchone()
+    if not old: raise ValueError("Follow-up not found")
+    c.execute("UPDATE FollowUp SET status='Rescheduled' WHERE followup_id=?", (followup_id,))
+    get_db().commit()
+    add_follow_up(old["loan_id"], new_date, remarks or old["remarks"], created_by,
+                  old["category"] or "Loans", old["item"])
+
 def get_active_follow_ups_map():
-    """Latest PENDING follow-up per loan_id — used to badge the Alerts page."""
+    """Latest PENDING *loan-collection* follow-up per loan_id — used to badge the Alerts page."""
     c = get_cur()
     c.execute("""SELECT f.* FROM FollowUp f
                  INNER JOIN (SELECT loan_id, MAX(created_at) as mx FROM FollowUp
-                             WHERE status='Pending' GROUP BY loan_id) latest
-                 ON f.loan_id=latest.loan_id AND f.created_at=latest.mx""")
+                             WHERE status='Pending' AND COALESCE(category,'Loans')='Loans' GROUP BY loan_id) latest
+                 ON f.loan_id=latest.loan_id AND f.created_at=latest.mx
+                 WHERE COALESCE(f.category,'Loans')='Loans'""")
     return {r["loan_id"]: dict(r) for r in c.fetchall()}
 
-def list_follow_ups(search=""):
+def list_follow_ups(search="", category=""):
     q = f"%{search}%"; c = get_cur()
-    c.execute("""SELECT f.followup_id, f.loan_id, f.follow_up_date, f.remarks, f.status,
+    sql = """SELECT f.followup_id, f.loan_id, f.follow_up_date, f.remarks, f.status,
                         f.created_by, f.created_at, f.resolved_at,
-                        le.loan_number, le.customer_name, le.customer_mobile,
-                        le.customer_address, le.customer_location
+                        COALESCE(f.category,'Loans') as category, f.item,
+                        le.loan_number, le.vehicle_type, le.customer_name, le.customer_mobile, le.customer_extra_numbers,
+                        le.guarantor_name, le.guarantor_mobile, le.guarantor_extra_numbers,
+                        le.customer_address, le.customer_permanent_address, le.customer_location, le.guarantor_location
                  FROM FollowUp f JOIN LoanEntry le ON f.loan_id=le.id
-                 WHERE le.loan_number LIKE ? OR le.customer_name LIKE ? OR le.customer_mobile LIKE ?
-                 ORDER BY f.follow_up_date ASC""", (q, q, q))
+                 WHERE (le.loan_number LIKE ? OR le.customer_name LIKE ? OR le.customer_mobile LIKE ?)"""
+    params = [q, q, q]
+    if category in FU_CATEGORIES:
+        sql += " AND COALESCE(f.category,'Loans')=?"
+        params.append(category)
+    sql += " ORDER BY f.follow_up_date ASC"
+    c.execute(sql, tuple(params))
     rows = [dict(r) for r in c.fetchall()]
     today_s = date.today().isoformat()
+    per_loan = {}
     for r in rows:
-        c2 = get_cur()
-        c2.execute("""SELECT SUM(COALESCE(remaining_amount,emi_amount)) as amt FROM EMI
-                      WHERE loan_id=? AND (status='Overdue' OR (status IN ('Pending','Partial') AND due_date<?))""",
-                   (r["loan_id"], today_s))
-        row2 = c2.fetchone()
-        r["overdue_amount"] = float(((row2["amt"] if row2 else 0) or 0))
+        lid = r["loan_id"]
+        if lid not in per_loan:
+            c2 = get_cur()
+            c2.execute("""SELECT
+                  SUM(CASE WHEN status NOT IN ('Paid','PreClosed') THEN COALESCE(remaining_amount,emi_amount) ELSE 0 END) as outstanding,
+                  MIN(CASE WHEN status NOT IN ('Paid','PreClosed') THEN due_date END) as oldest_due,
+                  SUM(CASE WHEN status='Overdue' OR (status IN ('Pending','Partial') AND due_date<?)
+                           THEN COALESCE(remaining_amount,emi_amount) ELSE 0 END) as overdue_amt,
+                  SUM(CASE WHEN status='Overdue' OR (status IN ('Pending','Partial') AND due_date<?)
+                           THEN 1 ELSE 0 END) as pending_dues,
+                  MAX(paid_at) as last_paid_emi
+                FROM EMI WHERE loan_id=?""", (today_s, today_s, lid))
+            agg = c2.fetchone()
+            c3 = get_cur()
+            c3.execute("SELECT emi_amount FROM EMI WHERE loan_id=? ORDER BY installment_no ASC LIMIT 1", (lid,))
+            first = c3.fetchone()
+            c4 = get_cur()
+            c4.execute("SELECT MAX(paid_at) as p FROM EMIPayments WHERE loan_id=?", (lid,))
+            pay = c4.fetchone()
+            paid_dates = [d[:10] for d in ((agg["last_paid_emi"] if agg else None), (pay["p"] if pay else None)) if d]
+            per_loan[lid] = {
+                "overdue_amount": float((agg["overdue_amt"] if agg else 0) or 0),
+                "pending_dues":   int((agg["pending_dues"] if agg else 0) or 0),
+                "outstanding":    float((agg["outstanding"] if agg else 0) or 0),
+                "oldest_due":     (agg["oldest_due"] if agg else None) or "",
+                "last_paid_date": max(paid_dates) if paid_dates else "",
+                "emi_amount":     float(first["emi_amount"]) if first and first["emi_amount"] is not None else None,
+            }
+        r.update(per_loan[lid])
     return rows
 
 def get_loan_summary_counts():
@@ -819,19 +1340,27 @@ def get_kpi_totals():
         ("SELECT COUNT(*) as n, SUM(loan_amount) as amt FROM LoanEntry", ()),
         ("SELECT SUM(emi_amount) as amt FROM EMI WHERE status='Paid'", ()),
         ("SELECT SUM(remaining_amount) as amt FROM EMI WHERE status IN ('Pending','Overdue','Partial')", ()),
+        # pre-closed loans: what was paid on the unpaid EMIs + the single closing settlement
+        ("SELECT SUM(amount_paid) as amt FROM EMI WHERE status='PreClosed'", ()),
+        ("SELECT SUM(settlement_amount) as amt FROM PreClosure WHERE status='Completed'", ()),
     ])
     row = results[0][0] if results[0] else {}
     tl  = row.get("n") or 0
     tla = row.get("amt") or 0.0
     tr  = (results[1][0].get("amt") if results[1] else 0) or 0.0
+    tr += ((results[3][0].get("amt") if results[3] else 0) or 0.0) + ((results[4][0].get("amt") if results[4] else 0) or 0.0)
     tp  = (results[2][0].get("amt") if results[2] else 0) or 0.0
     return tl, tla, tr, tp
 
 def get_monthly_paid_series():
     c=get_cur()
     c.execute("SELECT strftime('%Y-%m',paid_at) as ym,SUM(emi_amount) as amt FROM EMI WHERE status='Paid' AND paid_at IS NOT NULL GROUP BY ym ORDER BY ym ASC")
-    rows=c.fetchall()
-    return [r["ym"] for r in rows],[float(r["amt"] or 0) for r in rows]
+    series = {r["ym"]: float(r["amt"] or 0) for r in c.fetchall()}
+    c.execute("SELECT strftime('%Y-%m',paid_on) as ym,SUM(settlement_amount) as amt FROM PreClosure WHERE status='Completed' AND paid_on IS NOT NULL GROUP BY ym")
+    for r in c.fetchall():
+        series[r["ym"]] = series.get(r["ym"], 0.0) + float(r["amt"] or 0)
+    months = sorted(series)
+    return months, [series[m] for m in months]
 
 def get_loan_status_breakdown():
     c=get_cur()
@@ -1055,19 +1584,19 @@ def generate_followup_pdf(path, items):
              Paragraph(f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')}", styles["Normal"]),
              Spacer(1, 0.4*cm)]
     today = date.today()
-    data = [["Loan #","Customer","Mobile","Address","Follow-up Date","Status","Overdue Amt","Remarks","By"]]
+    data = [["Loan #","Customer","Mobile","Vehicle","Address","Follow-up Date","Status","Overdue Amt","Outstanding","Remarks","By"]]
     for r in items:
         fu_date = parse_date(r["follow_up_date"])
-        if r["status"] == "Resolved": status = "Resolved"
+        if r["status"] in ("Resolved","Rescheduled"): status = r["status"]
         elif fu_date < today: status = "Missed"
         else: status = "Pending"
         data.append([
             r["loan_number"], r.get("customer_name") or "", r.get("customer_mobile") or "",
-            (r.get("customer_address") or "")[:40], r["follow_up_date"], status,
-            f"Rs {r['overdue_amount']:,.2f}", (r.get("remarks") or "")[:60], r.get("created_by") or ""
+            r.get("vehicle_type") or "", (r.get("customer_address") or "")[:36], r["follow_up_date"], status,
+            f"Rs {r['overdue_amount']:,.2f}", f"Rs {r['outstanding']:,.2f}", (r.get("remarks") or "")[:50], r.get("created_by") or ""
         ])
     tbl = Table(data, repeatRows=1,
-                colWidths=[1.9*cm,2.6*cm,2.2*cm,3.4*cm,2.2*cm,1.8*cm,2.4*cm,5.5*cm,1.8*cm])
+                colWidths=[1.8*cm,2.4*cm,2.1*cm,2.0*cm,3.0*cm,2.1*cm,1.7*cm,2.2*cm,2.3*cm,4.4*cm,1.6*cm])
     tbl.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#1a4fad")),
         ("TEXTCOLOR",(0,0),(-1,0),colors.white),
@@ -1127,7 +1656,8 @@ html,body{height:100%;font-family:system-ui,'Segoe UI',sans-serif;font-size:14px
   background:rgba(255,255,255,.13);color:#fff;
   border-left-color:rgba(255,255,255,.8);
 }
-.sidebar nav a .icon{font-size:16px;min-width:20px;text-align:center;}
+.sidebar nav a .icon{font-size:16px;min-width:20px;text-align:center;display:inline-flex;align-items:center;justify-content:center;}
+img.emoji{height:1.1em;width:1.1em;margin:0 .05em 0 .1em;vertical-align:-0.15em;display:inline-block;}
 .sidebar .sidebar-footer{
   padding:12px 14px;border-top:1px solid rgba(255,255,255,.15);
   font-size:12px;color:rgba(255,255,255,.7);
@@ -1404,6 +1934,59 @@ tr.row-paid td{opacity:.65;}
 </style>
 """
 
+# Old computers without an emoji font show emoji as "?" or boxes. This detects that (colour test on a
+# canvas) and swaps every emoji for a small picture (Twemoji). Add ?emoji=1 to any page URL to force it.
+EMOJI_FALLBACK_JS = r"""<script>
+(function(){
+  function emojiOK(){
+    try{
+      var c=document.createElement('canvas'); c.width=c.height=32;
+      var x=c.getContext('2d'); x.textBaseline='top'; x.font='24px sans-serif'; x.fillStyle='#000';
+      x.fillText('😀',0,0);
+      var d=x.getImageData(0,0,32,32).data;
+      for(var i=0;i<d.length;i+=4){ if(d[i+3]>0 && (d[i]!==d[i+1]||d[i+1]!==d[i+2])) return true; }
+      return false;
+    }catch(e){ return true; }
+  }
+  if(emojiOK() && location.search.indexOf('emoji=1')<0) return;
+  var s=document.createElement('script');
+  s.src='https://cdn.jsdelivr.net/npm/@twemoji/api@15.0.3/dist/twemoji.min.js';
+  s.onload=function(){
+    function run(){ try{ twemoji.parse(document.body,{folder:'svg',ext:'.svg',className:'emoji'}); }catch(e){} }
+    run();
+    var t=null;
+    new MutationObserver(function(){ clearTimeout(t); t=setTimeout(run,150); }).observe(document.body,{childList:true,subtree:true});
+  };
+  document.head.appendChild(s);
+})();
+</script>"""
+
+# Menu icons are drawn as inline SVG so they show on every computer (emoji need an emoji font,
+# which old laptops don't have).
+_NAV_SVG = {
+    "dashboard": '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>',
+    "loans":     '<path d="M9 4h6v3H9z"/><path d="M7 5H5v16h14V5h-2"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="15" y2="16"/>',
+    "add":       '<circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/>',
+    "approval":  '<circle cx="12" cy="12" r="9"/><polyline points="8 12.5 11 15.5 16 9"/>',
+    "customers": '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6"/><circle cx="17" cy="9" r="2.6"/><path d="M17 14c2.8 0 4.5 1.9 4.5 4.5"/>',
+    "billing":   '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="9" y1="12" x2="15" y2="12"/>',
+    "alerts":    '<path d="M6 16v-5a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 21a2 2 0 0 0 4 0"/>',
+    "followup":  '<path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z"/>',
+    "closed":    '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+    "rejected":  '<circle cx="12" cy="12" r="9"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/>',
+    "calculator":'<rect x="5" y="3" width="14" height="18" rx="2"/><rect x="8" y="6" width="8" height="4"/><line x1="8" y1="14" x2="8.01" y2="14"/><line x1="12" y1="14" x2="12.01" y2="14"/><line x1="16" y1="14" x2="16.01" y2="14"/><line x1="8" y1="18" x2="8.01" y2="18"/><line x1="12" y1="18" x2="12.01" y2="18"/><line x1="16" y1="18" x2="16.01" y2="18"/>',
+    "report":    '<line x1="6" y1="20" x2="6" y2="11"/><line x1="12" y1="20" x2="12" y2="5"/><line x1="18" y1="20" x2="18" y2="14"/>',
+    "users":     '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/>',
+    "database":  '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>',
+    "user":      '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7"/>',
+    "logout":    '<path d="M9 21H5V3h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+    "menu":      '<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/>',
+}
+
+def nav_svg(key, size=20):
+    return (f'<svg viewBox="0 0 24 24" width="{size}" height="{size}" fill="none" stroke="currentColor" stroke-width="2" '
+            f'stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;flex-shrink:0;">{_NAV_SVG[key]}</svg>')
+
 def _nav_links(role, active):
     can_approve = ROLES.get(role,{}).get("can_approve", False)
     can_add     = ROLES.get(role,{}).get("can_add",     False)
@@ -1412,13 +1995,14 @@ def _nav_links(role, active):
 
     def lnk(href, icon, label, key):
         cls = "active" if active == key else ""
-        return f'<a href="{href}" class="{cls}"><span class="icon">{icon}</span>{label}</a>'
+        return f'<a href="{href}" class="{cls}"><span class="icon">{nav_svg(key if key in _NAV_SVG else "dashboard")}</span>{label}</a>'
 
     links = lnk("/dashboard","🏠","Dashboard","dashboard")
     links += lnk("/loans","📋","Loans","loans")
     if can_add:     links += lnk("/loan/add","➕","New Loan","add")
     if can_approve: links += lnk("/approval","✅","Approval","approval")
     links += lnk("/customers","👥","Customers","customers")
+    if ROLES.get(role,{}).get("can_pay", False): links += lnk("/billing","🧾","Billing","billing")
     links += lnk("/alerts","🔔","Alerts","alerts")
     links += lnk("/followup","📞","Follow Up","followup")
     links += lnk("/closed","🔒","Closed","closed")
@@ -1583,7 +2167,7 @@ def page(title, content, active=""):
 <body>
 <!-- Mobile topbar -->
 <div class="topbar">
-  <button id="hamburger" onclick="toggleSidebar()">☰</button>
+  <button id="hamburger" onclick="toggleSidebar()" aria-label="Menu">{nav_svg('menu', 24)}</button>
   {logo_img}
   <span class="brand-text">Thendralla Fincorp</span>
 </div>
@@ -1597,8 +2181,8 @@ def page(title, content, active=""):
   </div>
   <nav>{sidebar_nav}</nav>
   <div class="sidebar-footer">
-    👤 <b>{username}</b> <span style="opacity:.6">({role})</span><br>
-    <a href="/logout" style="color:#ff9999;">🔓 Logout</a>
+    {nav_svg('user', 15)} <b>{username}</b> <span style="opacity:.6">({role})</span><br>
+    <a href="/logout" style="color:#ff9999;">{nav_svg('logout', 15)} Logout</a>
   </div>
 </div>
 <!-- Main -->
@@ -1648,6 +2232,7 @@ document.querySelectorAll('.sidebar nav a').forEach(a=>{{
   </form>
 </div>
 {CHATBOT_JS}''' if role in ("admin","superadmin") else ""}
+{EMOJI_FALLBACK_JS}
 </body>
 </html>"""
 
@@ -1762,6 +2347,74 @@ def login():
 def logout(): session.clear(); return redirect(url_for("login"))
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
+FOLLOWUP_SOON_DAYS = 2   # same "due within 2 days" rule as the Follow Up page
+ATTENTION_ROWS = 5
+
+def attention_panel_html(overdue_emis):
+    """Highlighted 'Needs Attention' panel: missed / due-soon follow-ups and overdue EMI alerts."""
+    today = date.today()
+    soon = (today + timedelta(days=FOLLOWUP_SOON_DAYS)).isoformat()
+    c = get_cur()
+    c.execute("""SELECT f.followup_id, f.loan_id, f.follow_up_date, f.remarks, COALESCE(f.category,'Loans') as category,
+                        le.loan_number, le.customer_name
+                 FROM FollowUp f JOIN LoanEntry le ON le.id=f.loan_id
+                 WHERE f.status='Pending' AND f.follow_up_date<=?
+                 ORDER BY f.follow_up_date ASC""", (soon,))
+    fus = [dict(r) for r in c.fetchall()]
+    missed = [f for f in fus if parse_date(f["follow_up_date"]) < today]
+    due_today = [f for f in fus if parse_date(f["follow_up_date"]) == today]
+    due_soon = [f for f in fus if parse_date(f["follow_up_date"]) > today]
+
+    def fu_when(f):
+        d = (parse_date(f["follow_up_date"]) - today).days
+        if d < 0:  return f'<span style="color:var(--red);font-weight:700;">Missed {-d} day{"s" if d != -1 else ""} ago</span>'
+        if d == 0: return '<span style="color:var(--amber);font-weight:700;">Today</span>'
+        return f'<span style="color:#a16207;font-weight:700;">In {d} day{"s" if d != 1 else ""}</span>'
+
+    fu_rows = "".join(f"""<a href="/followup?cat={urlquote(f['category'])}" style="display:block;padding:7px 0;border-bottom:1px solid var(--border);color:inherit;text-decoration:none;">
+          <b style="color:var(--accent);">{html.escape(f['loan_number'])}</b> — {html.escape(f['customer_name'] or '')}
+          <span class="badge badge-partial" style="margin-left:4px;">{html.escape(f['category'])}</span><br>
+          <span style="font-size:12px;">{fu_when(f)} · {f['follow_up_date']} · <span style="color:var(--muted);">{html.escape((f.get('remarks') or '')[:60])}</span></span></a>"""
+        for f in (missed + due_today + due_soon)[:ATTENTION_ROWS])
+
+    groups = sorted(group_alerts_by_loan(overdue_emis), key=lambda g: g["oldest_due"])
+    total_overdue_amt = sum(g["total_due"] for g in groups)
+    od_rows = "".join(f"""<a href="/emis/{g['lid']}" style="display:block;padding:7px 0;border-bottom:1px solid var(--border);color:inherit;text-decoration:none;">
+          <b style="color:var(--accent);">{html.escape(g['loan_number'])}</b> — {html.escape(g['customer_name'] or '')}
+          <b style="float:right;color:var(--red);">₹{g['total_due']:,.2f}</b><br>
+          <span style="font-size:12px;color:var(--muted);">{g['emi_count']} EMI{"s" if g['emi_count'] != 1 else ""} overdue ·
+          <span style="color:var(--red);font-weight:700;">{(today - parse_date(g['oldest_due'])).days} days</span> since {g['oldest_due']}</span></a>"""
+        for g in groups[:ATTENTION_ROWS])
+
+    nothing = not fus and not groups
+    border = "#059669" if nothing else ("#dc2626" if (missed or groups) else "#d97706")
+    bg = "#ecfdf5" if nothing else ("#fef2f2" if (missed or groups) else "#fffbeb")
+    def badge(n, label, color):
+        return (f'<span style="background:{color};color:#fff;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:700;">{n} {label}</span>') if n else ""
+    fu_badges = " ".join(x for x in (badge(len(missed), "missed", "#dc2626"), badge(len(due_today), "today", "#d97706"),
+                                      badge(len(due_soon), f"in {FOLLOWUP_SOON_DAYS} days", "#ca8a04")) if x)
+    return f"""
+    <div style="background:{bg};border:1px solid {border};border-left:6px solid {border};border-radius:12px;padding:14px 16px;margin-bottom:16px;">
+      <div style="font-size:16px;font-weight:800;margin-bottom:10px;">{'✅ All clear — nothing needs attention' if nothing else '🚨 Needs Attention'}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;">
+        <div style="background:var(--surface);border-radius:10px;padding:12px 14px;">
+          <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;">
+            <b>📞 Follow-ups</b><span>{fu_badges or '<span style="font-size:12px;color:var(--green);">none due</span>'}</span>
+          </div>
+          {fu_rows or '<div style="font-size:13px;color:var(--muted);padding:6px 0;">No follow-ups missed or due in the next days.</div>'}
+          <div style="margin-top:8px;"><a href="/followup" class="btn btn-sm btn-primary">View all follow-ups</a></div>
+        </div>
+        <div style="background:var(--surface);border-radius:10px;padding:12px 14px;">
+          <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;">
+            <b>🔔 Overdue EMI alerts</b>
+            <span>{badge(len(groups), 'loans', '#dc2626')} <b style="color:var(--red);font-size:13px;">{('₹{:,.2f}'.format(total_overdue_amt)) if groups else ''}</b></span>
+          </div>
+          {od_rows or '<div style="font-size:13px;color:var(--muted);padding:6px 0;">No overdue EMIs.</div>'}
+          <div style="margin-top:8px;"><a href="/alerts" class="btn btn-sm btn-danger">View all alerts</a></div>
+        </div>
+      </div>
+    </div>"""
+
 @app.route("/dashboard")
 @login_required
 def dashboard():
@@ -1899,7 +2552,7 @@ def dashboard():
     </script>
     """
 
-    content = f"<h1>📊 Dashboard</h1>{kpi}{charts}"
+    content = f"<h1>📊 Dashboard</h1>{attention_panel_html(overdue)}{kpi}{charts}"
     return page("Dashboard", content, "dashboard")
 
 # ── Loans List ─────────────────────────────────────────────────────────────────
@@ -1946,6 +2599,12 @@ def add_loan():
         if len(mob) != 10:
             flash("Customer mobile number must be exactly 10 digits.","danger")
             return redirect(url_for("add_loan"))
+        try:
+            customer_extra = parse_extra_numbers_form(f, "customer", "Customer")
+            guarantor_extra = parse_extra_numbers_form(f, "guarantor", "Guarantor")
+        except ValueError as e:
+            flash(str(e),"danger")
+            return redirect(url_for("add_loan"))
         # Vehicle details are only mandatory for a reloan
         is_reloan_flag = f.get("is_reloan") == "yes"
         # Trim vehicle number spaces
@@ -1960,8 +2619,13 @@ def add_loan():
                 if not f.get(field,"").strip():
                     flash(f"{label} is mandatory for a reloan.","danger")
                     return redirect(url_for("add_loan"))
-        if not f.get("customer_address","").strip():
-            flash("Customer address is mandatory.","danger")
+        current_addr = f.get("customer_address","").strip()
+        if not current_addr:
+            flash("Current address is mandatory.","danger")
+            return redirect(url_for("add_loan"))
+        permanent_addr = current_addr if f.get("same_address") == "yes" else f.get("customer_permanent_address","").strip()
+        if not permanent_addr:
+            flash("Permanent address is mandatory (or tick 'Same as current address').","danger")
             return redirect(url_for("add_loan"))
         # Validate Aadhar (12 digits)
         aadhar = f.get("aadhar_number","").strip().replace(" ","")
@@ -2006,6 +2670,46 @@ def add_loan():
                 flash("Could not generate loan number. Please try again.","danger")
                 return redirect(url_for("add_loan"))
 
+        # Field visit / key / RC / proof & documents questions
+        field_visit = f.get("field_visit","")
+        if field_visit not in ("yes","no"):
+            flash("Please answer 'Field Visit Done?' (Yes / No).","danger")
+            return redirect(url_for("add_loan"))
+        field_visit_remark = f.get("field_visit_remark","").strip()
+        field_visit_date = None
+        field_visited_by = ""
+        if field_visit == "no":
+            if not field_visit_remark:
+                flash("Please enter why the field visit was not done.","danger")
+                return redirect(url_for("add_loan"))
+        else:
+            field_visit_remark = ""
+            field_visited_by = f.get("field_visited_by","").strip()
+            if not field_visited_by:
+                flash("Please enter the name of the person who did the field visit.","danger")
+                return redirect(url_for("add_loan"))
+            fv_str = f.get("field_visit_date","").strip()
+            if fv_str:
+                try:
+                    fv_date = datetime.strptime(fv_str, "%Y-%m-%d").date()
+                except ValueError:
+                    flash("Invalid Field Visit Date.","danger")
+                    return redirect(url_for("add_loan"))
+                if fv_date > date.today():
+                    flash("Field Visit Date cannot be a future date.","danger")
+                    return redirect(url_for("add_loan"))
+                field_visit_date = fv_date.isoformat()
+            else:
+                field_visit_date = loan_date_val.isoformat()
+        handover = {}
+        for key, label in (("key_received","Key Received"),("rc_received","RC Received"),
+                           ("docs_received","Proof & Documents Collected")):
+            ans = f.get(key,"")
+            if ans not in ("yes","no"):
+                flash(f"Please answer '{label}?' (Yes / No).","danger")
+                return redirect(url_for("add_loan"))
+            handover[key] = ans
+
         # Resolve interest rate depending on calc_mode
         calc_mode = f.get("calc_mode","rate")
         if calc_mode == "emi":
@@ -2020,7 +2724,7 @@ def add_loan():
                 flash("Interest Rate is mandatory.","danger")
                 return redirect(url_for("add_loan"))
         try:
-            create_loan(
+            new_loan_id = create_loan(
                 loan_number_val, f["customer_name"], mob,
                 f["customer_address"], f.get("customer_location",""),
                 f["vehicle_type"], vehicle_number_clean, f["vehicle_model"], f.get("vehicle_name",""),
@@ -2031,8 +2735,17 @@ def add_loan():
                 1 if f.get("is_reloan")=="yes" else 0, f.get("reloan_ref",""),
                 f.get("remarks",""), attachment,
                 f.get("custom_emi_amount","") if f.get("emi_mode")=="manual" else None,
-                loan_date_val.isoformat()
+                loan_date_val.isoformat(),
+                f.get("guarantor_location","").strip(),
+                permanent_addr
             )
+            c_ = get_cur()
+            c_.execute("UPDATE LoanEntry SET customer_extra_numbers=?, guarantor_extra_numbers=? WHERE id=?",
+                       (customer_extra or None, guarantor_extra or None, new_loan_id))
+            get_db().commit()
+            record_handover_details(new_loan_id, loan_date_val, field_visit, field_visit_date,
+                                    field_visit_remark, handover, session.get("username",""),
+                                    field_visited_by)
             flash("Loan submitted for approval.","success")
             return redirect(url_for("loans"))
         except Exception as e:
@@ -2109,6 +2822,24 @@ def add_loan():
             <option value="no">No</option><option value="yes">Yes</option>
           </select>
         </div>
+        <div class="form-group">
+          <label>Field Visit Done? *</label>
+          <select name="field_visit" id="field_visit" required onchange="toggleFieldVisit(this.value)">
+            <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option>
+          </select>
+        </div>
+        <div class="form-group" id="fv_by_group" style="display:none;">
+          <label>Visited By * <span style="font-size:10px;color:var(--muted);">(name of the person)</span></label>
+          <input name="field_visited_by" id="field_visited_by" placeholder="Enter name">
+        </div>
+        <div class="form-group" id="fv_date_group" style="display:none;">
+          <label>Field Visit Date <span style="font-size:10px;color:var(--muted);">(defaults to loan date)</span></label>
+          <input type="date" name="field_visit_date" id="field_visit_date" max="{date.today().isoformat()}">
+        </div>
+        <div class="form-group full" id="fv_remark_group" style="display:none;">
+          <label>Why was the field visit not done? *</label>
+          <textarea name="field_visit_remark" id="field_visit_remark" rows="2" placeholder="Enter the reason"></textarea>
+        </div>
 
         <div class="section-title">👤 Customer Details</div>
         <div class="form-group">
@@ -2121,9 +2852,19 @@ def add_loan():
                  pattern="[0-9]{{10}}" required
                  oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)">
         </div>
+        {extra_numbers_block('customer')}
         <div class="form-group full">
-          <label>Address * (mandatory)</label>
-          <textarea name="customer_address" id="cust_address" rows="2" required></textarea>
+          <label>Current Address * (mandatory)</label>
+          <textarea name="customer_address" id="cust_address" rows="2" required oninput="syncPermanentAddress()"></textarea>
+        </div>
+        <div class="form-group full">
+          <label>Permanent Address * (mandatory)</label>
+          <label style="display:flex;align-items:center;gap:8px;font-weight:600;text-transform:none;font-size:13px;margin-bottom:6px;cursor:pointer;">
+            <input type="checkbox" name="same_address" id="same_address" value="yes"
+                   style="width:auto;min-height:0;margin:0;" onchange="syncPermanentAddress()">
+            Same as current address
+          </label>
+          <textarea name="customer_permanent_address" id="cust_perm_address" rows="2" required></textarea>
         </div>
         <div class="form-group full">
           <label>📍 GPS Location <span style="font-size:10px;color:var(--muted);">(tap button or enter manually)</span></label>
@@ -2177,9 +2918,32 @@ def add_loan():
           <input name="guarantor_mobile" maxlength="10"
                  oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)">
         </div>
+        {extra_numbers_block('guarantor')}
         <div class="form-group full">
           <label>Guarantor Address</label>
           <textarea name="guarantor_address" rows="2"></textarea>
+        </div>
+        <div class="form-group full">
+          <label>📍 Guarantor GPS Location <span style="font-size:10px;color:var(--muted);">(tap button or enter manually)</span></label>
+          <div style="display:flex;gap:8px;align-items:stretch;flex-wrap:wrap;">
+            <input name="guarantor_location" id="g_location"
+                   placeholder="e.g. 10.9876,78.1234 or area name"
+                   style="flex:1;min-width:160px;"
+                   oninput="onLocationTyped(this.value,'g_gps_status','g_map_link')">
+            <button type="button" onclick="getGPS('g_location','g_gps_btn','g_gps_status','g_map_link')" id="g_gps_btn"
+                    style="background:var(--amber);color:#fff;border:none;border-radius:8px;
+                           padding:0 14px;font-size:13px;font-weight:700;cursor:pointer;
+                           white-space:nowrap;min-height:46px;flex-shrink:0;">
+              📡 Get GPS
+            </button>
+            <a id="g_map_link" href="#" target="_blank"
+               style="display:none;background:#34a853;color:#fff;border-radius:8px;
+                      padding:0 14px;font-size:13px;font-weight:700;text-decoration:none;
+                      white-space:nowrap;min-height:46px;line-height:46px;flex-shrink:0;">
+              🗺️ Show on Map
+            </a>
+          </div>
+          <small id="g_gps_status" style="color:var(--muted);font-size:11px;margin-top:2px;"></small>
         </div>
 
         <div class="section-title">🚗 Vehicle Details <span id="vehicle_mandatory_note">(optional unless Reloan = Yes)</span></div>
@@ -2216,8 +2980,26 @@ def add_loan():
           <label>Vehicle Colour</label>
           <input name="vehicle_colour" id="vehicle_colour" class="vehicle-req-field">
         </div>
+        <div class="form-group">
+          <label>Key Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 3 days)</span></label>
+          <select name="key_received" id="key_received" required>
+            <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>RC Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 15 days)</span></label>
+          <select name="rc_received" id="rc_received" required>
+            <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option>
+          </select>
+        </div>
 
         <div class="section-title">📎 Documents & Remarks</div>
+        <div class="form-group">
+          <label>Proof &amp; Documents Collected? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 3 days)</span></label>
+          <select name="docs_received" id="docs_received" required>
+            <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option>
+          </select>
+        </div>
         <div class="form-group full">
           <label>Attachment <span style="font-size:10px;color:var(--muted);">(Upload to Google Drive)</span></label>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
@@ -2338,11 +3120,40 @@ def add_loan():
       }}
     }});
 
+    /* ── Field visit: date when Yes, reason when No ───────────────────────── */
+    function toggleFieldVisit(v){{
+      const dateGrp = document.getElementById('fv_date_group');
+      const remGrp  = document.getElementById('fv_remark_group');
+      const rem     = document.getElementById('field_visit_remark');
+      const dt      = document.getElementById('field_visit_date');
+      const byInp = document.getElementById('field_visited_by');
+      document.getElementById('fv_by_group').style.display = v==='yes' ? 'block' : 'none';
+      if(v==='yes') byInp.setAttribute('required','required'); else byInp.removeAttribute('required');
+      dateGrp.style.display = v==='yes' ? 'block' : 'none';
+      remGrp.style.display  = v==='no'  ? 'block' : 'none';
+      if(v==='no') rem.setAttribute('required','required'); else rem.removeAttribute('required');
+      if(v==='yes' && !dt.value) dt.value = document.getElementById('loan_date').value;
+    }}
+
+    /* ── Permanent address = current address (tick box) ──────────────────── */
+    function syncPermanentAddress(){{
+      const same = document.getElementById('same_address').checked;
+      const perm = document.getElementById('cust_perm_address');
+      if(same){{
+        perm.value = document.getElementById('cust_address').value;
+        perm.readOnly = true;
+        perm.style.background = 'var(--surface2)';
+      }} else {{
+        perm.readOnly = false;
+        perm.style.background = '';
+      }}
+    }}
+
     /* ── GPS ─────────────────────────────────────────────────────────────── */
-    function getGPS(){{
-      const btn=document.getElementById('gps_btn');
-      const st=document.getElementById('gps_status');
-      const mapLink=document.getElementById('map_link');
+    function getGPS(inputId='cust_location', btnId='gps_btn', statusId='gps_status', mapId='map_link'){{
+      const btn=document.getElementById(btnId);
+      const st=document.getElementById(statusId);
+      const mapLink=document.getElementById(mapId);
       if(!navigator.geolocation){{
         st.textContent='❌ GPS not supported on this browser.';
         st.style.color='var(--red)'; return;
@@ -2355,7 +3166,7 @@ def add_loan():
           const lat=pos.coords.latitude.toFixed(6);
           const lon=pos.coords.longitude.toFixed(6);
           const coords=lat+','+lon;
-          document.getElementById('cust_location').value=coords;
+          document.getElementById(inputId).value=coords;
           st.textContent='✅ Location captured: '+coords;
           st.style.color='var(--green)';
           btn.textContent='📡 Get GPS'; btn.disabled=false;
@@ -2373,8 +3184,9 @@ def add_loan():
     }}
 
     /* ── GPS location typed manually → show map link ─────────────────────── */
-    function onLocationTyped(val){{
-      const mapLink = document.getElementById('map_link');
+    function onLocationTyped(val, statusId='gps_status', mapId='map_link'){{
+      const mapLink = document.getElementById(mapId);
+      const statusEl = document.getElementById(statusId);
       val = val.trim();
       // Try to parse as lat,lon coordinates
       const parts = val.split(',');
@@ -2384,8 +3196,8 @@ def add_loan():
         if(!isNaN(lat) && !isNaN(lon) && lat>=-90 && lat<=90 && lon>=-180 && lon<=180){{
           mapLink.href = 'https://www.google.com/maps?q='+lat+','+lon;
           mapLink.style.display = 'inline-block';
-          document.getElementById('gps_status').textContent = '✅ Coordinates valid — click Show on Map to verify.';
-          document.getElementById('gps_status').style.color = 'var(--green)';
+          statusEl.textContent = '✅ Coordinates valid — click Show on Map to verify.';
+          statusEl.style.color = 'var(--green)';
           return;
         }}
       }}
@@ -2393,11 +3205,11 @@ def add_loan():
       if(val.length > 3){{
         mapLink.href = 'https://www.google.com/maps/search/'+encodeURIComponent(val);
         mapLink.style.display = 'inline-block';
-        document.getElementById('gps_status').textContent = 'Click Show on Map to verify this address.';
-        document.getElementById('gps_status').style.color = 'var(--muted)';
+        statusEl.textContent = 'Click Show on Map to verify this address.';
+        statusEl.style.color = 'var(--muted)';
       }} else {{
         mapLink.style.display = 'none';
-        document.getElementById('gps_status').textContent = '';
+        statusEl.textContent = '';
       }}
     }}
 
@@ -2450,6 +3262,8 @@ def add_loan():
             document.getElementById('cust_name').value=data.customer.customer_name||'';
             document.getElementById('cust_mobile').value=data.customer.customer_mobile||'';
             document.getElementById('cust_address').value=data.customer.customer_address||'';
+            document.getElementById('cust_perm_address').value=data.customer.customer_permanent_address||'';
+            syncPermanentAddress();
             document.getElementById('cust_location').value=data.customer.customer_location||'';
           }}
         }});
@@ -2667,14 +3481,77 @@ def approval():
           </form>
         </div>"""
 
+    c = get_cur()
+    c.execute("""SELECT p.*, le.loan_number, le.customer_name, le.customer_mobile, le.vehicle_type, le.loan_amount,
+                        le.tenure, le.loan_date, le.start_date
+                 FROM PreClosure p JOIN LoanEntry le ON le.id=p.loan_id
+                 WHERE p.status='Pending' ORDER BY p.preclose_id ASC""")
+    pc_rows = [dict(r) for r in c.fetchall()]
+    pc_cards = ""
+    for p in pc_rows:
+        loan_like = dict(p); loan_like["id"] = p["loan_id"]
+        fig = preclosure_figures(loan_like, 0.0)
+        orig_pct = float(p["original_rate"]) * 100
+        pc_cards += f"""
+        <div class="card pc-card" data-principal="{float(p['loan_amount'])}" data-months="{fig['months']}" data-paid="{fig['paid']}">
+          <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
+            <div>
+              <b style="font-size:15px;color:var(--accent);">{html.escape(p['loan_number'])}</b> — {html.escape(p['customer_name'] or '')}
+              <div style="font-size:12px;color:var(--muted);margin-top:2px;">
+                📱 {html.escape(p.get('customer_mobile') or '')} &nbsp;|&nbsp; 🚗 {html.escape(p.get('vehicle_type') or '')}
+                &nbsp;|&nbsp; Requested by <b>{html.escape(p.get('requested_by') or '')}</b> on {(p.get('requested_at') or '')[:10]}
+              </div>
+            </div>
+            <a class="btn btn-sm btn-primary" href="/emis/{p['loan_id']}">View EMIs</a>
+          </div>
+          <div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px;">
+            <div class="kpi" style="padding:8px 10px;"><div class="val" style="font-size:15px;">₹{float(p['loan_amount']):,.2f}</div><div class="lbl">Loan Amount</div></div>
+            <div class="kpi" style="padding:8px 10px;"><div class="val" style="font-size:15px;">{orig_pct:.2f}%</div><div class="lbl">Current Rate</div></div>
+            <div class="kpi" style="padding:8px 10px;"><div class="val" style="font-size:15px;">{fig['months']}m</div><div class="lbl">Months Elapsed</div></div>
+            <div class="kpi" style="padding:8px 10px;"><div class="val" style="font-size:15px;">₹{fig['paid']:,.2f}</div><div class="lbl">Already Paid</div></div>
+          </div>
+          <form method="POST" action="/preclose/approve/{p['preclose_id']}">
+            <div class="form-grid" style="align-items:end;">
+              <div class="form-group">
+                <label>Reduced Interest Rate (% p.a.) <span style="font-size:10px;color:var(--muted);">(cannot be higher than {orig_pct:.2f}%)</span></label>
+                <input type="number" name="new_rate" class="pc-rate" value="{orig_pct:.2f}" min="0" max="{orig_pct:.2f}" step="0.01" required oninput="pcPreview(this)">
+              </div>
+              <div class="form-group">
+                <div class="pc-note" style="font-size:13px;line-height:1.7;padding:8px 10px;background:var(--surface2);border-radius:8px;min-height:42px;"></div>
+              </div>
+            </div>
+            <div style="margin-top:10px;display:flex;gap:8px;">
+              <button type="submit" class="btn btn-success btn-sm">✅ Approve Pre-closure</button>
+            </div>
+          </form>
+          <form method="POST" action="/preclose/reject/{p['preclose_id']}" onsubmit="return getReason(this)" style="margin-top:6px;">
+            <input type="hidden" name="reason" class="reason_inp">
+            <button type="submit" class="btn btn-danger btn-sm">❌ Reject</button>
+          </form>
+        </div>"""
+    pc_section = (f'<h2 style="margin:6px 0 10px;">⏩ Pre-closure Requests ({len(pc_rows)})</h2>{pc_cards}'
+                  f'<h2 style="margin:18px 0 10px;">🆕 New Loan Applications</h2>') if pc_rows else ""
+
     content = f"""
     <h1>✅ Loan Approval</h1>
     <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;">
       <input name="q" value="{q}" placeholder="Search…" style="max-width:240px;">
       <button class="btn btn-primary btn-sm">Search</button>
     </form>
+    {pc_section}
     {cards or '<div class="card"><p style="text-align:center;color:var(--muted);">No pending loans</p></div>'}
     <script>
+    function pcPreview(input){{
+      const card = input.closest('.pc-card');
+      const P = parseFloat(card.dataset.principal), m = parseInt(card.dataset.months), paid = parseFloat(card.dataset.paid);
+      const r = parseFloat(input.value)||0;
+      const interest = Math.round(P*r/100*m/12*100)/100;
+      const settle = Math.max(0, Math.round((P+interest-paid)*100)/100);
+      card.querySelector('.pc-note').innerHTML =
+        'Interest for '+m+' month(s): <b>'+fmtINR(interest)+'</b> &nbsp;|&nbsp; Loan + interest: <b>'+fmtINR(P+interest)+'</b><br>'+
+        'Less already paid '+fmtINR(paid)+' → <b style="color:var(--green);">Settlement to collect: '+fmtINR(settle)+'</b>';
+    }}
+    window.addEventListener('DOMContentLoaded',function(){{ document.querySelectorAll('.pc-rate').forEach(pcPreview); }});
     function fmtINR(v){{return '₹'+v.toLocaleString('en-IN',{{minimumFractionDigits:2,maximumFractionDigits:2}});}}
     function previewSchedule(input){{
       const card = input.closest('.card');
@@ -2723,6 +3600,7 @@ def customers():
         loan_no = c.get('loan_number') or '—'
         rows += f"""<tr>
           <td><b style="color:var(--accent);">{loan_no}</b> — {c['name']}</td><td>{c['vehicle_type']}</td>
+          <td>{customer_numbers_html(c)}</td><td>{guarantor_numbers_html(c)}</td>
           <td>₹{c['loan_amount']:,.2f}</td><td><b>₹{c['emi_amount']:,.2f}</b></td>
           <td><span class="badge badge-{sc}">{c['status']}</span></td>
           <td style="white-space:nowrap;">
@@ -2736,9 +3614,10 @@ def customers():
       <input name="q" value="{q}" placeholder="Search…" style="max-width:240px;">
       <button class="btn btn-primary btn-sm">Search</button>
     </form>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">📞 Place the cursor on a number to see whose number it is. Tap a number to call.</p>
     <div class="card"><div class="table-wrap"><table>
-      <tr><th>Loan # — Name</th><th>Vehicle</th><th>Loan Amt</th><th>EMI/mo</th><th>Status</th><th>Actions</th></tr>
-      {rows or '<tr><td colspan="6" style="text-align:center;color:var(--muted);">No customers found</td></tr>'}
+      <tr><th>Loan # — Name</th><th>Vehicle</th><th>Customer Mobile</th><th>Guarantor Mobile</th><th>Loan Amt</th><th>EMI/mo</th><th>Status</th><th>Actions</th></tr>
+      {rows or '<tr><td colspan="8" style="text-align:center;color:var(--muted);">No customers found</td></tr>'}
     </table></div></div>"""
     return page("Customers", content, "customers")
 
@@ -2757,16 +3636,21 @@ def customer_edit(loan_id):
     if request.method == "POST":
         f = request.form
         try:
+            customer_extra = parse_extra_numbers_form(f, "customer", "Customer")
+            guarantor_extra = parse_extra_numbers_form(f, "guarantor", "Guarantor")
+            c.execute("""UPDATE LoanEntry SET customer_extra_numbers=?, guarantor_extra_numbers=? WHERE id=?""",
+                      (customer_extra or None, guarantor_extra or None, loan_id))
             c.execute("""UPDATE LoanEntry SET
-                customer_name=?, customer_mobile=?, customer_address=?, customer_location=?,
+                customer_name=?, customer_mobile=?, customer_address=?, customer_permanent_address=?, customer_location=?,
                 customer_email=?, vehicle_type=?, vehicle_number=?, vehicle_model=?,
                 engine_number=?, chassis_number=?, vehicle_colour=?,
-                guarantor_name=?, guarantor_address=?, guarantor_mobile=?,
+                guarantor_name=?, guarantor_address=?, guarantor_mobile=?, guarantor_location=?,
                 loan_amount=?, interest_rate=?, tenure=?, start_date=?, remarks=?
                 WHERE id=?""",
                 (f.get("customer_name","").strip(),
                  f.get("customer_mobile","").strip(),
                  f.get("customer_address","").strip(),
+                 f.get("customer_permanent_address","").strip(),
                  f.get("customer_location","").strip(),
                  f.get("customer_email","").strip(),
                  f.get("vehicle_type","").strip(),
@@ -2778,6 +3662,7 @@ def customer_edit(loan_id):
                  f.get("guarantor_name","").strip(),
                  f.get("guarantor_address","").strip(),
                  f.get("guarantor_mobile","").strip(),
+                 f.get("guarantor_location","").strip(),
                  float(f.get("loan_amount",0)),
                  float(f.get("interest_rate",0))/100 if float(f.get("interest_rate",0))>1 else float(f.get("interest_rate",0)),
                  int(f.get("tenure",0)),
@@ -2845,9 +3730,19 @@ def customer_edit(loan_id):
           <input name="customer_mobile" value="{loan.get('customer_mobile','')}" maxlength="10"
                  oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)">
         </div>
+        {extra_numbers_block('customer', loan.get('customer_extra_numbers'))}
         <div class="form-group full">
-          <label>Address</label>
-          <textarea name="customer_address" rows="2">{loan.get('customer_address','')}</textarea>
+          <label>Current Address</label>
+          <textarea name="customer_address" id="e_cur_addr" rows="2">{loan.get('customer_address','')}</textarea>
+        </div>
+        <div class="form-group full">
+          <label>Permanent Address</label>
+          <label style="display:flex;align-items:center;gap:8px;font-weight:600;text-transform:none;font-size:13px;margin-bottom:6px;cursor:pointer;">
+            <input type="checkbox" style="width:auto;min-height:0;margin:0;"
+                   onchange="if(this.checked) document.getElementById('e_perm_addr').value=document.getElementById('e_cur_addr').value;">
+            Same as current address
+          </label>
+          <textarea name="customer_permanent_address" id="e_perm_addr" rows="2">{loan.get('customer_permanent_address') or ''}</textarea>
         </div>
         <div class="form-group full">
           <label>GPS Location</label>
@@ -2890,9 +3785,14 @@ def customer_edit(loan_id):
           <input name="guarantor_mobile" value="{loan.get('guarantor_mobile','')}" maxlength="10"
                  oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)">
         </div>
+        {extra_numbers_block('guarantor', loan.get('guarantor_extra_numbers'))}
         <div class="form-group full">
           <label>Guarantor Address</label>
           <textarea name="guarantor_address" rows="2">{loan.get('guarantor_address','')}</textarea>
+        </div>
+        <div class="form-group full">
+          <label>Guarantor GPS Location</label>
+          <input name="guarantor_location" value="{loan.get('guarantor_location') or ''}">
         </div>
 
         <div class="section-title">📝 Remarks</div>
@@ -2919,27 +3819,30 @@ def emis(loan_id):
     can_edit_emi = ROLES.get(role,{}).get("can_edit", False)
     today = date.today(); upcoming_limit = today + timedelta(days=UPCOMING_DAYS)
 
+    pc = get_preclosure(loan_id)
+    pc_open = bool(pc and pc["status"] in ("Pending", "Approved"))
     total_remaining = sum(float(e.get("remaining_amount") or e["emi_amount"])
-                          for e in emi_list if e["status"] != "Paid")
+                          for e in emi_list if e["status"] not in ("Paid", "PreClosed"))
     rows = ""
     for e in emi_list:
         due_d = parse_date(e["due_date"])
         is_paid = e["status"] == "Paid"
-        is_overdue = not is_paid and due_d < today
-        is_upcoming = not is_paid and not is_overdue and due_d <= upcoming_limit
+        is_pre = e["status"] == "PreClosed"
+        is_overdue = not is_paid and not is_pre and due_d < today
+        is_upcoming = not is_paid and not is_pre and not is_overdue and due_d <= upcoming_limit
 
         row_class = ""
         if is_overdue:   row_class = "row-overdue"
         elif is_upcoming: row_class = "row-upcoming"
-        elif is_paid:    row_class = "row-paid"
+        elif is_paid or is_pre: row_class = "row-paid"
 
-        sc = {"Paid":"paid","Partial":"partial","Overdue":"overdue"}.get(e["status"],"pending")
-        remaining = 0.0 if is_paid else float(e.get("remaining_amount") if e.get("remaining_amount") is not None else e["emi_amount"])
+        sc = {"Paid":"paid","Partial":"partial","Overdue":"overdue","PreClosed":"closed"}.get(e["status"],"pending")
+        remaining = 0.0 if (is_paid or is_pre) else float(e.get("remaining_amount") if e.get("remaining_amount") is not None else e["emi_amount"])
         bill_no   = format_bill_ref(e["installment_no"], payments_by_emi.get(e["emi_id"], []), is_paid)
-        paid_at   = (e.get("paid_at") or "")[:10]
+        paid_on_html, pay_status_html = paid_on_and_status(e, payments_by_emi.get(e["emi_id"], []), is_paid, today)
 
         pay_form = ""
-        if can_pay and not is_paid:
+        if can_pay and not is_paid and not is_pre and not pc_open:
             pay_form = f"""
             <form method="POST" action="/emi/pay" style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;">
               <input type="hidden" name="emi_id" value="{e['emi_id']}">
@@ -2956,10 +3859,12 @@ def emis(loan_id):
         emi_edit_link = f'<a class="btn btn-sm btn-amber" href="/emi/edit/{e["emi_id"]}?loan_id={loan_id}">&#9998;</a>' if can_edit_emi else ""
         rows += f'<tr class="{row_class}" id="emi_{e["emi_id"]}">'
         rows += f"""<td>{e['installment_no']}</td><td>{e['due_date']}</td>
-          <td>₹{e['emi_amount']:,.2f}</td><td>₹{float(e['amount_paid'] or 0):,.2f}</td>
+          <td>₹{e['emi_amount']:,.2f}</td><td style="white-space:nowrap;">{paid_amount_cell(e, payments_by_emi.get(e["emi_id"], []))}</td>
           <td><b>₹{remaining:,.2f}</b></td>
-          <td><span class="badge badge-{sc}">{e['status']}</span></td>
-          <td>{bill_no}</td><td>{paid_at}</td>
+          <td><span class="badge badge-{sc}">{"Pre-closed" if is_pre else e['status']}</span></td>
+          <td>{bill_no}</td><td style="white-space:nowrap;">{paid_on_html}</td>
+          <td style="white-space:nowrap;">{pay_status_html}</td>
+          <td style="text-align:center;">{late_days_cell(e, payments_by_emi.get(e["emi_id"], []), is_paid)}</td>
           <td style="white-space:nowrap;">{pay_form}{emi_edit_link}
           </td>
         </tr>"""
@@ -2978,12 +3883,58 @@ def emis(loan_id):
       </span>
     </div>"""
 
+    guarantor_header = ""
+    g_nums = guarantor_numbers_html(loan)
+    if g_nums != "—":
+        guarantor_header = (f"<div><b>Guarantor:</b> {html.escape(loan.get('guarantor_name') or '')} — "
+                            f"{g_nums.replace('<br>', ' &nbsp;·&nbsp; ')}</div>")
+    preclose_box = ""
+    if pc and pc["status"] == "Pending":
+        preclose_box = (f'<span class="badge badge-pending" style="font-size:13px;padding:8px 12px;">'
+                        f'⏳ Pre-closure sent for admin approval (requested by {html.escape(pc.get("requested_by") or "")})</span>')
+    elif pc and pc["status"] == "Approved":
+        settle = float(pc["settlement_amount"] or 0)
+        if settle > 0:
+            close_form = (f'<form method="POST" action="/preclose/close/{pc["preclose_id"]}" '
+                          f'style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px;" '
+                          f'onsubmit="return confirm(\'Close this loan with the settlement bill? This cannot be undone.\')">'
+                          f'<input name="bill_number" placeholder="Closing Bill No.*" required style="width:150px;font-size:12px;padding:6px;">'
+                          f'<input type="date" name="paid_on" value="{today.isoformat()}" max="{today.isoformat()}" required '
+                          f'style="width:140px;font-size:12px;padding:6px;" title="Paid On">'
+                          f'<button class="btn btn-success btn-sm">🔒 Close Loan</button></form>')
+        else:
+            close_form = (f'<form method="POST" action="/preclose/close/{pc["preclose_id"]}" style="margin-top:8px;" '
+                          f'onsubmit="return confirm(\'Close this loan now? This cannot be undone.\')">'
+                          f'<input type="hidden" name="paid_on" value="{today.isoformat()}">'
+                          f'<button class="btn btn-success btn-sm">🔒 Close Loan</button></form>')
+        pay_line = (f'Pay <b style="font-size:16px;">₹{settle:,.2f}</b> in <b>one bill</b> to close the loan.' if settle > 0
+                    else 'No further payment is due (already paid more than the reduced total).')
+        preclose_box = (f'<div style="background:#d1fae5;border:1px solid #6ee7b7;border-radius:10px;padding:10px 14px;max-width:440px;font-size:13px;">'
+                        f'<b>✅ Pre-closure approved</b> by {html.escape(pc.get("approved_by") or "")}<br>'
+                        f'Interest rate reduced <b>{float(pc["original_rate"] or 0)*100:.2f}% → {float(pc["new_rate"] or 0)*100:.2f}%</b> '
+                        f'(for {int(pc["months_elapsed"] or 0)} month(s); already paid ₹{float(pc["paid_before"] or 0):,.2f})<br>'
+                        f'{pay_line}{close_form if can_pay else ""}</div>')
+    elif pc and pc["status"] == "Completed" and loan.get("status") == "Closed":
+        preclose_box = (f'<span class="badge badge-closed" style="font-size:13px;padding:8px 12px;">'
+                        f'⏩ Pre-closed on {html.escape(pc.get("paid_on") or "")} — settled ₹{float(pc["settlement_amount"] or 0):,.2f} '
+                        f'(bill {html.escape(pc.get("bill_number") or "—")})</span>')
+    elif loan.get("status") == "Approved" and can_pay:
+        rejected_note = ""
+        if pc and pc["status"] == "Rejected":
+            rejected_note = (f'<div style="font-size:12px;color:var(--red);margin-bottom:6px;text-align:right;">'
+                             f'Last pre-closure request was rejected: {html.escape(pc.get("decision_remarks") or "")}</div>')
+        preclose_box = (f'<div>{rejected_note}<form method="POST" action="/preclose/request/{loan_id}" '
+                        f'onsubmit="return confirm(\'Send a pre-closure request to the admin for approval?\')">'
+                        f'<button class="btn btn-amber">⏩ Pre-Close Loan</button></form></div>')
+    preclose_row = f'<div style="display:flex;justify-content:flex-end;margin-bottom:10px;">{preclose_box}</div>' if preclose_box else ""
     content = f"""
     <h1>💳 EMI Schedule — {loan.get('loan_number','')}</h1>
     <div class="card" style="margin-bottom:12px;">
+      {preclose_row}
       <div class="form-grid">
         <div><b>Customer:</b> {loan.get('customer_name','')}</div>
-        <div><b>Mobile:</b> {loan.get('customer_mobile','')}</div>
+        <div><b>Mobile:</b> {customer_numbers_html(loan).replace("<br>", " &nbsp;·&nbsp; ")}</div>
+        {guarantor_header}
         <div><b>Vehicle:</b> {loan.get('vehicle_type','')} — {loan.get('vehicle_number','')}</div>
         <div><b>Model:</b> {loan.get('vehicle_model','')}</div>
         <div><b>Loan Amount:</b> ₹{float(loan.get('loan_amount',0)):,.2f}</div>
@@ -3001,8 +3952,8 @@ def emis(loan_id):
       {legend}
       <div class="table-wrap"><table>
         <tr><th>#</th><th>Due Date</th><th>EMI</th><th>Paid</th><th>Remaining</th>
-            <th>Status</th><th>Bill No</th><th>Paid On</th><th>Action</th></tr>
-        {rows or '<tr><td colspan="9" style="text-align:center;">No EMIs</td></tr>'}
+            <th>Status</th><th>Bill No</th><th>Paid On</th><th>Payment Status</th><th>Late Payment Days</th><th>Action</th></tr>
+        {rows or '<tr><td colspan="11" style="text-align:center;">No EMIs</td></tr>'}
       </table></div>
     </div>
     <script>
@@ -3033,6 +3984,341 @@ def emi_pay():
     except Exception as e:
         flash(str(e),"danger")
     return redirect(url_for("emis", loan_id=loan_id) + f"#emi_{emi_id}")
+
+# ── Billing ────────────────────────────────────────────────────────────────────
+def _unpaid_emis(loan_id):
+    c = get_cur()
+    c.execute("""SELECT * FROM EMI WHERE loan_id=? AND status NOT IN ('Paid','PreClosed')
+                 ORDER BY installment_no ASC""", (loan_id,))
+    return [dict(r) for r in c.fetchall()]
+
+def _emi_remaining(e):
+    rem = e.get("remaining_amount")
+    return float(rem if rem is not None else e["emi_amount"])
+
+@app.route("/billing")
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def billing():
+    q = request.args.get("q","").strip()
+    c = get_cur(); today = date.today()
+    cards = ""
+    if q:
+        digits = re.sub(r"\D", "", q)
+        like = f"%{q}%"; dlike = f"%{digits}%" if len(digits) >= 3 else like
+        c.execute("""SELECT * FROM LoanEntry WHERE status='Approved' AND
+                        (loan_number LIKE ? OR customer_name LIKE ? OR vehicle_number LIKE ?
+                         OR customer_mobile LIKE ? OR guarantor_mobile LIKE ?
+                         OR customer_extra_numbers LIKE ? OR guarantor_extra_numbers LIKE ?)
+                     ORDER BY loan_number ASC LIMIT 20""", (like, like, like, dlike, dlike, dlike, dlike))
+        for l in [dict(r) for r in c.fetchall()]:
+            nxt = (_unpaid_emis(l["id"]) or [None])[0]
+            if nxt:
+                late = (today - parse_date(nxt["due_date"])).days
+                due_txt = (f'<b>{ordinal_due(nxt["installment_no"])}</b> — due {nxt["due_date"]} — pending '
+                           f'<b>₹{_emi_remaining(nxt):,.2f}</b>'
+                           + (f' <span style="color:var(--red);font-weight:600;">({late} day{"s" if late != 1 else ""} overdue)</span>' if late > 0 else ""))
+                btn = f'<a class="btn btn-primary btn-sm" href="/billing/new/{l["id"]}">🧾 Make Bill</a>'
+            else:
+                due_txt, btn = "No unpaid EMI.", ""
+            cards += f"""<div class="card" style="margin-bottom:10px;">
+              <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
+                <div>
+                  <b style="color:var(--accent);font-size:15px;">{html.escape(l['loan_number'])}</b> — {html.escape(l['customer_name'] or '')}
+                  <div style="font-size:12px;color:var(--muted);margin:2px 0 6px;">
+                    🚗 {html.escape(l.get('vehicle_number') or '—')} &nbsp;|&nbsp; 📱 {customer_numbers_html(l).replace('<br>', ' · ')}
+                  </div>
+                  <div style="font-size:13px;">Next EMI: {due_txt}</div>
+                </div>
+                <div>{btn}</div>
+              </div></div>"""
+        if not cards:
+            cards = '<div class="card"><p style="text-align:center;color:var(--muted);">No active loan matches that phone number, loan number or name.</p></div>'
+    # receipts list (filtered by the same search box)
+    rlike = f"%{q}%"
+    c.execute("""SELECT * FROM Receipts WHERE (? = '' OR receipt_no LIKE ? OR received_from LIKE ? OR loan_number LIKE ?)
+                 ORDER BY receipt_id DESC LIMIT 50""", (q, rlike, rlike, rlike))
+    receipts = [dict(r) for r in c.fetchall()]
+    rrows = "".join(f"""<tr>
+        <td><b>{html.escape(r['receipt_no'])}</b></td><td>{r['receipt_date']}</td><td>{html.escape(r['received_from'] or '')}</td>
+        <td>{html.escape(r['loan_number'] or '')}</td><td>{html.escape(r['installment_label'] or '')}</td>
+        <td>₹{float(r['cash'] or 0):,.2f}</td><td>₹{float(r['online'] or 0):,.2f}</td><td><b>₹{float(r['total'] or 0):,.2f}</b></td>
+        <td>{html.escape(r['cashier'] or '')}</td>
+        <td style="white-space:nowrap;"><a class="btn btn-sm btn-primary" href="/billing/receipt/{r['receipt_id']}">View</a>
+            <a class="btn btn-sm btn-success" href="/billing/receipt/{r['receipt_id']}/pdf">⬇ PDF</a></td></tr>""" for r in receipts)
+    content = f"""
+    <h1>🧾 Billing</h1>
+    <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;">
+      <input name="q" value="{html.escape(q)}" placeholder="Search by phone number, loan number or customer name…" style="max-width:420px;" autofocus>
+      <button class="btn btn-primary btn-sm">Search</button>
+    </form>
+    {('<h3 style="margin:6px 0 10px;">Matching loans</h3>' + cards) if q else '<p style="font-size:12.5px;color:var(--muted);margin-bottom:10px;">Search for the customer to make a bill. Phone numbers match the customer’s and guarantor’s numbers, including additional ones.</p>'}
+    <h3 style="margin:16px 0 10px;">Receipts {('matching “' + html.escape(q) + '”') if q else '(latest 50)'}</h3>
+    <div class="card"><div class="table-wrap"><table>
+      <tr><th>Receipt No</th><th>Date</th><th>Received From</th><th>Loan No</th><th>Installment</th>
+          <th>Cash</th><th>Online</th><th>Total</th><th>Cashier</th><th>Bill</th></tr>
+      {rrows or '<tr><td colspan="10" style="text-align:center;color:var(--muted);">No receipts yet.</td></tr>'}
+    </table></div></div>"""
+    return page("Billing", content, "billing")
+
+def _billing_form(loan_id, values=None):
+    values = values or {}
+    c = get_cur(); c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
+    loan = c.fetchone()
+    if not loan:
+        flash("Loan not found.","danger"); return redirect(url_for("billing"))
+    loan = dict(loan)
+    if loan["status"] != "Approved":
+        flash("Bills can only be made for active (approved) loans.","danger"); return redirect(url_for("billing"))
+    emis_open = _unpaid_emis(loan_id)
+    sel_emi = str(values.get("emi_id") or request.args.get("emi") or (emis_open[0]["emi_id"] if emis_open else ""))
+    pc_open = preclosure_in_progress(loan_id)
+    opts = "".join(
+        f'<option value="{e["emi_id"]}" data-rem="{_emi_remaining(e):.2f}" data-label="{ordinal_due(e["installment_no"])}" '
+        f'{"selected" if str(e["emi_id"]) == sel_emi else ""}>{ordinal_due(e["installment_no"])} — due {e["due_date"]} — pending ₹{_emi_remaining(e):,.2f}</option>'
+        for e in emis_open)
+    c.execute("SELECT receipt_no FROM Receipts ORDER BY receipt_id DESC LIMIT 1")
+    last = c.fetchone(); last_txt = f"Last receipt: <b>{html.escape(last['receipt_no'])}</b>" if last else "No receipts yet"
+    rec_checked = "" if (values and not values.get("record_on_emi")) else "checked"
+    pc_note = ('<div class="alert alert-warning" style="font-size:12px;">A pre-closure is in progress for this loan, so the payment '
+               'cannot be recorded on the EMI. You can still make a receipt (untick the box).</div>') if pc_open else ""
+    content = f"""
+    <h1>🧾 Make Bill — {html.escape(loan['loan_number'])}</h1>
+    {pc_note}
+    <div class="card"><form method="POST" action="/billing/create" id="billForm">
+      <input type="hidden" name="loan_id" value="{loan_id}">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Receipt No * <span style="font-size:10px;color:var(--muted);">({last_txt})</span></label>
+          <input name="receipt_no" value="{html.escape(values.get('receipt_no',''))}" required placeholder="e.g. B745">
+        </div>
+        <div class="form-group">
+          <label>Date *</label>
+          <input type="date" name="receipt_date" value="{html.escape(values.get('receipt_date') or date.today().isoformat())}" max="{date.today().isoformat()}" required>
+        </div>
+        <div class="form-group">
+          <label>Received From *</label>
+          <input name="received_from" value="{html.escape(values.get('received_from') or loan.get('customer_name') or '')}" required>
+        </div>
+        <div class="form-group">
+          <label>Vehicle No.</label>
+          <input value="{html.escape(loan.get('vehicle_number') or '')}" readonly style="background:var(--surface2);">
+        </div>
+        <div class="form-group">
+          <label>Loan No.</label>
+          <input value="{html.escape(loan['loan_number'])}" readonly style="background:var(--surface2);">
+        </div>
+        <div class="form-group">
+          <label>Installment * <span style="font-size:10px;color:var(--muted);">(next upcoming EMI is pre-selected)</span></label>
+          <select name="emi_id" id="emi_sel" required onchange="hint()">{opts}</select>
+        </div>
+        <div class="form-group">
+          <label>Cash (₹)</label>
+          <input type="number" name="cash" id="cash" min="0" step="0.01" value="{html.escape(str(values.get('cash','')))}" oninput="recalc()">
+        </div>
+        <div class="form-group">
+          <label>Online (₹)</label>
+          <input type="number" name="online" id="online" min="0" step="0.01" value="{html.escape(str(values.get('online','')))}" oninput="recalc()">
+        </div>
+        <div class="form-group full">
+          <div style="background:var(--surface2);border-radius:8px;padding:10px 12px;">
+            <div style="font-size:12px;color:var(--muted);" id="remHint"></div>
+            <div style="font-size:18px;font-weight:800;margin-top:2px;">Total: <span id="totalAmt">₹0.00</span></div>
+            <div style="font-size:13px;margin-top:2px;" id="wordsAmt" ></div>
+          </div>
+        </div>
+        <div class="form-group full">
+          <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;font-weight:600;cursor:pointer;">
+            <input type="checkbox" name="record_on_emi" value="yes" {rec_checked} style="width:auto;min-height:0;margin:0;" {"disabled" if (pc_open or not emis_open) else ""}>
+            Also record this payment on the EMI (receipt no becomes the EMI’s Bill No; a full payment closes the EMI)
+          </label>
+        </div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
+        <button type="submit" class="btn btn-primary">🧾 Generate Bill</button>
+        <a href="/billing" class="btn" style="background:var(--surface2);color:var(--text);">Cancel</a>
+      </div>
+    </form></div>
+    <script>
+    function inr(v){{return '₹'+v.toLocaleString('en-IN',{{minimumFractionDigits:2,maximumFractionDigits:2}});}}
+    let wt=null;
+    function recalc(){{
+      const t=(parseFloat(document.getElementById('cash').value)||0)+(parseFloat(document.getElementById('online').value)||0);
+      document.getElementById('totalAmt').textContent=inr(t);
+      clearTimeout(wt);
+      wt=setTimeout(()=>{{
+        if(t<=0){{document.getElementById('wordsAmt').textContent='';return;}}
+        fetch('/billing/words?amount='+t).then(r=>r.json()).then(d=>{{document.getElementById('wordsAmt').textContent='Rupees: '+d.words;}});
+      }},200);
+    }}
+    function hint(){{
+      const o=document.getElementById('emi_sel').selectedOptions[0];
+      document.getElementById('remHint').textContent=o?('Pending on '+o.dataset.label+': '+inr(parseFloat(o.dataset.rem))):'';
+    }}
+    hint(); recalc();
+    </script>"""
+    return page("Make Bill", content, "billing")
+
+@app.route("/billing/new/<int:loan_id>")
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def billing_new(loan_id):
+    return _billing_form(loan_id)
+
+@app.route("/billing/words")
+@login_required
+def billing_words():
+    try: return jsonify({"words": amount_in_words(float(request.args.get("amount","0")))})
+    except ValueError: return jsonify({"words": ""})
+
+@app.route("/billing/create", methods=["POST"])
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def billing_create():
+    f = request.form
+    loan_id = int(f.get("loan_id", 0) or 0)
+    def back(msg):
+        flash(msg, "danger"); return _billing_form(loan_id, dict(f))
+    c = get_cur(); c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
+    loan = c.fetchone()
+    if not loan or loan["status"] != "Approved":
+        flash("Bills can only be made for active (approved) loans.","danger"); return redirect(url_for("billing"))
+    loan = dict(loan)
+    receipt_no = f.get("receipt_no","").strip()
+    if not receipt_no: return back("Receipt number is required.")
+    c.execute("SELECT 1 FROM Receipts WHERE LOWER(receipt_no)=LOWER(?)", (receipt_no,))
+    if c.fetchone(): return back(f"Receipt number '{receipt_no}' has already been used.")
+    try: rdate = datetime.strptime(f.get("receipt_date","").strip(), "%Y-%m-%d").date()
+    except ValueError: return back("Enter a valid date.")
+    if rdate > date.today(): return back("Date cannot be in the future.")
+    try:
+        cash = round(float(f.get("cash") or 0), 2); online = round(float(f.get("online") or 0), 2)
+    except ValueError: return back("Enter valid amounts.")
+    if cash < 0 or online < 0: return back("Amounts cannot be negative.")
+    total = round(cash + online, 2)
+    if total <= 0: return back("Enter a Cash or Online amount.")
+    received_from = f.get("received_from","").strip()
+    if not received_from: return back("'Received From' is required.")
+    emi = next((e for e in _unpaid_emis(loan_id) if str(e["emi_id"]) == f.get("emi_id","")), None)
+    if not emi: return back("Please choose an unpaid installment.")
+    recorded = 0
+    if f.get("record_on_emi") == "yes":
+        if total > _emi_remaining(emi) + 0.005:
+            return back(f"The amount is more than the ₹{_emi_remaining(emi):,.2f} pending on this installment.")
+        try:
+            pay_emi(emi["emi_id"], total, bill_number=receipt_no, paid_on=rdate.isoformat(), paid_by=session.get("username"))
+            recorded = 1
+        except Exception as e:
+            return back(str(e))
+    c = get_cur()
+    c.execute("""INSERT INTO Receipts (receipt_no,loan_id,emi_id,installment_no,installment_label,received_from,receipt_date,
+                 vehicle_number,loan_number,cash,online,total,amount_words,cashier,recorded_on_emi,created_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              (receipt_no, loan_id, emi["emi_id"], emi["installment_no"], ordinal_due(emi["installment_no"]), received_from,
+               rdate.isoformat(), loan.get("vehicle_number") or "", loan["loan_number"], cash, online, total,
+               amount_in_words(total), session.get("username",""), recorded, datetime.now(timezone.utc).isoformat()))
+    get_db().commit()
+    flash("Bill generated" + (" and the payment was recorded on the EMI." if recorded else "."), "success")
+    return redirect(url_for("billing_receipt", receipt_id=c.lastrowid))
+
+def _get_receipt(receipt_id):
+    c = get_cur(); c.execute("SELECT * FROM Receipts WHERE receipt_id=?", (receipt_id,))
+    r = c.fetchone()
+    return dict(r) if r else None
+
+@app.route("/billing/receipt/<int:receipt_id>")
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def billing_receipt(receipt_id):
+    r = _get_receipt(receipt_id)
+    if not r:
+        flash("Receipt not found.","danger"); return redirect(url_for("billing"))
+    def row(label, value): return (f'<div style="display:flex;gap:10px;border-bottom:1px dotted var(--border);padding:8px 0;">'
+                                   f'<div style="width:130px;font-weight:700;color:var(--accent);font-size:12px;">{label}</div><div>{html.escape(str(value or ""))}</div></div>')
+    content = f"""
+    <h1>🧾 Receipt {html.escape(r['receipt_no'])}</h1>
+    <div class="card" style="max-width:560px;border:2px solid var(--accent);">
+      <div style="display:flex;justify-content:space-between;gap:10px;border-bottom:2px solid var(--accent);padding-bottom:10px;margin-bottom:6px;">
+        <div><div style="font-size:20px;font-weight:800;color:var(--accent);">Thendralla Fincorp</div>
+             <div style="font-size:11px;color:var(--muted);">12/360 - 1, Anbu Nagar, Madukkarai Market,<br>Coimbatore - 641 105. Ph : +91 63697 52877</div></div>
+        <div style="text-align:center;border-left:2px solid var(--accent);padding-left:12px;">
+             <div style="font-size:10px;font-weight:800;color:var(--accent);">RECEIPT NO</div><div style="font-size:22px;font-weight:800;">{html.escape(r['receipt_no'])}</div></div>
+      </div>
+      {row('Received From', r['received_from'])}{row('Date', datetime.strptime(r['receipt_date'], '%Y-%m-%d').strftime('%d/%m/%Y'))}
+      {row('Vehicle No.', r['vehicle_number'])}{row('Installment No.', r['installment_label'])}{row('Loan No.', r['loan_number'])}
+      {row('Cash', f"₹{float(r['cash'] or 0):,.2f}")}{row('Online', f"₹{float(r['online'] or 0):,.2f}")}
+      <div style="display:flex;gap:10px;padding:10px 0;font-size:18px;font-weight:800;"><div style="width:130px;color:var(--accent);">Total</div><div>₹{float(r['total']):,.2f}</div></div>
+      {row('Rupees', r['amount_words'])}{row('Cashier', r['cashier'])}
+      <div style="font-size:12px;margin-top:6px;color:{'var(--green)' if r['recorded_on_emi'] else 'var(--muted)'};">
+        {'✅ Payment recorded on the EMI with this receipt number as Bill No.' if r['recorded_on_emi'] else 'Receipt only — no EMI payment was recorded.'}</div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
+      <a class="btn btn-success" href="/billing/receipt/{receipt_id}/pdf">⬇ Download Bill (PDF)</a>
+      <a class="btn btn-primary" href="/billing">🧾 New Bill / Search</a>
+      <a class="btn" style="background:var(--surface2);color:var(--text);" href="/emis/{r['loan_id']}">View EMIs</a>
+    </div>"""
+    return page("Receipt", content, "billing")
+
+@app.route("/billing/receipt/<int:receipt_id>/pdf")
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def billing_receipt_pdf(receipt_id):
+    r = _get_receipt(receipt_id)
+    if not r:
+        flash("Receipt not found.","danger"); return redirect(url_for("billing"))
+    if not REPORTLAB_AVAILABLE:
+        flash("reportlab not installed. Run: pip install reportlab","danger"); return redirect(url_for("billing_receipt", receipt_id=receipt_id))
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", r["receipt_no"])
+    return send_file(generate_receipt_pdf(r), as_attachment=True, download_name=f"Receipt_{safe}.pdf", mimetype="application/pdf")
+
+# ── Pre-closure ────────────────────────────────────────────────────────────────
+@app.route("/preclose/request/<int:loan_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def preclose_request(loan_id):
+    try:
+        request_preclosure(loan_id, session.get("username",""))
+        flash("Pre-closure request sent to the admin for approval.","success")
+    except Exception as e:
+        flash(str(e),"danger")
+    return redirect(url_for("emis", loan_id=loan_id))
+
+@app.route("/preclose/approve/<int:preclose_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin")
+def preclose_approve(preclose_id):
+    try:
+        approve_preclosure(preclose_id, request.form.get("new_rate",""), session.get("username",""))
+        flash("Pre-closure approved. The staff can now record the closing bill.","success")
+    except Exception as e:
+        flash(str(e),"danger")
+    return redirect(url_for("approval"))
+
+@app.route("/preclose/reject/<int:preclose_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin")
+def preclose_reject(preclose_id):
+    try:
+        reject_preclosure(preclose_id, request.form.get("reason",""), session.get("username",""))
+        flash("Pre-closure request rejected.","success")
+    except Exception as e:
+        flash(str(e),"danger")
+    return redirect(url_for("approval"))
+
+@app.route("/preclose/close/<int:preclose_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def preclose_close(preclose_id):
+    pc_loan = None
+    try:
+        c = get_cur(); c.execute("SELECT loan_id FROM PreClosure WHERE preclose_id=?", (preclose_id,))
+        row = c.fetchone(); pc_loan = row["loan_id"] if row else None
+        complete_preclosure(preclose_id, request.form.get("bill_number",""), request.form.get("paid_on",""),
+                            session.get("username",""))
+        flash("Loan pre-closed and moved to Closed Loans.","success")
+    except Exception as e:
+        flash(str(e),"danger")
+    return redirect(url_for("emis", loan_id=pc_loan) if pc_loan else url_for("dashboard"))
 
 # ── Alerts (grouped by loan number) ────────────────────────────────────────────
 @app.route("/alerts")
@@ -3179,13 +4465,33 @@ def followup_resolve(followup_id):
     flash("Follow-up marked as resolved.","success")
     return redirect(request.form.get("next") or url_for("followups"))
 
+@app.route("/followup/reschedule/<int:followup_id>", methods=["POST"])
+@login_required
+def followup_reschedule(followup_id):
+    nxt   = request.form.get("next") or url_for("followups")
+    fdate = request.form.get("follow_up_date","").strip()
+    if not fdate:
+        flash("Please pick the new follow-up date.","danger")
+        return redirect(nxt)
+    try:
+        reschedule_follow_up(followup_id, fdate, request.form.get("remarks","").strip(),
+                             session.get("username",""))
+        flash("New follow-up added.","success")
+    except Exception as e:
+        flash(str(e),"danger")
+    return redirect(nxt)
+
 # ── Follow Up (all customers, all loans) ────────────────────────────────────────
 @app.route("/followup")
 @login_required
 def followups():
     q = request.args.get("q","")
-    items = list_follow_ups(q)
+    cat = request.args.get("cat","")
+    if cat not in FU_CATEGORIES: cat = ""
+    items = list_follow_ups(q, cat)
     today = date.today()
+    q_url = urlquote(q); cat_url = urlquote(cat)
+    back_url = f"/followup?q={q_url}&cat={cat_url}"
     rows = ""
     for r in items:
         fu_date = parse_date(r["follow_up_date"])
@@ -3193,6 +4499,8 @@ def followups():
         row_cls = ""
         if r["status"] == "Resolved":
             status_badge = '<span class="badge badge-closed">✅ Resolved</span>'
+        elif r["status"] == "Rescheduled":
+            status_badge = '<span class="badge badge-closed">🔁 Rescheduled</span>'
         elif fu_date < today:
             status_badge = '<span class="badge badge-overdue">⏰ Missed</span>'
             row_cls = "row-overdue"
@@ -3201,24 +4509,42 @@ def followups():
             row_cls = "row-upcoming"
         else:
             status_badge = '<span class="badge badge-pending">📅 Pending</span>'
-        resolve_btn = "" if r["status"] == "Resolved" else f"""
+        is_open = r["status"] == "Pending"
+        resolve_label = "✔ Received" if r.get("item") in FU_ITEM_COLUMNS else "✔ Resolve"
+        resolve_btn = "" if not is_open else f"""
           <form method="POST" action="/followup/resolve/{r['followup_id']}" style="display:inline;">
-            <input type="hidden" name="next" value="/followup?q={q}">
-            <button class="btn btn-sm btn-success">✔ Resolve</button>
+            <input type="hidden" name="next" value="{back_url}">
+            <button class="btn btn-sm btn-success">{resolve_label}</button>
           </form>"""
-        pay_btn = f'<a class="btn btn-sm btn-danger" href="/emis/{r["loan_id"]}">💳 Pay</a>'
+        reschedule_form = "" if not (is_open and r["category"] != "Loans") else f"""
+          <form method="POST" action="/followup/reschedule/{r['followup_id']}" style="display:flex;gap:4px;align-items:center;">
+            <input type="hidden" name="next" value="{back_url}">
+            <input type="date" name="follow_up_date" min="{today.isoformat()}" required
+                   style="width:130px;font-size:12px;padding:5px 6px;" title="New follow-up date">
+            <button class="btn btn-sm btn-amber">🔁 Reschedule</button>
+          </form>"""
+        pay_btn = f'<a class="btn btn-sm btn-danger" href="/emis/{r["loan_id"]}">💳 Pay</a>' if r["category"] == "Loans" else ""
         rows += f"""<tr class="{row_cls}">
           <td><b><a href="/emis/{r['loan_id']}" style="color:var(--accent);">{r['loan_number']}</a></b></td>
+          <td><span class="badge badge-partial">{html.escape(r['category'])}</span></td>
           <td>{r['customer_name']}</td>
-          <td>{r.get('customer_mobile') or '—'}</td>
-          <td style="white-space:normal;max-width:180px;">{r.get('customer_address') or '—'}</td>
-          <td>{_location_link(r.get('customer_location'))}</td>
+          <td>{customer_numbers_html(r)}{('<br><span style="font-size:11px;color:var(--muted);">🛡️ Guarantor</span><br>' + guarantor_numbers_html(r)) if guarantor_numbers_html(r) != '—' else ''}</td>
+          <td>{html.escape(r.get('vehicle_type') or '—')}</td>
+          <td>{('₹{:,.2f}'.format(r['emi_amount'])) if r.get('emi_amount') is not None else '—'}</td>
+          <td>{r.get('oldest_due') or '—'}</td>
+          <td style="text-align:center;">{r['pending_dues']}</td>
           <td><b style="color:var(--red);">₹{r['overdue_amount']:,.2f}</b></td>
+          <td><b>₹{r['outstanding']:,.2f}</b></td>
+          <td>{r.get('last_paid_date') or '—'}</td>
+          <td style="white-space:normal;max-width:180px;">{r.get('customer_address') or '—'}</td>
+          <td style="white-space:normal;max-width:180px;">{r.get('customer_permanent_address') or '—'}</td>
+          <td>{_location_link(r.get('customer_location'))}</td>
+          <td>{_location_link(r.get('guarantor_location'))}</td>
           <td>{r['follow_up_date']}</td>
           <td style="white-space:normal;max-width:220px;">{r['remarks']}</td>
           <td>{status_badge}</td>
           <td>{r.get('created_by') or ''}</td>
-          <td style="white-space:nowrap;display:flex;gap:6px;">{pay_btn}{resolve_btn}</td>
+          <td style="white-space:nowrap;display:flex;gap:6px;flex-wrap:wrap;">{pay_btn}{resolve_btn}{reschedule_form}</td>
         </tr>"""
     legend = """
     <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px;font-size:12px;">
@@ -3229,25 +4555,35 @@ def followups():
         <span style="width:14px;height:14px;background:#fef9c3;border-left:3px solid #d97706;display:inline-block;"></span> Due within 2 days
       </span>
     </div>"""
-    q_url = urlquote(q)
+    tabs = "".join(
+        f'<a href="/followup?q={q_url}&cat={urlquote(name)}" class="btn btn-sm" '
+        f'style="{"background:var(--accent);color:#fff;" if cat==name else "background:var(--surface2);color:var(--text);"}">{label}</a>'
+        for name, label in (("", "All"), ("Loans", "💰 Loans"), ("Key Collection", "🔑 Key Collection"),
+                            ("Proof & Documents", "📄 Proof & Documents")))
     content = f"""
     <h1>📞 Follow Up</h1>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">{tabs}</div>
     <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;">
+      <input type="hidden" name="cat" value="{html.escape(cat)}">
       <input name="q" value="{q}" placeholder="Search loan / customer / mobile…" style="max-width:280px;">
       <button class="btn btn-primary btn-sm">Search</button>
-      <a href="/followup/export/csv?q={q_url}" class="btn btn-success btn-sm">📊 Export Excel (CSV)</a>
-      <a href="/followup/export/pdf?q={q_url}" class="btn btn-danger btn-sm">📄 Export PDF</a>
+      <a href="/followup/export/csv?q={q_url}&cat={cat_url}" class="btn btn-success btn-sm">📊 Export Excel (CSV)</a>
+      <a href="/followup/export/pdf?q={q_url}&cat={cat_url}" class="btn btn-danger btn-sm">📄 Export PDF</a>
     </form>
     <div class="card">
       <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">
-        Every follow-up saved from the Alerts page — customer-requested collection dates and remarks,
-        with contact, address and location, across all loans. Rows are ordered by follow-up date.
+        Loan collection follow-ups (saved from the Alerts page) plus the automatic Key Collection and
+        Proof &amp; Documents follow-ups created when a loan is submitted with Key / RC / Documents = No.
+        Rows are ordered by follow-up date. <b>Overdue Amt</b> = already past due; <b>Outstanding</b> = total balance
+        of the loan still to be collected; <b>Oldest Due Date</b> = earliest unpaid EMI.
       </p>
       {legend}
       <div class="table-wrap"><table>
-        <tr><th>Loan #</th><th>Customer</th><th>Mobile</th><th>Address</th><th>Location</th>
-            <th>Overdue Amt</th><th>Follow-up Date</th><th>Remarks</th><th>Status</th><th>By</th><th>Action</th></tr>
-        {rows or '<tr><td colspan="11" style="text-align:center;color:var(--muted);">No follow-ups recorded yet.</td></tr>'}
+        <tr><th>Loan #</th><th>Category</th><th>Customer</th><th>Mobile</th>
+            <th>Vehicle</th><th>EMI Amt</th><th>Oldest Due Date</th><th>Pending Dues</th><th>Overdue Amt</th><th>Outstanding</th><th>Last Paid</th>
+            <th>Current Address</th><th>Permanent Address</th><th>Location</th><th>Guarantor Location</th>
+            <th>Follow-up Date</th><th>Remarks</th><th>Status</th><th>By</th><th>Action</th></tr>
+        {rows or '<tr><td colspan="20" style="text-align:center;color:var(--muted);">No follow-ups recorded yet.</td></tr>'}
       </table></div>
     </div>"""
     return page("Follow Up", content, "followup")
@@ -3256,21 +4592,31 @@ def followups():
 @login_required
 def followup_export_csv():
     q = request.args.get("q","")
-    items = list_follow_ups(q)
+    items = list_follow_ups(q, request.args.get("cat",""))
     today = date.today()
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["Loan Number","Customer","Mobile","Address","Location",
-                      "Overdue Amount","Follow-up Date","Remarks","Status","Created By"])
+    writer.writerow(["Loan Number","Category","Customer","Mobile","Customer Other Numbers","Guarantor Numbers",
+                      "Vehicle Type","EMI Amount","Oldest Due Date","Pending Dues","Overdue Amount","Outstanding Amount","Last Paid Date",
+                      "Current Address","Permanent Address","Location","Guarantor Location",
+                      "Follow-up Date","Remarks","Status","Created By"])
     for r in items:
         fu_date = parse_date(r["follow_up_date"])
-        if r["status"] == "Resolved": status = "Resolved"
+        if r["status"] in ("Resolved","Rescheduled"): status = r["status"]
         elif fu_date < today: status = "Missed"
         else: status = "Pending"
         writer.writerow([
-            r["loan_number"], r.get("customer_name") or "", r.get("customer_mobile") or "",
-            r.get("customer_address") or "", r.get("customer_location") or "",
-            f"{r['overdue_amount']:.2f}", r["follow_up_date"], r.get("remarks") or "",
+            r["loan_number"], r["category"], r.get("customer_name") or "", r.get("customer_mobile") or "",
+            contact_numbers_text(r.get("customer_extra_numbers")),
+            "; ".join(x for x in [
+                f"{r.get('guarantor_mobile')} (Primary - {r.get('guarantor_name') or 'Guarantor'})" if r.get("guarantor_mobile") else "",
+                contact_numbers_text(r.get("guarantor_extra_numbers"))] if x),
+            r.get("vehicle_type") or "",
+            f"{r['emi_amount']:.2f}" if r.get("emi_amount") is not None else "",
+            r.get("oldest_due") or "", r["pending_dues"],
+            f"{r['overdue_amount']:.2f}", f"{r['outstanding']:.2f}", r.get("last_paid_date") or "",
+            r.get("customer_address") or "", r.get("customer_permanent_address") or "", r.get("customer_location") or "", r.get("guarantor_location") or "",
+            r["follow_up_date"], r.get("remarks") or "",
             status, r.get("created_by") or ""
         ])
     return send_file(io.BytesIO(buf.getvalue().encode("utf-8-sig")), as_attachment=True,
@@ -3283,7 +4629,7 @@ def followup_export_pdf():
     if not REPORTLAB_AVAILABLE:
         flash("reportlab not installed. Run: pip install reportlab","danger")
         return redirect(url_for("followups", q=q))
-    items = list_follow_ups(q)
+    items = list_follow_ups(q, request.args.get("cat",""))
     path = os.path.join(tempfile.gettempdir(), "tfc_followup_report.pdf")
     try:
         generate_followup_pdf(path, items)
@@ -3297,10 +4643,16 @@ def followup_export_pdf():
 @login_required
 def closed():
     q = request.args.get("q",""); ll = list_closed_loans(q)
+    def closure_label(l):
+        pc = l.get("preclosure")
+        if not pc: return "Regular"
+        return (f'<span class="badge badge-partial">⏩ Pre-closed</span><br>'
+                f'<span style="font-size:11px;color:var(--muted);">Settled ₹{float(pc["settlement_amount"] or 0):,.2f} · '
+                f'rate {float(pc["original_rate"] or 0)*100:.2f}% → {float(pc["new_rate"] or 0)*100:.2f}% · bill {html.escape(str(pc["bill_number"] or ""))}</span>')
     rows = "".join(f"""<tr>
         <td><b>{l['loan_number']}</b></td><td>{l['customer_name']}</td>
         <td>{l['vehicle_type']}</td><td>₹{l['loan_amount']:,.2f}</td>
-        <td>{l['closure_date']}</td></tr>""" for l in ll)
+        <td>{l['closure_date']}</td><td>{closure_label(l)}</td></tr>""" for l in ll)
     content = f"""
     <h1>🔒 Closed Loans</h1>
     <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;">
@@ -3308,8 +4660,8 @@ def closed():
       <button class="btn btn-primary btn-sm">Search</button>
     </form>
     <div class="card"><div class="table-wrap"><table>
-      <tr><th>Loan #</th><th>Customer</th><th>Type</th><th>Amount</th><th>Closed On</th></tr>
-      {rows or '<tr><td colspan="5" style="text-align:center;color:var(--muted);">No closed loans</td></tr>'}
+      <tr><th>Loan #</th><th>Customer</th><th>Type</th><th>Amount</th><th>Closed On</th><th>Closure</th></tr>
+      {rows or '<tr><td colspan="6" style="text-align:center;color:var(--muted);">No closed loans</td></tr>'}
     </table></div></div>"""
     return page("Closed Loans", content, "closed")
 
@@ -3731,7 +5083,7 @@ def _chatbot_loan_summary(loan, detailed=False):
     emis = get_emis_for_loan(lid)
     total = len(emis)
     paid  = len([e for e in emis if e["status"]=="Paid"])
-    outstanding = sum(float(e.get("remaining_amount") or e["emi_amount"]) for e in emis if e["status"]!="Paid")
+    outstanding = sum(float(e.get("remaining_amount") or e["emi_amount"]) for e in emis if e["status"] not in ("Paid","PreClosed"))
     next_due = next((e for e in emis if e["status"] in ("Pending","Partial","Overdue")), None)
 
     lines = []
@@ -4614,7 +5966,7 @@ def emi_edit(emi_id):
 
     c.execute("SELECT loan_number, customer_name FROM LoanEntry WHERE id=?", (loan_id,))
     loan_row = c.fetchone() or {}
-    status_options = ["Pending","Paid","Partial","Overdue"]
+    status_options = ["Pending","Paid","Partial","Overdue","PreClosed"]
 
     payments = get_payments_for_emi(emi_id)
     inst_no = emi.get('installment_no','?')
@@ -4623,18 +5975,21 @@ def emi_edit(emi_id):
           <td>{fmt_inr(p.get('extra_interest') or 0)}</td>
           <td>{p.get('bill_number') or '—'}</td>
           <td>{(p.get('paid_at') or '')[:10]}</td>
+          <td>{delay_badge(emi.get('due_date',''), (p.get('paid_at') or '')[:10]) if p.get('paid_at') else '—'}</td>
           <td>{p.get('paid_by') or '—'}</td>
         </tr>""" for i, p in enumerate(payments))
     if payments and emi.get("status") == "Paid":
+        last_paid = (payments[-1].get('paid_at') or '')[:10]
         payment_rows += f"""<tr>
-          <td colspan="6" style="color:var(--green);"><b>✅ {inst_no} (Closed)</b></td>
+          <td colspan="7" style="color:var(--green);"><b>✅ {inst_no} (Closed)</b>
+            {('— closed on ' + last_paid + ' — ' + delay_badge(emi.get('due_date',''), last_paid) + ' — Late Payment Days: <b>' + str(max(0, (parse_date(last_paid) - parse_date(emi.get('due_date',''))).days)) + '</b>') if last_paid else ''}</td>
         </tr>"""
     payment_history_card = f"""
     <div class="card" style="margin-bottom:12px;">
       <h3 style="font-size:14px;margin-bottom:10px;">💳 Payment History <span style="font-size:11px;font-weight:400;color:var(--muted);">(each payment recorded separately — Ref # = installment.payment)</span></h3>
       <div class="table-wrap"><table>
-        <tr><th>Ref #</th><th>Amount</th><th>Extra Interest</th><th>Bill No</th><th>Paid On</th><th>Paid By</th></tr>
-        {payment_rows or '<tr><td colspan="6" style="text-align:center;color:var(--muted);">No payments recorded yet for this installment.</td></tr>'}
+        <tr><th>Ref #</th><th>Amount</th><th>Extra Interest</th><th>Bill No</th><th>Paid On</th><th>Payment Status</th><th>Paid By</th></tr>
+        {payment_rows or '<tr><td colspan="7" style="text-align:center;color:var(--muted);">No payments recorded yet for this installment.</td></tr>'}
       </table></div>
     </div>"""
 
