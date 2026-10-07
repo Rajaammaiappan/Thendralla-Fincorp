@@ -11,7 +11,7 @@ Changes v3:
   - All previous features preserved
 """
 
-import os, math, sqlite3, hashlib, secrets, calendar, smtplib, base64, io, zipfile, csv, re, tempfile, html, json
+import os, math, sqlite3, hashlib, secrets, calendar, smtplib, base64, io, zipfile, csv, re, tempfile, html, json, time
 import requests as http_req
 from urllib.parse import quote as urlquote
 from datetime import date, datetime, timezone, timedelta
@@ -2525,6 +2525,14 @@ def login_required(f):
     @wraps(f)
     def dec(*a,**kw):
         if "username" not in session: return redirect(url_for("login"))
+        # pick up role changes / removed users made by the Super Admin (checked at most once a minute)
+        now = time.time()
+        if now - session.get("role_checked", 0) > 60:
+            c = get_cur(); c.execute("SELECT role FROM Users WHERE username=?", (session["username"],))
+            row = c.fetchone()
+            if not row:
+                session.clear(); return redirect(url_for("login"))
+            session["role"] = row["role"]; session["role_checked"] = now
         return f(*a,**kw)
     return dec
 
@@ -2564,7 +2572,7 @@ def login():
         user = authenticate_user(request.form["username"], request.form["password"])
         if user:
             session.permanent = True
-            session["username"] = user["username"]; session["role"] = user["role"]
+            session["username"] = user["username"]; session["role"] = user["role"]; session["role_checked"] = time.time()
             flash(f"Welcome, {user['username']}!","success")
             return redirect(url_for("dashboard"))
         err = "Invalid credentials."
@@ -5505,17 +5513,38 @@ def report():
 @login_required
 @role_required("admin","superadmin")
 def users():
+    is_super = session.get("role") == "superadmin"
+    me = session.get("username", "")
     if request.method == "POST":
         uname = request.form["username"].strip(); pw = request.form["password"]; role_u = request.form["role"]
         c = get_cur()
-        c.execute("INSERT INTO Users (username,pw_hash,role,created_at) VALUES (?,?,?,?) ON CONFLICT(username) DO UPDATE SET pw_hash=?,role=?",
-                  (uname,hash_pw(pw),role_u,datetime.now(timezone.utc).isoformat(),hash_pw(pw),role_u))
-        get_db().commit(); flash(f"User '{uname}' saved.","success")
+        c.execute("SELECT role FROM Users WHERE username=?", (uname,))
+        existing = c.fetchone()
+        if role_u not in ROLES:
+            flash("Unknown role.","danger")
+        elif not is_super and role_u == "superadmin":
+            flash("Only a Super Admin can create a Super Admin.","danger")
+        else:
+            if existing and not is_super:
+                role_u = existing["role"]      # only a Super Admin may change an existing user's role
+            c.execute("INSERT INTO Users (username,pw_hash,role,created_at) VALUES (?,?,?,?) ON CONFLICT(username) DO UPDATE SET pw_hash=?,role=?",
+                      (uname,hash_pw(pw),role_u,datetime.now(timezone.utc).isoformat(),hash_pw(pw),role_u))
+            get_db().commit(); flash(f"User '{uname}' saved.","success")
     c = get_cur(); c.execute("SELECT * FROM Users ORDER BY user_id")
     ul = [dict(r) for r in c.fetchall()]
+    def role_cell(u):
+        if not is_super: return ""
+        if u["username"] == me:
+            return '<td style="font-size:12px;color:var(--muted);">(you — cannot change your own role)</td>'
+        opts = "".join(f'<option value="{r}" {"selected" if r == u["role"] else ""}>{ROLES[r]["label"]}</option>' for r in ROLES)
+        return (f'<td><form method="POST" action="/users/role" style="display:flex;gap:6px;align-items:center;" '
+                f'onsubmit="return confirm(\'Change the role of {html.escape(u["username"])}?\')">'
+                f'<input type="hidden" name="username" value="{html.escape(u["username"])}">'
+                f'<select name="role" style="font-size:12px;padding:4px 6px;">{opts}</select>'
+                f'<button class="btn btn-sm btn-amber">Change role</button></form></td>')
     urows = "".join(f"""<tr><td>{u['username']}</td>
-        <td><span class="badge badge-{u['role']}">{u['role'].title()}</span></td>
-        <td>{fmt_date((u.get('created_at') or '')[:10])}</td></tr>""" for u in ul)
+        <td><span class="badge badge-{u['role']}">{ROLES.get(u['role'],{}).get('label', u['role'].title())}</span></td>
+        <td>{fmt_date((u.get('created_at') or '')[:10])}</td>{role_cell(u)}</tr>""" for u in ul)
     rrws = ""
     for r,p in ROLES.items():
         def ck(k,p=p): return "✅" if p.get(k) else "❌"
@@ -5549,10 +5578,38 @@ def users():
     <div class="card">
       <h2>All Users</h2>
       <div class="table-wrap"><table>
-        <tr><th>Username</th><th>Role</th><th>Created</th></tr>{urows}
+        <tr><th>Username</th><th>Role</th><th>Created</th>{'<th>Change role</th>' if is_super else ''}</tr>{urows}
       </table></div>
+      {'<p style="font-size:12px;color:var(--muted);margin-top:8px;">A role change applies to that user within about a minute, without them logging in again.</p>' if is_super else ''}
     </div>"""
     return page("Users", content, "users")
+
+@app.route("/users/role", methods=["POST"])
+@login_required
+@role_required("superadmin")
+def users_change_role():
+    uname = request.form.get("username","").strip(); new_role = request.form.get("role","")
+    c = get_cur()
+    c.execute("SELECT role FROM Users WHERE username=?", (uname,))
+    row = c.fetchone()
+    if new_role not in ROLES:
+        flash("Unknown role.","danger")
+    elif not row:
+        flash("User not found.","danger")
+    elif uname == session.get("username"):
+        flash("You cannot change your own role.","danger")
+    elif row["role"] == new_role:
+        flash(f"'{uname}' is already {ROLES[new_role]['label']}.","info")
+    else:
+        if row["role"] == "superadmin":
+            c.execute("SELECT COUNT(*) as n FROM Users WHERE role='superadmin'")
+            if c.fetchone()["n"] <= 1:
+                flash("There must always be at least one Super Admin.","danger")
+                return redirect(url_for("users"))
+        c.execute("UPDATE Users SET role=? WHERE username=?", (new_role, uname))
+        get_db().commit()
+        flash(f"'{uname}' is now {ROLES[new_role]['label']} (was {ROLES.get(row['role'],{}).get('label', row['role'])}).","success")
+    return redirect(url_for("users"))
 
 # ── API ────────────────────────────────────────────────────────────────────────
 @app.route("/api/chart/monthly")
