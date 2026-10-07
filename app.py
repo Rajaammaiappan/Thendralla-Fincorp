@@ -81,12 +81,16 @@ SMS_CONFIG = {
 }
 
 ROLES = {
-    "superadmin":{"label":"Super Admin","can_approve":True,"can_reject":True,"can_add":True,"can_pay":True,"can_report":True,"can_edit":True,"can_db":True},
-    "admin":    {"label":"Admin",    "can_approve":True,  "can_reject":True,  "can_add":True,  "can_pay":True,  "can_report":True, "can_edit":False,"can_db":False},
-    "manager":  {"label":"Manager",  "can_approve":False, "can_reject":False, "can_add":True,  "can_pay":True,  "can_report":True, "can_edit":False,"can_db":False},
-    "fieldpia": {"label":"Fieldpia", "can_approve":False, "can_reject":False, "can_add":True,  "can_pay":True,  "can_report":False,"can_edit":False,"can_db":False},
-    "viewer":   {"label":"Viewer",   "can_approve":False, "can_reject":False, "can_add":False, "can_pay":False, "can_report":True, "can_edit":False,"can_db":False},
+    "superadmin":{"label":"Super Admin","can_approve":True,"can_reject":True,"can_add":True,"can_pay":True,"can_report":True,"can_edit":True,"can_db":True,"can_ack":True},
+    "admin":    {"label":"Admin",    "can_approve":True,  "can_reject":True,  "can_add":True,  "can_pay":True,  "can_report":True, "can_edit":False,"can_db":False,"can_ack":True},
+    "manager":  {"label":"Manager",  "can_approve":False, "can_reject":False, "can_add":True,  "can_pay":True,  "can_report":True, "can_edit":False,"can_db":False,"can_ack":False},
+    "fieldpia": {"label":"Fieldpia", "can_approve":False, "can_reject":False, "can_add":True,  "can_pay":True,  "can_report":False,"can_edit":False,"can_db":False,"can_ack":False},
+    # Associate Manager: second-level cross-check only (acknowledges payments and follow-ups); no decision-making approvals
+    "assocmgr": {"label":"Associate Manager","can_approve":False,"can_reject":False,"can_add":False,"can_pay":False,"can_report":True,"can_edit":False,"can_db":False,"can_ack":True},
+    "viewer":   {"label":"Viewer",   "can_approve":False, "can_reject":False, "can_add":False, "can_pay":False, "can_report":True, "can_edit":False,"can_db":False,"can_ack":False},
 }
+ACK_ROLES = ("superadmin", "admin", "assocmgr")     # may acknowledge
+DIRECT_ROLES = ("superadmin", "admin")              # their own entries need no extra acknowledgement
 
 DEFAULT_USERS = {
     "superadmin":{"role":"superadmin","pw_hash": hashlib.sha256(b"superadmin123").hexdigest()},
@@ -119,6 +123,13 @@ def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
 def parse_date(s):
     try: return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
     except: return date.today()
+
+def fmt_date(v, empty="—"):
+    """Display format for dates: DD/MM/YYYY. Stored values stay YYYY-MM-DD."""
+    if not v: return empty
+    if isinstance(v, (date, datetime)): return v.strftime("%d/%m/%Y")
+    try: return datetime.strptime(str(v)[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError: return str(v)
 
 def add_months(d, m):
     month = d.month - 1 + m
@@ -492,6 +503,45 @@ def init_db():
         FOREIGN KEY(emi_id) REFERENCES EMI(emi_id),
         FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
     );
+    CREATE TABLE IF NOT EXISTS PendingPayments (
+        pp_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        emi_id INTEGER,
+        loan_id INTEGER,
+        installment_no INTEGER,
+        amount REAL,
+        bill_number TEXT,
+        paid_on TEXT,
+        penalty_rate REAL,
+        receipt_id INTEGER,
+        requested_by TEXT,
+        requested_at TEXT,
+        status TEXT,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_remarks TEXT,
+        FOREIGN KEY(emi_id) REFERENCES EMI(emi_id)
+    );
+    CREATE TABLE IF NOT EXISTS Penalties (
+        penalty_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        loan_id INTEGER,
+        emi_id INTEGER,
+        installment_no INTEGER,
+        days INTEGER,
+        half_paid_date TEXT,
+        requested_rate REAL,
+        requested_amount REAL,
+        requested_by TEXT,
+        requested_at TEXT,
+        status TEXT,
+        final_rate REAL,
+        final_amount REAL,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_remarks TEXT,
+        followup_id INTEGER,
+        collected_at TEXT,
+        FOREIGN KEY(emi_id) REFERENCES EMI(emi_id)
+    );
     CREATE TABLE IF NOT EXISTS Receipts (
         receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
         receipt_no TEXT,
@@ -587,6 +637,10 @@ def init_db():
         "ALTER TABLE LoanEntry ADD COLUMN docs_received_date TEXT",
         "ALTER TABLE FollowUp ADD COLUMN category TEXT DEFAULT 'Loans'",
         "ALTER TABLE FollowUp ADD COLUMN item TEXT",
+        "ALTER TABLE FollowUp ADD COLUMN ref_id INTEGER",
+        "ALTER TABLE FollowUp ADD COLUMN ack_requested_by TEXT",
+        "ALTER TABLE FollowUp ADD COLUMN ack_requested_at TEXT",
+        "ALTER TABLE FollowUp ADD COLUMN ack_note TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN guarantor_mobile TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN is_reloan INTEGER DEFAULT 0",
         "ALTER TABLE LoanEntry ADD COLUMN reloan_ref TEXT",
@@ -621,6 +675,10 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_customers_status ON Customers(status)",
         "CREATE INDEX IF NOT EXISTS idx_followup_loan_id ON FollowUp(loan_id)",
         "CREATE INDEX IF NOT EXISTS idx_followup_status ON FollowUp(status)",
+        "CREATE INDEX IF NOT EXISTS idx_pp_status ON PendingPayments(status)",
+        "CREATE INDEX IF NOT EXISTS idx_pp_emi ON PendingPayments(emi_id)",
+        "CREATE INDEX IF NOT EXISTS idx_penalties_status ON Penalties(status)",
+        "CREATE INDEX IF NOT EXISTS idx_penalties_emi ON Penalties(emi_id)",
         "CREATE INDEX IF NOT EXISTS idx_receipts_no ON Receipts(receipt_no)",
         "CREATE INDEX IF NOT EXISTS idx_receipts_loan_id ON Receipts(loan_id)",
         "CREATE INDEX IF NOT EXISTS idx_preclosure_loan_id ON PreClosure(loan_id)",
@@ -1019,6 +1077,149 @@ def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number="", paid_on
             get_db().commit(); _notify_closure(lid)
         return "EMI paid successfully!"
 
+# ── Payment acknowledgement (second-level cross-check) & late-payment penalties ──
+PENALTY_FOLLOWUP_DAYS = 3      # penalty-collection follow-up falls due this many days after approval
+
+def pending_payment_for_emi(emi_id):
+    c = get_cur()
+    c.execute("SELECT * FROM PendingPayments WHERE emi_id=? AND status='Pending' ORDER BY pp_id DESC LIMIT 1", (emi_id,))
+    r = c.fetchone()
+    return dict(r) if r else None
+
+def validate_payment(emi_id, amount, bill_number, paid_on):
+    """Same rules pay_emi enforces, checked up front so a bad payment is refused before it is queued."""
+    c = get_cur(); c.execute("SELECT * FROM EMI WHERE emi_id=?", (emi_id,))
+    emi = c.fetchone()
+    if not emi: raise ValueError("EMI not found")
+    emi = dict(emi)
+    if emi["status"] == "Paid": raise ValueError("EMI already paid")
+    if emi["status"] == "PreClosed": raise ValueError("This loan has been pre-closed.")
+    if preclosure_in_progress(emi["loan_id"]):
+        raise ValueError("A pre-closure is in progress for this loan, so EMI payments are paused. "
+                         "Finish or reject the pre-closure first.")
+    if pending_payment_for_emi(emi_id):
+        raise ValueError("A payment for this installment is already awaiting acknowledgement.")
+    if not can_pay_emi(emi["loan_id"], emi["installment_no"]):
+        raise ValueError(f"Cannot pay installment {emi['installment_no']}. Complete previous first "
+                         f"(a payment awaiting acknowledgement counts as not yet paid).")
+    if not (bill_number or "").strip(): raise ValueError("Bill number is mandatory before payment.")
+    if not amount or float(amount) <= 0: raise ValueError("Enter a payment amount.")
+    if paid_on:
+        try: d = datetime.strptime(paid_on, "%Y-%m-%d").date()
+        except ValueError: raise ValueError("Invalid Paid On date.")
+        if d > date.today(): raise ValueError("Paid On date cannot be in the future.")
+    return emi
+
+def queue_payment(emi, amount, bill_number, paid_on, user, penalty_rate=None, receipt_id=None):
+    c = get_cur()
+    c.execute("""INSERT INTO PendingPayments (emi_id,loan_id,installment_no,amount,bill_number,paid_on,penalty_rate,
+                 receipt_id,requested_by,requested_at,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+              (emi["emi_id"], emi["loan_id"], emi["installment_no"], float(amount), bill_number.strip(),
+               paid_on or date.today().isoformat(), float(penalty_rate or 0) or None, receipt_id, user,
+               datetime.now(timezone.utc).isoformat(), "Pending"))
+    get_db().commit()
+    return c.lastrowid
+
+def submit_payment(emi_id, amount, bill_number, paid_on, user, role, penalty_rate=None):
+    """Admin / Super Admin payments are applied straight away. Everyone else's payment is held back as
+    'awaiting acknowledgement' until an Associate Manager (or an admin) cross-checks and confirms it."""
+    emi = validate_payment(emi_id, amount, bill_number, paid_on)
+    if role in DIRECT_ROLES:
+        msg = pay_emi(emi_id, float(amount), bill_number=bill_number, paid_on=paid_on or None, paid_by=user)
+        pen = create_penalty_if_needed(emi_id, penalty_rate, user)
+        return msg + ((" " + pen) if pen else "")
+    queue_payment(emi, amount, bill_number, paid_on, user, penalty_rate)
+    return "Payment sent for acknowledgement. It will be recorded on the EMI once it is acknowledged."
+
+def acknowledge_payment(pp_id, username):
+    c = get_cur(); c.execute("SELECT * FROM PendingPayments WHERE pp_id=?", (pp_id,))
+    pp = c.fetchone()
+    if not pp or pp["status"] != "Pending": raise ValueError("This payment is no longer awaiting acknowledgement.")
+    if pp["requested_by"] == username: raise ValueError("You cannot acknowledge your own entry.")
+    msg = pay_emi(pp["emi_id"], float(pp["amount"]), bill_number=pp["bill_number"], paid_on=pp["paid_on"],
+                  paid_by=pp["requested_by"])
+    c = get_cur()
+    c.execute("UPDATE PendingPayments SET status='Acknowledged', decided_by=?, decided_at=? WHERE pp_id=?",
+              (username, datetime.now(timezone.utc).isoformat(), pp_id))
+    if pp["receipt_id"]:
+        c.execute("UPDATE Receipts SET recorded_on_emi=1 WHERE receipt_id=?", (pp["receipt_id"],))
+    get_db().commit()
+    pen = create_penalty_if_needed(pp["emi_id"], pp["penalty_rate"], pp["requested_by"])
+    return msg + ((" " + pen) if pen else "")
+
+def reject_payment(pp_id, reason, username):
+    c = get_cur(); c.execute("SELECT * FROM PendingPayments WHERE pp_id=?", (pp_id,))
+    pp = c.fetchone()
+    if not pp or pp["status"] != "Pending": raise ValueError("This payment is no longer awaiting acknowledgement.")
+    c.execute("""UPDATE PendingPayments SET status='Rejected', decided_by=?, decided_at=?, decision_remarks=?
+                 WHERE pp_id=?""", (username, datetime.now(timezone.utc).isoformat(), (reason or "").strip() or "No reason given", pp_id))
+    if pp["receipt_id"]:
+        c.execute("UPDATE Receipts SET recorded_on_emi=3 WHERE receipt_id=?", (pp["receipt_id"],))
+    get_db().commit()
+
+def create_penalty_if_needed(emi_id, rate, requested_by):
+    """After a payment: if the installment has crossed half of its EMI late (point 22 rule) and a per-day
+    rate was given, raise a penalty (days x rate) for admin approval. Returns a short message or ''."""
+    try: rate = float(rate or 0)
+    except (TypeError, ValueError): return ""
+    if rate <= 0: return ""
+    c = get_cur(); c.execute("SELECT * FROM EMI WHERE emi_id=?", (emi_id,))
+    emi = c.fetchone()
+    if not emi: return ""
+    emi = dict(emi)
+    payments = get_payments_for_emi(emi_id)
+    days = late_payment_days(emi, payments, emi["status"] == "Paid")
+    if not days:
+        return "No penalty raised: the payment is not late, or the installment is not yet more than half paid."
+    c.execute("SELECT 1 FROM Penalties WHERE emi_id=? AND status!='Rejected'", (emi_id,))
+    if c.fetchone(): return "A penalty already exists for this installment."
+    amount = round(days * rate, 2)
+    c.execute("""INSERT INTO Penalties (loan_id,emi_id,installment_no,days,half_paid_date,requested_rate,requested_amount,
+                 requested_by,requested_at,status) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+              (emi["loan_id"], emi_id, emi["installment_no"], days, half_paid_date(emi, payments), rate, amount,
+               requested_by, datetime.now(timezone.utc).isoformat(), "Pending"))
+    get_db().commit()
+    return f"Penalty of {fmt_inr(amount)} ({days} days x {fmt_inr(rate)}/day) sent for admin approval."
+
+def approve_penalty(penalty_id, rate, username):
+    c = get_cur(); c.execute("SELECT * FROM Penalties WHERE penalty_id=?", (penalty_id,))
+    pen = c.fetchone()
+    if not pen or pen["status"] != "Pending": raise ValueError("This penalty is not pending.")
+    try: rate = float(rate)
+    except (TypeError, ValueError): raise ValueError("Enter a valid per-day penalty amount.")
+    if rate < 0: raise ValueError("Penalty per day cannot be negative.")
+    final = round(int(pen["days"]) * rate, 2)
+    now = datetime.now(timezone.utc).isoformat()
+    if final <= 0:
+        c.execute("""UPDATE Penalties SET status='Waived', final_rate=0, final_amount=0, decided_by=?, decided_at=?
+                     WHERE penalty_id=?""", (username, now, penalty_id))
+        get_db().commit(); return 0.0
+    c.execute("SELECT loan_number FROM LoanEntry WHERE id=?", (pen["loan_id"],))
+    loan_no = c.fetchone()["loan_number"]
+    fu_id = add_follow_up(pen["loan_id"], (date.today() + timedelta(days=PENALTY_FOLLOWUP_DAYS)).isoformat(),
+                          f"Collect late-payment penalty {fmt_inr(final)} ({pen['days']} days x {fmt_inr(rate)}/day) "
+                          f"for installment {pen['installment_no']}",
+                          username, "Penalty Collection", "penalty", ref_id=penalty_id)
+    c = get_cur()
+    c.execute("""UPDATE Penalties SET status='Approved', final_rate=?, final_amount=?, decided_by=?, decided_at=?,
+                 followup_id=? WHERE penalty_id=?""", (rate, final, username, now, fu_id, penalty_id))
+    get_db().commit()
+    return final
+
+def reject_penalty(penalty_id, reason, username):
+    c = get_cur(); c.execute("SELECT status FROM Penalties WHERE penalty_id=?", (penalty_id,))
+    pen = c.fetchone()
+    if not pen or pen["status"] != "Pending": raise ValueError("This penalty is not pending.")
+    c.execute("""UPDATE Penalties SET status='Rejected', decided_by=?, decided_at=?, decision_remarks=?
+                 WHERE penalty_id=?""", (username, datetime.now(timezone.utc).isoformat(), (reason or "").strip() or "No reason given", penalty_id))
+    get_db().commit()
+
+def get_penalties_by_emi(loan_id):
+    """Latest non-rejected penalty per installment of a loan (emi_id -> row)."""
+    c = get_cur()
+    c.execute("SELECT * FROM Penalties WHERE loan_id=? AND status!='Rejected' ORDER BY penalty_id ASC", (loan_id,))
+    return {r["emi_id"]: dict(r) for r in c.fetchall()}
+
 # ── Query helpers ──────────────────────────────────────────────────────────────
 def list_pending_loans(search=""):
     q=f"%{search}%"; c=get_cur()
@@ -1067,6 +1268,23 @@ def delay_badge(due_s, paid_s):
         return '<span style="color:var(--green);font-weight:600;">✅ On time</span>'
     return f'<span style="color:var(--red);font-weight:600;">⏰ {d} day{"s" if d != 1 else ""} late</span>'
 
+def half_paid_date(e, payments):
+    """Date (YYYY-MM-DD) on which the payments for this installment first add up to MORE than half
+    of the EMI amount; this is the date used to work out the payment delay. Payments are taken in date
+    order. Older paid installments without a payment list use their single paid date. None if half
+    has not been crossed yet."""
+    threshold = round(float(e.get("emi_amount") or 0) / 2.0, 2)
+    ordered = sorted((p for p in payments if p.get("paid_at")),
+                     key=lambda p: ((p["paid_at"] or "")[:10], p.get("payment_id") or 0))
+    running = 0.0
+    for p in ordered:
+        running = round(running + float(p.get("amount") or 0), 2)
+        if running > threshold:
+            return p["paid_at"][:10]
+    if not payments and e.get("status") == "Paid" and e.get("paid_at"):
+        return e["paid_at"][:10]
+    return None
+
 def paid_on_and_status(e, payments, is_paid, today):
     """Builds the 'Paid On' and 'Payment Status' cells for an EMI row: each sub-bill (5.1, 5.2 …)
     gets its own payment date and delay; once closed, a final line gives the closing payment's delay.
@@ -1078,16 +1296,16 @@ def paid_on_and_status(e, payments, is_paid, today):
         for i, p in enumerate(payments):
             pd = (p.get("paid_at") or "")[:10]
             tag = f"<b>{inst}.{i+1}</b>: " if multi else ""
-            on_lines.append(f"{tag}{pd or '—'}")
+            on_lines.append(f"{tag}{fmt_date(pd)}")
             st_lines.append(f"{tag}{delay_badge(due, pd) if pd else '—'}")
-        if is_paid and multi:
-            last = (payments[-1].get("paid_at") or "")[:10]
-            if last:
-                on_lines.append(f'<span style="color:var(--green);">✅ <b>{inst}</b></span>: {last}')
-                st_lines.append(f"<b>{inst}</b>: {delay_badge(due, last)}")
+        if multi:
+            hd = half_paid_date(e, payments)
+            if hd:
+                on_lines.append(f'<span style="color:var(--accent);">½ <b>{inst}</b> half paid</span>: {fmt_date(hd)}')
+                st_lines.append(f"<b>{inst}</b>: {delay_badge(due, hd)}")
     elif is_paid and e.get("paid_at"):
         pd = e["paid_at"][:10]
-        on_lines.append(pd)
+        on_lines.append(fmt_date(pd))
         st_lines.append(delay_badge(due, pd))
     if not is_paid and e.get("status") != "PreClosed":
         overdue_days = (today - parse_date(due)).days
@@ -1107,22 +1325,17 @@ def paid_amount_cell(e, payments):
     return fmt_inr(total)
 
 def late_payment_days(e, payments, is_paid):
-    """Days between the EMI due date and the date of the payment that closed the bill
-    (0 if paid on/before the due date). None while the bill is still open."""
-    if not is_paid: return None
-    if payments and payments[-1].get("paid_at"):
-        closing = payments[-1]["paid_at"][:10]
-    elif e.get("paid_at"):
-        closing = e["paid_at"][:10]
-    else:
-        return None
-    return max(0, (parse_date(closing) - parse_date(e["due_date"])).days)
+    """Days between the EMI due date and the date the installment crossed half of its EMI value
+    (0 if that was on/before the due date). None until half has been crossed."""
+    hd = half_paid_date(e, payments)
+    if not hd: return None
+    return max(0, (parse_date(hd) - parse_date(e["due_date"])).days)
 
 def late_days_cell(e, payments, is_paid):
     days = late_payment_days(e, payments, is_paid)
     if days is None: return "—"
     color = "var(--green)" if days == 0 else "var(--red)"
-    pad = "<br>" * len(payments) if len(payments) > 1 else ""   # sit on the bill's closing line
+    pad = "<br>" * len(payments) if len(payments) > 1 else ""   # sit on the 'half paid' line
     return f'{pad}<b style="color:{color};">{days}</b>'
 
 def format_bill_ref(installment_no, payments, is_paid):
@@ -1213,30 +1426,58 @@ def _location_link(loc):
     return f'<a href="{url}" target="_blank" rel="noopener">📍 {html.escape(loc)}</a>'
 
 # ── Follow Up (customer-requested collection date) ──────────────────────────────
-FU_CATEGORIES = ["Loans", "Key Collection", "Proof & Documents"]
+FU_CATEGORIES = ["Loans", "Key Collection", "Proof & Documents", "Penalty Collection"]
 # follow-up "item" -> (LoanEntry received column, LoanEntry received-date column)
 FU_ITEM_COLUMNS = {"key": ("key_received", "key_received_date"),
                    "rc":  ("rc_received",  "rc_received_date"),
                    "docs":("docs_received","docs_received_date")}
 
-def add_follow_up(loan_id, follow_up_date, remarks, created_by, category="Loans", item=None):
+def add_follow_up(loan_id, follow_up_date, remarks, created_by, category="Loans", item=None, ref_id=None):
     c = get_cur(); now = datetime.now(timezone.utc).isoformat()
-    c.execute("""INSERT INTO FollowUp (loan_id,follow_up_date,remarks,status,created_by,created_at,category,item)
-                 VALUES (?,?,?,?,?,?,?,?)""",
-              (loan_id, follow_up_date, remarks.strip(), "Pending", created_by, now, category, item))
+    c.execute("""INSERT INTO FollowUp (loan_id,follow_up_date,remarks,status,created_by,created_at,category,item,ref_id)
+                 VALUES (?,?,?,?,?,?,?,?,?)""",
+              (loan_id, follow_up_date, remarks.strip(), "Pending", created_by, now, category, item, ref_id))
     get_db().commit()
+    return c.lastrowid
 
 def resolve_follow_up(followup_id):
-    """Closes the follow-up. For Key / RC / Proof follow-ups it also marks that item as
-    received (with today's date) on the loan record."""
+    """Closes the follow-up. For Key / RC / Proof follow-ups it also marks that item as received (with
+    today's date) on the loan record; for a Penalty follow-up it marks the penalty as collected."""
     c = get_cur(); now = datetime.now(timezone.utc).isoformat()
-    c.execute("SELECT loan_id, item FROM FollowUp WHERE followup_id=?", (followup_id,))
+    c.execute("SELECT loan_id, item, ref_id FROM FollowUp WHERE followup_id=?", (followup_id,))
     row = c.fetchone()
     c.execute("UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE followup_id=?", (now, followup_id))
     if row and row["item"] in FU_ITEM_COLUMNS:
         col, col_date = FU_ITEM_COLUMNS[row["item"]]
         c.execute(f"UPDATE LoanEntry SET {col}='yes', {col_date}=? WHERE id=?",
                   (date.today().isoformat(), row["loan_id"]))
+    if row and row["item"] == "penalty" and row["ref_id"]:
+        c.execute("UPDATE Penalties SET status='Collected', collected_at=? WHERE penalty_id=? AND status='Approved'",
+                  (now, row["ref_id"]))
+    get_db().commit()
+
+def request_followup_ack(followup_id, username, note=""):
+    """A follow-up is not closed directly: it goes to the acknowledger for a cross-check first."""
+    c = get_cur(); c.execute("SELECT status FROM FollowUp WHERE followup_id=?", (followup_id,))
+    row = c.fetchone()
+    if not row or row["status"] != "Pending": raise ValueError("This follow-up is not open.")
+    c.execute("""UPDATE FollowUp SET status='AwaitingAck', ack_requested_by=?, ack_requested_at=?, ack_note=?
+                 WHERE followup_id=?""", (username, datetime.now(timezone.utc).isoformat(), (note or "").strip(), followup_id))
+    get_db().commit()
+
+def acknowledge_followup(followup_id, username):
+    c = get_cur(); c.execute("SELECT status, ack_requested_by FROM FollowUp WHERE followup_id=?", (followup_id,))
+    row = c.fetchone()
+    if not row or row["status"] != "AwaitingAck": raise ValueError("This follow-up is not awaiting acknowledgement.")
+    if row["ack_requested_by"] == username: raise ValueError("You cannot acknowledge your own entry.")
+    resolve_follow_up(followup_id)
+
+def reject_followup_ack(followup_id, reason, username):
+    c = get_cur(); c.execute("SELECT status FROM FollowUp WHERE followup_id=?", (followup_id,))
+    row = c.fetchone()
+    if not row or row["status"] != "AwaitingAck": raise ValueError("This follow-up is not awaiting acknowledgement.")
+    c.execute("UPDATE FollowUp SET status='Pending', ack_note=? WHERE followup_id=?",
+              (f"Not acknowledged by {username}: {(reason or '').strip() or 'no reason given'}", followup_id))
     get_db().commit()
 
 def reschedule_follow_up(followup_id, new_date, remarks, created_by):
@@ -1248,7 +1489,7 @@ def reschedule_follow_up(followup_id, new_date, remarks, created_by):
     c.execute("UPDATE FollowUp SET status='Rescheduled' WHERE followup_id=?", (followup_id,))
     get_db().commit()
     add_follow_up(old["loan_id"], new_date, remarks or old["remarks"], created_by,
-                  old["category"] or "Loans", old["item"])
+                  old["category"] or "Loans", old["item"], ref_id=old["ref_id"])
 
 def get_active_follow_ups_map():
     """Latest PENDING *loan-collection* follow-up per loan_id — used to badge the Alerts page."""
@@ -1264,7 +1505,8 @@ def list_follow_ups(search="", category=""):
     q = f"%{search}%"; c = get_cur()
     sql = """SELECT f.followup_id, f.loan_id, f.follow_up_date, f.remarks, f.status,
                         f.created_by, f.created_at, f.resolved_at,
-                        COALESCE(f.category,'Loans') as category, f.item,
+                        COALESCE(f.category,'Loans') as category, f.item, f.ref_id,
+                        f.ack_requested_by, f.ack_requested_at, f.ack_note,
                         le.loan_number, le.vehicle_type, le.customer_name, le.customer_mobile, le.customer_extra_numbers,
                         le.guarantor_name, le.guarantor_mobile, le.guarantor_extra_numbers,
                         le.customer_address, le.customer_permanent_address, le.customer_location, le.guarantor_location
@@ -1477,10 +1719,10 @@ def _notify_emi_due(loan_number, customer_name, mobile, due_date, amount, days_l
     """Upcoming EMI reminder SMS."""
     if days_left <= 0:
         msg = (f"Dear {customer_name}, EMI of {fmt_inr(amount)} for loan {loan_number} "
-               f"was DUE on {due_date}. Please pay immediately. -Thendralla Fincorp")
+               f"was DUE on {fmt_date(due_date)}. Please pay immediately. -Thendralla Fincorp")
     else:
         msg = (f"Dear {customer_name}, Reminder: EMI of {fmt_inr(amount)} for loan "
-               f"{loan_number} is DUE on {due_date} ({days_left} days). -Thendralla Fincorp")
+               f"{loan_number} is DUE on {fmt_date(due_date)} ({days_left} days). -Thendralla Fincorp")
     return _send_sms(mobile, msg)
 
 def send_bulk_overdue_sms():
@@ -1530,7 +1772,7 @@ def send_bulk_upcoming_sms():
         amt    = sum(float(x.get("remaining_amount") or x["emi_amount"])
                      for x in upcoming if x["loan_number"]==ln)
         msg = (f"Dear {name}, Reminder: EMI of {fmt_inr(amt)} for loan {ln} is due "
-               f"on {e['due_date']} ({days_left} day(s)). -Thendralla Fincorp")
+               f"on {fmt_date(e['due_date'])} ({days_left} day(s)). -Thendralla Fincorp")
         ok, info = _send_sms(mobile, msg)
         results.append({"loan":ln,"name":name,"mobile":mobile,"ok":ok,"info":info})
         if ok: total_sent += 1
@@ -1588,11 +1830,12 @@ def generate_followup_pdf(path, items):
     for r in items:
         fu_date = parse_date(r["follow_up_date"])
         if r["status"] in ("Resolved","Rescheduled"): status = r["status"]
+        elif r["status"] == "AwaitingAck": status = "Awaiting ack"
         elif fu_date < today: status = "Missed"
         else: status = "Pending"
         data.append([
             r["loan_number"], r.get("customer_name") or "", r.get("customer_mobile") or "",
-            r.get("vehicle_type") or "", (r.get("customer_address") or "")[:36], r["follow_up_date"], status,
+            r.get("vehicle_type") or "", (r.get("customer_address") or "")[:36], fmt_date(r["follow_up_date"]), status,
             f"Rs {r['overdue_amount']:,.2f}", f"Rs {r['outstanding']:,.2f}", (r.get("remarks") or "")[:50], r.get("created_by") or ""
         ])
     tbl = Table(data, repeatRows=1,
@@ -1752,6 +1995,7 @@ tr.row-paid td{opacity:.65;}
 .badge-manager{background:#059669;color:#fff;}
 .badge-fieldpia{background:#d97706;color:#fff;}
 .badge-viewer{background:#6b7280;color:#fff;}
+.badge-assocmgr{background:#0e7490;color:#fff;}
 
 /* ── ALERTS ── */
 .alert{padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:13px;}
@@ -1970,6 +2214,7 @@ _NAV_SVG = {
     "approval":  '<circle cx="12" cy="12" r="9"/><polyline points="8 12.5 11 15.5 16 9"/>',
     "customers": '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6"/><circle cx="17" cy="9" r="2.6"/><path d="M17 14c2.8 0 4.5 1.9 4.5 4.5"/>',
     "billing":   '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="9" y1="12" x2="15" y2="12"/>',
+    "ack":       '<path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h9"/>',
     "alerts":    '<path d="M6 16v-5a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 21a2 2 0 0 0 4 0"/>',
     "followup":  '<path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z"/>',
     "closed":    '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
@@ -2003,6 +2248,12 @@ def _nav_links(role, active):
     if can_approve: links += lnk("/approval","✅","Approval","approval")
     links += lnk("/customers","👥","Customers","customers")
     if ROLES.get(role,{}).get("can_pay", False): links += lnk("/billing","🧾","Billing","billing")
+    if ROLES.get(role,{}).get("can_ack", False):
+        try:
+            n_p, n_f = ack_counts(); n_ack = n_p + n_f
+        except Exception:
+            n_ack = 0
+        links += lnk("/acknowledgements","🔎",f"Acknowledgements" + (f' <span style="background:#dc2626;color:#fff;border-radius:999px;padding:1px 7px;font-size:11px;margin-left:4px;">{n_ack}</span>' if n_ack else ""),"ack")
     links += lnk("/alerts","🔔","Alerts","alerts")
     links += lnk("/followup","📞","Follow Up","followup")
     links += lnk("/closed","🔒","Closed","closed")
@@ -2350,6 +2601,25 @@ def logout(): session.clear(); return redirect(url_for("login"))
 FOLLOWUP_SOON_DAYS = 2   # same "due within 2 days" rule as the Follow Up page
 ATTENTION_ROWS = 5
 
+def waiting_items_html():
+    """Short banner on the dashboard: payments/follow-ups waiting for acknowledgement (Associate Manager,
+    Admin, Super Admin) and penalties waiting for approval (Admin, Super Admin)."""
+    role = session.get("role", "")
+    bits = []
+    if role in ACK_ROLES:
+        n_p, n_f = ack_counts()
+        if n_p or n_f:
+            bits.append(f'<a href="/acknowledgements" style="color:inherit;"><b>{n_p}</b> payment(s) and <b>{n_f}</b> follow-up(s) '
+                        f'awaiting acknowledgement →</a>')
+    if role in DIRECT_ROLES:
+        c = get_cur(); c.execute("SELECT COUNT(*) as n FROM Penalties WHERE status='Pending'")
+        n_pen = c.fetchone()["n"]
+        if n_pen:
+            bits.append(f'<a href="/approval" style="color:inherit;"><b>{n_pen}</b> late-payment penalty(ies) awaiting your approval →</a>')
+    if not bits: return ""
+    return ('<div style="background:#eff6ff;border:1px solid #93c5fd;border-left:6px solid #1d6fdb;border-radius:12px;'
+            'padding:10px 14px;margin-bottom:12px;font-size:13.5px;">🔔 ' + " &nbsp;|&nbsp; ".join(bits) + '</div>')
+
 def attention_panel_html(overdue_emis):
     """Highlighted 'Needs Attention' panel: missed / due-soon follow-ups and overdue EMI alerts."""
     today = date.today()
@@ -2374,7 +2644,7 @@ def attention_panel_html(overdue_emis):
     fu_rows = "".join(f"""<a href="/followup?cat={urlquote(f['category'])}" style="display:block;padding:7px 0;border-bottom:1px solid var(--border);color:inherit;text-decoration:none;">
           <b style="color:var(--accent);">{html.escape(f['loan_number'])}</b> — {html.escape(f['customer_name'] or '')}
           <span class="badge badge-partial" style="margin-left:4px;">{html.escape(f['category'])}</span><br>
-          <span style="font-size:12px;">{fu_when(f)} · {f['follow_up_date']} · <span style="color:var(--muted);">{html.escape((f.get('remarks') or '')[:60])}</span></span></a>"""
+          <span style="font-size:12px;">{fu_when(f)} · {fmt_date(f['follow_up_date'])} ·<span style="color:var(--muted);">{html.escape((f.get('remarks') or '')[:60])}</span></span></a>"""
         for f in (missed + due_today + due_soon)[:ATTENTION_ROWS])
 
     groups = sorted(group_alerts_by_loan(overdue_emis), key=lambda g: g["oldest_due"])
@@ -2383,7 +2653,7 @@ def attention_panel_html(overdue_emis):
           <b style="color:var(--accent);">{html.escape(g['loan_number'])}</b> — {html.escape(g['customer_name'] or '')}
           <b style="float:right;color:var(--red);">₹{g['total_due']:,.2f}</b><br>
           <span style="font-size:12px;color:var(--muted);">{g['emi_count']} EMI{"s" if g['emi_count'] != 1 else ""} overdue ·
-          <span style="color:var(--red);font-weight:700;">{(today - parse_date(g['oldest_due'])).days} days</span> since {g['oldest_due']}</span></a>"""
+          <span style="color:var(--red);font-weight:700;">{(today - parse_date(g['oldest_due'])).days} days</span> since {fmt_date(g['oldest_due'])}</span></a>"""
         for g in groups[:ATTENTION_ROWS])
 
     nothing = not fus and not groups
@@ -2552,7 +2822,7 @@ def dashboard():
     </script>
     """
 
-    content = f"<h1>📊 Dashboard</h1>{attention_panel_html(overdue)}{kpi}{charts}"
+    content = f"<h1>📊 Dashboard</h1>{waiting_items_html()}{attention_panel_html(overdue)}{kpi}{charts}"
     return page("Dashboard", content, "dashboard")
 
 # ── Loans List ─────────────────────────────────────────────────────────────────
@@ -3076,14 +3346,15 @@ def add_loan():
         e.preventDefault();
         const gn = name => {{ const el = _loanForm.querySelector('[name="'+name+'"]'); return el ? el.value : ''; }};
         const amt = parseFloat(gn('loan_amount')||0);
+        const dmy = s => {{ const p=(s||'').split('-'); return p.length===3 ? p[2]+'/'+p[1]+'/'+p[0] : '—'; }};
         document.getElementById('loanConfirmSummary').innerHTML = `
           <div><b>Loan Number:</b> ${{gn('loan_number')||'—'}}</div>
           <div><b>Customer:</b> ${{gn('customer_name')||'—'}}</div>
           <div><b>Mobile:</b> ${{gn('customer_mobile')||'—'}}</div>
           <div><b>Loan Amount:</b> ₹${{amt.toLocaleString('en-IN')}}</div>
           <div><b>Tenure:</b> ${{gn('tenure')||'—'}} months</div>
-          <div><b>Loan Date:</b> ${{gn('loan_date')||'—'}}</div>
-          <div><b>EMI Start Date:</b> ${{gn('emi_start_date')||'—'}}</div>
+          <div><b>Loan Date:</b> ${{dmy(gn('loan_date'))}}</div>
+          <div><b>EMI Start Date:</b> ${{dmy(gn('emi_start_date'))}}</div>
         `;
         document.getElementById('loanConfirmModal').classList.add('open');
       }});
@@ -3439,7 +3710,7 @@ def approval():
             <div>
               <b style="font-size:15px;color:var(--accent);">{l['loan_number']}</b> — {l['customer_name']}
               <div style="font-size:12px;color:var(--muted);margin-top:2px;">
-                📱 {l.get('customer_mobile','')} &nbsp;|&nbsp; 🚗 {l['vehicle_type']} &nbsp;|&nbsp; 📅 Start: {l['start_date']}
+                📱 {l.get('customer_mobile','')} &nbsp;|&nbsp; 🚗 {l['vehicle_type']} &nbsp;|&nbsp; 📅 Start: {fmt_date(l['start_date'])}
               </div>
             </div>
             <div style="text-align:right;">
@@ -3499,7 +3770,7 @@ def approval():
               <b style="font-size:15px;color:var(--accent);">{html.escape(p['loan_number'])}</b> — {html.escape(p['customer_name'] or '')}
               <div style="font-size:12px;color:var(--muted);margin-top:2px;">
                 📱 {html.escape(p.get('customer_mobile') or '')} &nbsp;|&nbsp; 🚗 {html.escape(p.get('vehicle_type') or '')}
-                &nbsp;|&nbsp; Requested by <b>{html.escape(p.get('requested_by') or '')}</b> on {(p.get('requested_at') or '')[:10]}
+                &nbsp;|&nbsp; Requested by <b>{html.escape(p.get('requested_by') or '')}</b> on {fmt_date((p.get('requested_at') or '')[:10])}
               </div>
             </div>
             <a class="btn btn-sm btn-primary" href="/emis/{p['loan_id']}">View EMIs</a>
@@ -3529,8 +3800,57 @@ def approval():
             <button type="submit" class="btn btn-danger btn-sm">❌ Reject</button>
           </form>
         </div>"""
-    pc_section = (f'<h2 style="margin:6px 0 10px;">⏩ Pre-closure Requests ({len(pc_rows)})</h2>{pc_cards}'
-                  f'<h2 style="margin:18px 0 10px;">🆕 New Loan Applications</h2>') if pc_rows else ""
+    c = get_cur()
+    c.execute("""SELECT pn.*, le.loan_number, le.customer_name, le.customer_mobile, e.due_date, e.emi_amount
+                 FROM Penalties pn JOIN LoanEntry le ON le.id=pn.loan_id JOIN EMI e ON e.emi_id=pn.emi_id
+                 WHERE pn.status='Pending' ORDER BY pn.penalty_id ASC""")
+    pen_rows = [dict(r) for r in c.fetchall()]
+    pen_cards = ""
+    for p in pen_rows:
+        pen_cards += f"""
+        <div class="card pen-card" data-days="{int(p['days'])}">
+          <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
+            <div>
+              <b style="font-size:15px;color:var(--accent);">{html.escape(p['loan_number'])}</b> — {html.escape(p['customer_name'] or '')}
+              <div style="font-size:12px;color:var(--muted);margin-top:2px;">
+                Installment <b>{ordinal_due(p['installment_no'])}</b> · EMI {fmt_inr(p['emi_amount'])} · due {fmt_date(p['due_date'])}
+                · half of the EMI paid on {fmt_date(p['half_paid_date'])}<br>
+                Requested by <b>{html.escape(p.get('requested_by') or '')}</b> on {fmt_date((p.get('requested_at') or '')[:10])}
+                at {fmt_inr(p['requested_rate'])}/day = {fmt_inr(p['requested_amount'])}
+              </div>
+            </div>
+            <a class="btn btn-sm btn-primary" href="/emis/{p['loan_id']}">View EMIs</a>
+          </div>
+          <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px;">
+            <div class="kpi" style="padding:8px 10px;border-color:var(--red);"><div class="val" style="font-size:16px;color:var(--red);">{int(p['days'])} days</div><div class="lbl">Delayed payment</div></div>
+            <div class="kpi" style="padding:8px 10px;"><div class="val" style="font-size:15px;">{fmt_inr(p['requested_rate'])}</div><div class="lbl">Requested per day</div></div>
+            <div class="kpi" style="padding:8px 10px;"><div class="val" style="font-size:15px;">{fmt_inr(p['requested_amount'])}</div><div class="lbl">Requested penalty</div></div>
+          </div>
+          <form method="POST" action="/penalty/approve/{p['penalty_id']}">
+            <div class="form-grid" style="align-items:end;">
+              <div class="form-group">
+                <label>Final penalty per day (₹) <span style="font-size:10px;color:var(--muted);">(edit to set the final amount; 0 waives it)</span></label>
+                <input type="number" name="rate" class="pen-rate" value="{float(p['requested_rate']):.2f}" min="0" step="0.01" required oninput="penPreview(this)">
+              </div>
+              <div class="form-group">
+                <div class="pen-note" style="font-size:13px;line-height:1.7;padding:8px 10px;background:var(--surface2);border-radius:8px;min-height:42px;"></div>
+              </div>
+            </div>
+            <div style="margin-top:10px;display:flex;gap:8px;">
+              <button type="submit" class="btn btn-success btn-sm">✅ Approve Penalty</button>
+            </div>
+          </form>
+          <form method="POST" action="/penalty/reject/{p['penalty_id']}" onsubmit="return getReason(this)" style="margin-top:6px;">
+            <input type="hidden" name="reason" class="reason_inp">
+            <button type="submit" class="btn btn-danger btn-sm">❌ Reject</button>
+          </form>
+        </div>"""
+    parts = ""
+    if pen_rows:
+        parts += f'<h2 style="margin:6px 0 10px;">💰 Late Payment Penalties ({len(pen_rows)})</h2>{pen_cards}'
+    if pc_rows:
+        parts += f'<h2 style="margin:18px 0 10px;">⏩ Pre-closure Requests ({len(pc_rows)})</h2>{pc_cards}'
+    pc_section = (parts + '<h2 style="margin:18px 0 10px;">🆕 New Loan Applications</h2>') if parts else ""
 
     content = f"""
     <h1>✅ Loan Approval</h1>
@@ -3552,6 +3872,14 @@ def approval():
         'Less already paid '+fmtINR(paid)+' → <b style="color:var(--green);">Settlement to collect: '+fmtINR(settle)+'</b>';
     }}
     window.addEventListener('DOMContentLoaded',function(){{ document.querySelectorAll('.pc-rate').forEach(pcPreview); }});
+    function penPreview(input){{
+      const card = input.closest('.pen-card');
+      const days = parseInt(card.dataset.days), r = parseFloat(input.value)||0;
+      const amt = Math.round(days*r*100)/100;
+      card.querySelector('.pen-note').innerHTML = days+' day(s) × '+fmtINR(r)+' = <b style="color:var(--red);">Final penalty: '+fmtINR(amt)+'</b>'
+        + (amt>0 ? '' : ' <span style="color:var(--muted);">(waived)</span>');
+    }}
+    window.addEventListener('DOMContentLoaded',function(){{ document.querySelectorAll('.pen-rate').forEach(penPreview); }});
     function fmtINR(v){{return '₹'+v.toLocaleString('en-IN',{{minimumFractionDigits:2,maximumFractionDigits:2}});}}
     function previewSchedule(input){{
       const card = input.closest('.card');
@@ -3815,6 +4143,9 @@ def emis(loan_id):
     c = get_cur(); c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
     loan = dict(c.fetchone() or {}); emi_list = get_emis_for_loan(loan_id)
     payments_by_emi = get_payments_by_emi_for_loan(loan_id)
+    c.execute("SELECT * FROM PendingPayments WHERE loan_id=? AND status='Pending'", (loan_id,))
+    pending_by_emi = {r["emi_id"]: dict(r) for r in c.fetchall()}
+    penalty_by_emi = get_penalties_by_emi(loan_id)
     role = session.get("role",""); can_pay = ROLES.get(role,{}).get("can_pay", False)
     can_edit_emi = ROLES.get(role,{}).get("can_edit", False)
     today = date.today(); upcoming_limit = today + timedelta(days=UPCOMING_DAYS)
@@ -3842,7 +4173,18 @@ def emis(loan_id):
         paid_on_html, pay_status_html = paid_on_and_status(e, payments_by_emi.get(e["emi_id"], []), is_paid, today)
 
         pay_form = ""
-        if can_pay and not is_paid and not is_pre and not pc_open:
+        pend = pending_by_emi.get(e["emi_id"])
+        pen = penalty_by_emi.get(e["emi_id"])
+        if pend:
+            pay_form = (f'<div style="font-size:12px;background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:6px 8px;white-space:normal;max-width:230px;">'
+                        f'⏳ <b>₹{float(pend["amount"]):,.2f}</b> awaiting acknowledgement<br>'
+                        f'<span style="color:var(--muted);">bill {html.escape(pend["bill_number"])} · entered by {html.escape(pend["requested_by"] or "")}</span></div>')
+        elif can_pay and not is_paid and not is_pre and not pc_open:
+            penalty_box = ""
+            if is_overdue and not pen:
+                penalty_box = ('<input type="number" name="penalty_rate" min="0" step="0.01" placeholder="Penalty/day ₹" '
+                               'title="Optional: late-payment penalty per day. Goes to admin approval." '
+                               'style="width:105px;font-size:12px;padding:5px 6px;">')
             pay_form = f"""
             <form method="POST" action="/emi/pay" style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;">
               <input type="hidden" name="emi_id" value="{e['emi_id']}">
@@ -3853,12 +4195,19 @@ def emis(loan_id):
                      min="1" step="0.01" style="width:90px;font-size:12px;padding:5px 6px;" required>
               <input type="date" name="paid_on" value="{today.isoformat()}" max="{today.isoformat()}"
                      title="Paid On" style="width:130px;font-size:12px;padding:5px 6px;" required>
+              {penalty_box}
               <button class="btn btn-success btn-sm" onclick="return chkBill(this)">Pay</button>
             </form>"""
+        if pen:
+            label = {"Pending": "pending admin approval", "Approved": "approved - to be collected", "Collected": "collected",
+                     "Waived": "waived"}.get(pen["status"], pen["status"])
+            amt = pen["final_amount"] if pen["status"] != "Pending" and pen["final_amount"] is not None else pen["requested_amount"]
+            pay_status_html += (f'<br><span style="font-weight:600;color:#7c3aed;">💰 Penalty {fmt_inr(amt or 0)} '
+                                f'({pen["days"]} d) — {label}</span>')
 
         emi_edit_link = f'<a class="btn btn-sm btn-amber" href="/emi/edit/{e["emi_id"]}?loan_id={loan_id}">&#9998;</a>' if can_edit_emi else ""
         rows += f'<tr class="{row_class}" id="emi_{e["emi_id"]}">'
-        rows += f"""<td>{e['installment_no']}</td><td>{e['due_date']}</td>
+        rows += f"""<td>{e['installment_no']}</td><td>{fmt_date(e['due_date'])}</td>
           <td>₹{e['emi_amount']:,.2f}</td><td style="white-space:nowrap;">{paid_amount_cell(e, payments_by_emi.get(e["emi_id"], []))}</td>
           <td><b>₹{remaining:,.2f}</b></td>
           <td><span class="badge badge-{sc}">{"Pre-closed" if is_pre else e['status']}</span></td>
@@ -3916,7 +4265,7 @@ def emis(loan_id):
                         f'{pay_line}{close_form if can_pay else ""}</div>')
     elif pc and pc["status"] == "Completed" and loan.get("status") == "Closed":
         preclose_box = (f'<span class="badge badge-closed" style="font-size:13px;padding:8px 12px;">'
-                        f'⏩ Pre-closed on {html.escape(pc.get("paid_on") or "")} — settled ₹{float(pc["settlement_amount"] or 0):,.2f} '
+                        f'⏩ Pre-closed on {fmt_date(pc.get("paid_on"), "")} — settled ₹{float(pc["settlement_amount"] or 0):,.2f} '
                         f'(bill {html.escape(pc.get("bill_number") or "—")})</span>')
     elif loan.get("status") == "Approved" and can_pay:
         rejected_note = ""
@@ -3979,7 +4328,8 @@ def emi_pay():
     bill_no = request.form.get("bill_number","").strip()
     paid_on = request.form.get("paid_on","").strip()
     try:
-        msg = pay_emi(emi_id, pay_amt, bill_number=bill_no, paid_on=paid_on or None, paid_by=session.get("username"))
+        msg = submit_payment(emi_id, pay_amt, bill_no, paid_on or None, session.get("username"),
+                             session.get("role",""), request.form.get("penalty_rate"))
         flash(msg,"success")
     except Exception as e:
         flash(str(e),"danger")
@@ -4015,7 +4365,7 @@ def billing():
             nxt = (_unpaid_emis(l["id"]) or [None])[0]
             if nxt:
                 late = (today - parse_date(nxt["due_date"])).days
-                due_txt = (f'<b>{ordinal_due(nxt["installment_no"])}</b> — due {nxt["due_date"]} — pending '
+                due_txt = (f'<b>{ordinal_due(nxt["installment_no"])}</b> — due {fmt_date(nxt["due_date"])} — pending '
                            f'<b>₹{_emi_remaining(nxt):,.2f}</b>'
                            + (f' <span style="color:var(--red);font-weight:600;">({late} day{"s" if late != 1 else ""} overdue)</span>' if late > 0 else ""))
                 btn = f'<a class="btn btn-primary btn-sm" href="/billing/new/{l["id"]}">🧾 Make Bill</a>'
@@ -4040,7 +4390,7 @@ def billing():
                  ORDER BY receipt_id DESC LIMIT 50""", (q, rlike, rlike, rlike))
     receipts = [dict(r) for r in c.fetchall()]
     rrows = "".join(f"""<tr>
-        <td><b>{html.escape(r['receipt_no'])}</b></td><td>{r['receipt_date']}</td><td>{html.escape(r['received_from'] or '')}</td>
+        <td><b>{html.escape(r['receipt_no'])}</b></td><td>{fmt_date(r['receipt_date'])}</td><td>{html.escape(r['received_from'] or '')}</td>
         <td>{html.escape(r['loan_number'] or '')}</td><td>{html.escape(r['installment_label'] or '')}</td>
         <td>₹{float(r['cash'] or 0):,.2f}</td><td>₹{float(r['online'] or 0):,.2f}</td><td><b>₹{float(r['total'] or 0):,.2f}</b></td>
         <td>{html.escape(r['cashier'] or '')}</td>
@@ -4075,7 +4425,7 @@ def _billing_form(loan_id, values=None):
     pc_open = preclosure_in_progress(loan_id)
     opts = "".join(
         f'<option value="{e["emi_id"]}" data-rem="{_emi_remaining(e):.2f}" data-label="{ordinal_due(e["installment_no"])}" '
-        f'{"selected" if str(e["emi_id"]) == sel_emi else ""}>{ordinal_due(e["installment_no"])} — due {e["due_date"]} — pending ₹{_emi_remaining(e):,.2f}</option>'
+        f'{"selected" if str(e["emi_id"]) == sel_emi else ""}>{ordinal_due(e["installment_no"])} — due {fmt_date(e["due_date"])} — pending ₹{_emi_remaining(e):,.2f}</option>'
         for e in emis_open)
     c.execute("SELECT receipt_no FROM Receipts ORDER BY receipt_id DESC LIMIT 1")
     last = c.fetchone(); last_txt = f"Last receipt: <b>{html.escape(last['receipt_no'])}</b>" if last else "No receipts yet"
@@ -4126,6 +4476,10 @@ def _billing_form(loan_id, values=None):
             <div style="font-size:18px;font-weight:800;margin-top:2px;">Total: <span id="totalAmt">₹0.00</span></div>
             <div style="font-size:13px;margin-top:2px;" id="wordsAmt" ></div>
           </div>
+        </div>
+        <div class="form-group">
+          <label>Penalty per day (₹) <span style="font-size:10px;color:var(--muted);">(optional — only if this EMI is paid late; goes to admin approval)</span></label>
+          <input type="number" name="penalty_rate" min="0" step="0.01" value="{html.escape(str(values.get('penalty_rate','')))}" placeholder="e.g. 50">
         </div>
         <div class="form-group full">
           <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;font-weight:600;cursor:pointer;">
@@ -4201,13 +4555,22 @@ def billing_create():
     if not received_from: return back("'Received From' is required.")
     emi = next((e for e in _unpaid_emis(loan_id) if str(e["emi_id"]) == f.get("emi_id","")), None)
     if not emi: return back("Please choose an unpaid installment.")
-    recorded = 0
+    user, role = session.get("username",""), session.get("role","")
+    penalty_rate = f.get("penalty_rate")
+    recorded = 0          # 0 receipt only · 1 recorded on the EMI · 2 awaiting acknowledgement
+    queue_after = False
+    pen_msg = ""
     if f.get("record_on_emi") == "yes":
         if total > _emi_remaining(emi) + 0.005:
             return back(f"The amount is more than the ₹{_emi_remaining(emi):,.2f} pending on this installment.")
         try:
-            pay_emi(emi["emi_id"], total, bill_number=receipt_no, paid_on=rdate.isoformat(), paid_by=session.get("username"))
-            recorded = 1
+            emi_row = validate_payment(emi["emi_id"], total, receipt_no, rdate.isoformat())
+            if role in DIRECT_ROLES:
+                pay_emi(emi["emi_id"], total, bill_number=receipt_no, paid_on=rdate.isoformat(), paid_by=user)
+                pen_msg = create_penalty_if_needed(emi["emi_id"], penalty_rate, user)
+                recorded = 1
+            else:
+                recorded, queue_after = 2, True
         except Exception as e:
             return back(str(e))
     c = get_cur()
@@ -4216,10 +4579,17 @@ def billing_create():
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
               (receipt_no, loan_id, emi["emi_id"], emi["installment_no"], ordinal_due(emi["installment_no"]), received_from,
                rdate.isoformat(), loan.get("vehicle_number") or "", loan["loan_number"], cash, online, total,
-               amount_in_words(total), session.get("username",""), recorded, datetime.now(timezone.utc).isoformat()))
+               amount_in_words(total), user, recorded, datetime.now(timezone.utc).isoformat()))
     get_db().commit()
-    flash("Bill generated" + (" and the payment was recorded on the EMI." if recorded else "."), "success")
-    return redirect(url_for("billing_receipt", receipt_id=c.lastrowid))
+    receipt_id = c.lastrowid
+    if queue_after:
+        queue_payment(emi_row, total, receipt_no, rdate.isoformat(), user, penalty_rate, receipt_id=receipt_id)
+    msg = "Bill generated"
+    if recorded == 1: msg += " and the payment was recorded on the EMI."
+    elif recorded == 2: msg += ". The payment is awaiting acknowledgement before it is recorded on the EMI."
+    else: msg += "."
+    flash(msg + ((" " + pen_msg) if pen_msg else ""), "success")
+    return redirect(url_for("billing_receipt", receipt_id=receipt_id))
 
 def _get_receipt(receipt_id):
     c = get_cur(); c.execute("SELECT * FROM Receipts WHERE receipt_id=?", (receipt_id,))
@@ -4249,8 +4619,10 @@ def billing_receipt(receipt_id):
       {row('Cash', f"₹{float(r['cash'] or 0):,.2f}")}{row('Online', f"₹{float(r['online'] or 0):,.2f}")}
       <div style="display:flex;gap:10px;padding:10px 0;font-size:18px;font-weight:800;"><div style="width:130px;color:var(--accent);">Total</div><div>₹{float(r['total']):,.2f}</div></div>
       {row('Rupees', r['amount_words'])}{row('Cashier', r['cashier'])}
-      <div style="font-size:12px;margin-top:6px;color:{'var(--green)' if r['recorded_on_emi'] else 'var(--muted)'};">
-        {'✅ Payment recorded on the EMI with this receipt number as Bill No.' if r['recorded_on_emi'] else 'Receipt only — no EMI payment was recorded.'}</div>
+      <div style="font-size:12px;margin-top:6px;color:{ {1:'var(--green)',2:'var(--amber)',3:'var(--red)'}.get(r['recorded_on_emi'],'var(--muted)') };">
+        {({1:'✅ Payment recorded on the EMI with this receipt number as Bill No.',
+           2:'⏳ Payment is awaiting acknowledgement; it will be recorded on the EMI once acknowledged.',
+           3:'❌ The payment was not acknowledged, so it was NOT recorded on the EMI.'}).get(r['recorded_on_emi'], 'Receipt only — no EMI payment was recorded.')}</div>
     </div>
     <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
       <a class="btn btn-success" href="/billing/receipt/{receipt_id}/pdf">⬇ Download Bill (PDF)</a>
@@ -4345,7 +4717,7 @@ def alerts():
         fu_date = parse_date(fu["follow_up_date"])
         overdue_badge = ' <span class="badge badge-overdue">missed</span>' if fu_date < today else ''
         return (f'<div style="font-size:11.5px;max-width:180px;">'
-                f'<span class="badge badge-partial">📅 {fu["follow_up_date"]}</span>{overdue_badge}'
+                f'<span class="badge badge-partial">📅 {fmt_date(fu["follow_up_date"])}</span>{overdue_badge}'
                 f'<div style="color:var(--muted);margin-top:2px;white-space:normal;">{html.escape(fu["remarks"])}</div>'
                 f'{btn}</div>')
 
@@ -4356,7 +4728,7 @@ def alerts():
           <td><b><a href="/emis/{g['lid']}" style="color:var(--accent);">{g['loan_number']}</a></b></td>
           <td>{g['customer_name']}</td>
           <td style="text-align:center;">{g['emi_count']}</td>
-          <td>{g['oldest_due']}</td>
+          <td>{fmt_date(g['oldest_due'])}</td>
           <td><b style="color:var(--red);">₹{g['total_due']:,.2f}</b></td>
           <td><b style="color:var(--red);">{oldest_days} days</b></td>
           <td>{fu_cell(g['loan_id'], g['loan_number'], g['customer_name'])}</td>
@@ -4370,7 +4742,7 @@ def alerts():
           <td><b><a href="/emis/{g['lid']}" style="color:var(--accent);">{g['loan_number']}</a></b></td>
           <td>{g['customer_name']}</td>
           <td style="text-align:center;">{g['emi_count']}</td>
-          <td>{g['oldest_due']}</td>
+          <td>{fmt_date(g['oldest_due'])}</td>
           <td><b style="color:var(--amber);">₹{g['total_due']:,.2f}</b></td>
           <td><b style="color:var(--amber);">in {days_left} days</b></td>
           <td>{fu_cell(g['loan_id'], g['loan_number'], g['customer_name'])}</td>
@@ -4461,9 +4833,153 @@ def followup_add():
 @app.route("/followup/resolve/<int:followup_id>", methods=["POST"])
 @login_required
 def followup_resolve(followup_id):
-    resolve_follow_up(followup_id)
-    flash("Follow-up marked as resolved.","success")
+    try:
+        if session.get("role","") in DIRECT_ROLES:
+            resolve_follow_up(followup_id)
+            flash("Follow-up marked as resolved.","success")
+        else:
+            request_followup_ack(followup_id, session.get("username",""), request.form.get("note",""))
+            flash("Sent for acknowledgement. The follow-up closes once an Associate Manager or admin acknowledges it.","success")
+    except Exception as e:
+        flash(str(e),"danger")
     return redirect(request.form.get("next") or url_for("followups"))
+
+# ── Acknowledgements (second-level cross-check) ────────────────────────────────
+def ack_counts():
+    c = get_cur()
+    c.execute("SELECT COUNT(*) as n FROM PendingPayments WHERE status='Pending'"); p = c.fetchone()["n"]
+    c.execute("SELECT COUNT(*) as n FROM FollowUp WHERE status='AwaitingAck'"); f = c.fetchone()["n"]
+    return p, f
+
+@app.route("/acknowledgements")
+@login_required
+@role_required(*ACK_ROLES)
+def acknowledgements():
+    c = get_cur(); me = session.get("username","")
+    c.execute("""SELECT p.*, le.loan_number, le.customer_name, e.due_date, e.emi_amount, e.remaining_amount
+                 FROM PendingPayments p JOIN LoanEntry le ON le.id=p.loan_id JOIN EMI e ON e.emi_id=p.emi_id
+                 WHERE p.status='Pending' ORDER BY p.pp_id ASC""")
+    pays = [dict(r) for r in c.fetchall()]
+    pay_cards = ""
+    for p in pays:
+        late = (parse_date(p["paid_on"]) - parse_date(p["due_date"])).days
+        own = p["requested_by"] == me
+        pay_cards += f"""<div class="card" style="margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+            <div>
+              <b style="color:var(--accent);font-size:15px;">{html.escape(p['loan_number'])}</b> — {html.escape(p['customer_name'] or '')}
+              <div style="font-size:12.5px;margin-top:4px;line-height:1.7;">
+                Installment <b>{ordinal_due(p['installment_no'])}</b> · due {fmt_date(p['due_date'])} · EMI {fmt_inr(p['emi_amount'])}<br>
+                Payment <b style="font-size:15px;">{fmt_inr(p['amount'])}</b> · bill <b>{html.escape(p['bill_number'])}</b> · paid on <b>{fmt_date(p['paid_on'])}</b>
+                {('· <span style="color:var(--red);font-weight:700;">' + str(late) + ' day(s) after due date</span>') if late > 0 else '· <span style="color:var(--green);font-weight:700;">on time</span>'}<br>
+                <span style="color:var(--muted);">Entered by <b>{html.escape(p['requested_by'] or '')}</b> on {fmt_date((p.get('requested_at') or '')[:10])}
+                {(' · penalty ₹' + format(p['penalty_rate'], ',.2f') + '/day requested') if p.get('penalty_rate') else ''}</span>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;">
+              {'<span style="font-size:12px;color:var(--muted);">You entered this, so someone else must acknowledge it.</span>' if own else f'''
+              <form method="POST" action="/ack/payment/{p['pp_id']}" onsubmit="return confirm('Acknowledge this payment? It will be recorded on the EMI.')">
+                <input type="hidden" name="action" value="ack"><button class="btn btn-success btn-sm">✅ Acknowledge</button></form>
+              <form method="POST" action="/ack/payment/{p['pp_id']}" onsubmit="return getReason(this)">
+                <input type="hidden" name="action" value="reject"><input type="hidden" name="reason" class="reason_inp">
+                <button class="btn btn-danger btn-sm">❌ Reject</button></form>'''}
+            </div>
+          </div></div>"""
+    c.execute("""SELECT f.*, COALESCE(f.category,'Loans') as cat, le.loan_number, le.customer_name
+                 FROM FollowUp f JOIN LoanEntry le ON le.id=f.loan_id
+                 WHERE f.status='AwaitingAck' ORDER BY f.follow_up_date ASC""")
+    fus = [dict(r) for r in c.fetchall()]
+    fu_cards = ""
+    for f in fus:
+        own = f["ack_requested_by"] == me
+        fu_cards += f"""<div class="card" style="margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+            <div>
+              <b style="color:var(--accent);font-size:15px;">{html.escape(f['loan_number'])}</b> — {html.escape(f['customer_name'] or '')}
+              <span class="badge badge-partial" style="margin-left:6px;">{html.escape(f['cat'])}</span>
+              <div style="font-size:12.5px;margin-top:4px;line-height:1.7;">
+                {html.escape(f.get('remarks') or '')}<br>
+                <span style="color:var(--muted);">Follow-up date {fmt_date(f['follow_up_date'])} · marked done by <b>{html.escape(f.get('ack_requested_by') or '')}</b>
+                on {fmt_date((f.get('ack_requested_at') or '')[:10])}{(' · note: ' + html.escape(f['ack_note'])) if f.get('ack_note') else ''}</span>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;">
+              {'<span style="font-size:12px;color:var(--muted);">You marked this, so someone else must acknowledge it.</span>' if own else f'''
+              <form method="POST" action="/ack/followup/{f['followup_id']}" onsubmit="return confirm('Acknowledge and close this follow-up?')">
+                <input type="hidden" name="action" value="ack"><button class="btn btn-success btn-sm">✅ Acknowledge</button></form>
+              <form method="POST" action="/ack/followup/{f['followup_id']}" onsubmit="return getReason(this)">
+                <input type="hidden" name="action" value="reject"><input type="hidden" name="reason" class="reason_inp">
+                <button class="btn btn-danger btn-sm">❌ Not done</button></form>'''}
+            </div>
+          </div></div>"""
+    content = f"""
+    <h1>🔎 Acknowledgements</h1>
+    <p style="font-size:12.5px;color:var(--muted);margin-bottom:12px;">Second-level cross-check: confirm that the payment or follow-up
+       shown is correct. Financial decisions (loans, pre-closures, penalties) stay with the admin.</p>
+    <h3 style="margin:6px 0 10px;">💳 Payments awaiting acknowledgement ({len(pays)})</h3>
+    {pay_cards or '<div class="card"><p style="text-align:center;color:var(--muted);">No payments waiting.</p></div>'}
+    <h3 style="margin:18px 0 10px;">📞 Follow-ups awaiting acknowledgement ({len(fus)})</h3>
+    {fu_cards or '<div class="card"><p style="text-align:center;color:var(--muted);">No follow-ups waiting.</p></div>'}
+    <script>
+    function getReason(form){{
+      const r=prompt('Reason:'); if(!r) return false;
+      form.querySelector('.reason_inp').value=r; return true;
+    }}
+    </script>"""
+    return page("Acknowledgements", content, "ack")
+
+@app.route("/ack/payment/<int:pp_id>", methods=["POST"])
+@login_required
+@role_required(*ACK_ROLES)
+def ack_payment(pp_id):
+    try:
+        if request.form.get("action") == "ack":
+            flash(acknowledge_payment(pp_id, session.get("username","")), "success")
+        else:
+            reject_payment(pp_id, request.form.get("reason",""), session.get("username",""))
+            flash("Payment rejected; it was not recorded on the EMI.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("acknowledgements"))
+
+@app.route("/ack/followup/<int:followup_id>", methods=["POST"])
+@login_required
+@role_required(*ACK_ROLES)
+def ack_followup(followup_id):
+    try:
+        if request.form.get("action") == "ack":
+            acknowledge_followup(followup_id, session.get("username",""))
+            flash("Follow-up acknowledged and closed.", "success")
+        else:
+            reject_followup_ack(followup_id, request.form.get("reason",""), session.get("username",""))
+            flash("Follow-up sent back as not done.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("acknowledgements"))
+
+# ── Penalty approval (admin) ───────────────────────────────────────────────────
+@app.route("/penalty/approve/<int:penalty_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin")
+def penalty_approve(penalty_id):
+    try:
+        final = approve_penalty(penalty_id, request.form.get("rate",""), session.get("username",""))
+        flash(("Penalty approved: " + fmt_inr(final) + ". A penalty-collection follow-up was added.") if final > 0
+              else "Penalty waived (per-day amount was 0).", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("approval"))
+
+@app.route("/penalty/reject/<int:penalty_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin")
+def penalty_reject(penalty_id):
+    try:
+        reject_penalty(penalty_id, request.form.get("reason",""), session.get("username",""))
+        flash("Penalty rejected.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("approval"))
 
 @app.route("/followup/reschedule/<int:followup_id>", methods=["POST"])
 @login_required
@@ -4501,6 +5017,9 @@ def followups():
             status_badge = '<span class="badge badge-closed">✅ Resolved</span>'
         elif r["status"] == "Rescheduled":
             status_badge = '<span class="badge badge-closed">🔁 Rescheduled</span>'
+        elif r["status"] == "AwaitingAck":
+            status_badge = (f'<span class="badge badge-partial">⏳ Awaiting acknowledgement</span><br>'
+                            f'<span style="font-size:11px;color:var(--muted);">marked done by {html.escape(r.get("ack_requested_by") or "")}</span>')
         elif fu_date < today:
             status_badge = '<span class="badge badge-overdue">⏰ Missed</span>'
             row_cls = "row-overdue"
@@ -4510,11 +5029,17 @@ def followups():
         else:
             status_badge = '<span class="badge badge-pending">📅 Pending</span>'
         is_open = r["status"] == "Pending"
-        resolve_label = "✔ Received" if r.get("item") in FU_ITEM_COLUMNS else "✔ Resolve"
+        direct = session.get("role", "") in DIRECT_ROLES
+        if direct:
+            resolve_label = {"penalty": "✔ Collected"}.get(r.get("item"), "✔ Received" if r.get("item") in FU_ITEM_COLUMNS else "✔ Resolve")
+            resolve_tip = "Closes this follow-up"
+        else:
+            resolve_label = "✔ Mark done"
+            resolve_tip = "Goes to an Associate Manager / admin for acknowledgement before it closes"
         resolve_btn = "" if not is_open else f"""
           <form method="POST" action="/followup/resolve/{r['followup_id']}" style="display:inline;">
             <input type="hidden" name="next" value="{back_url}">
-            <button class="btn btn-sm btn-success">{resolve_label}</button>
+            <button class="btn btn-sm btn-success" title="{resolve_tip}">{resolve_label}</button>
           </form>"""
         reschedule_form = "" if not (is_open and r["category"] != "Loans") else f"""
           <form method="POST" action="/followup/reschedule/{r['followup_id']}" style="display:flex;gap:4px;align-items:center;">
@@ -4531,17 +5056,17 @@ def followups():
           <td>{customer_numbers_html(r)}{('<br><span style="font-size:11px;color:var(--muted);">🛡️ Guarantor</span><br>' + guarantor_numbers_html(r)) if guarantor_numbers_html(r) != '—' else ''}</td>
           <td>{html.escape(r.get('vehicle_type') or '—')}</td>
           <td>{('₹{:,.2f}'.format(r['emi_amount'])) if r.get('emi_amount') is not None else '—'}</td>
-          <td>{r.get('oldest_due') or '—'}</td>
+          <td>{fmt_date(r.get('oldest_due'))}</td>
           <td style="text-align:center;">{r['pending_dues']}</td>
           <td><b style="color:var(--red);">₹{r['overdue_amount']:,.2f}</b></td>
           <td><b>₹{r['outstanding']:,.2f}</b></td>
-          <td>{r.get('last_paid_date') or '—'}</td>
+          <td>{fmt_date(r.get('last_paid_date'))}</td>
           <td style="white-space:normal;max-width:180px;">{r.get('customer_address') or '—'}</td>
           <td style="white-space:normal;max-width:180px;">{r.get('customer_permanent_address') or '—'}</td>
           <td>{_location_link(r.get('customer_location'))}</td>
           <td>{_location_link(r.get('guarantor_location'))}</td>
-          <td>{r['follow_up_date']}</td>
-          <td style="white-space:normal;max-width:220px;">{r['remarks']}</td>
+          <td>{fmt_date(r['follow_up_date'])}</td>
+          <td style="white-space:normal;max-width:220px;">{r['remarks']}{('<br><span style="font-size:11.5px;color:var(--red);">' + html.escape(r['ack_note']) + '</span>') if r.get('ack_note') and r['status'] == 'Pending' else ''}</td>
           <td>{status_badge}</td>
           <td>{r.get('created_by') or ''}</td>
           <td style="white-space:nowrap;display:flex;gap:6px;flex-wrap:wrap;">{pay_btn}{resolve_btn}{reschedule_form}</td>
@@ -4559,7 +5084,7 @@ def followups():
         f'<a href="/followup?q={q_url}&cat={urlquote(name)}" class="btn btn-sm" '
         f'style="{"background:var(--accent);color:#fff;" if cat==name else "background:var(--surface2);color:var(--text);"}">{label}</a>'
         for name, label in (("", "All"), ("Loans", "💰 Loans"), ("Key Collection", "🔑 Key Collection"),
-                            ("Proof & Documents", "📄 Proof & Documents")))
+                            ("Proof & Documents", "📄 Proof & Documents"), ("Penalty Collection", "⚖️ Penalty Collection")))
     content = f"""
     <h1>📞 Follow Up</h1>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">{tabs}</div>
@@ -4573,7 +5098,9 @@ def followups():
     <div class="card">
       <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">
         Loan collection follow-ups (saved from the Alerts page) plus the automatic Key Collection and
-        Proof &amp; Documents follow-ups created when a loan is submitted with Key / RC / Documents = No.
+        Proof &amp; Documents follow-ups created when a loan is submitted with Key / RC / Documents = No, and
+        Penalty Collection tasks created when an admin approves a late-payment penalty. Marking a follow-up done
+        sends it to an Associate Manager / admin for acknowledgement before it closes.
         Rows are ordered by follow-up date. <b>Overdue Amt</b> = already past due; <b>Outstanding</b> = total balance
         of the loan still to be collected; <b>Oldest Due Date</b> = earliest unpaid EMI.
       </p>
@@ -4603,6 +5130,7 @@ def followup_export_csv():
     for r in items:
         fu_date = parse_date(r["follow_up_date"])
         if r["status"] in ("Resolved","Rescheduled"): status = r["status"]
+        elif r["status"] == "AwaitingAck": status = "Awaiting acknowledgement"
         elif fu_date < today: status = "Missed"
         else: status = "Pending"
         writer.writerow([
@@ -4613,10 +5141,10 @@ def followup_export_csv():
                 contact_numbers_text(r.get("guarantor_extra_numbers"))] if x),
             r.get("vehicle_type") or "",
             f"{r['emi_amount']:.2f}" if r.get("emi_amount") is not None else "",
-            r.get("oldest_due") or "", r["pending_dues"],
-            f"{r['overdue_amount']:.2f}", f"{r['outstanding']:.2f}", r.get("last_paid_date") or "",
+            fmt_date(r.get("oldest_due"), ""), r["pending_dues"],
+            f"{r['overdue_amount']:.2f}", f"{r['outstanding']:.2f}", fmt_date(r.get("last_paid_date"), ""),
             r.get("customer_address") or "", r.get("customer_permanent_address") or "", r.get("customer_location") or "", r.get("guarantor_location") or "",
-            r["follow_up_date"], r.get("remarks") or "",
+            fmt_date(r["follow_up_date"]), r.get("remarks") or "",
             status, r.get("created_by") or ""
         ])
     return send_file(io.BytesIO(buf.getvalue().encode("utf-8-sig")), as_attachment=True,
@@ -4652,7 +5180,7 @@ def closed():
     rows = "".join(f"""<tr>
         <td><b>{l['loan_number']}</b></td><td>{l['customer_name']}</td>
         <td>{l['vehicle_type']}</td><td>₹{l['loan_amount']:,.2f}</td>
-        <td>{l['closure_date']}</td><td>{closure_label(l)}</td></tr>""" for l in ll)
+        <td>{fmt_date(l['closure_date'])}</td><td>{closure_label(l)}</td></tr>""" for l in ll)
     content = f"""
     <h1>🔒 Closed Loans</h1>
     <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;">
@@ -4671,7 +5199,7 @@ def rejected():
     q = request.args.get("q",""); ll = list_rejected_loans(q)
     rows = "".join(f"""<tr>
         <td><b>{l['loan_number']}</b></td><td>{l['customer_name']}</td>
-        <td>{l['reason']}</td><td>{(l.get('created_at') or '')[:10]}</td></tr>""" for l in ll)
+        <td>{l['reason']}</td><td>{fmt_date((l.get('created_at') or '')[:10])}</td></tr>""" for l in ll)
     content = f"""
     <h1>❌ Rejected Loans</h1>
     <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;">
@@ -4943,7 +5471,7 @@ def calculator():
 # ── Report ─────────────────────────────────────────────────────────────────────
 @app.route("/report", methods=["GET","POST"])
 @login_required
-@role_required("superadmin","admin","manager","viewer")
+@role_required("superadmin","admin","manager","viewer","assocmgr")
 def report():
     if request.method == "POST":
         if not REPORTLAB_AVAILABLE:
@@ -4987,14 +5515,14 @@ def users():
     ul = [dict(r) for r in c.fetchall()]
     urows = "".join(f"""<tr><td>{u['username']}</td>
         <td><span class="badge badge-{u['role']}">{u['role'].title()}</span></td>
-        <td>{(u.get('created_at') or '')[:10]}</td></tr>""" for u in ul)
+        <td>{fmt_date((u.get('created_at') or '')[:10])}</td></tr>""" for u in ul)
     rrws = ""
     for r,p in ROLES.items():
         def ck(k,p=p): return "✅" if p.get(k) else "❌"
         rrws += f"""<tr>
             <td><span class="badge badge-{r}">{p['label']}</span></td>
             <td>{ck('can_add')}</td><td>{ck('can_approve')}</td>
-            <td>{ck('can_pay')}</td><td>{ck('can_report')}</td>
+            <td>{ck('can_pay')}</td><td>{ck('can_ack')}</td><td>{ck('can_report')}</td>
         </tr>"""
     content = f"""
     <h1>⚙️ User Management</h1>
@@ -5013,7 +5541,7 @@ def users():
       <div class="card">
         <h2>Role Permissions</h2>
         <div class="table-wrap"><table>
-          <tr><th>Role</th><th>ADD</th><th>APPROVE</th><th>PAY</th><th>REPORT</th></tr>
+          <tr><th>Role</th><th>ADD</th><th>APPROVE</th><th>PAY</th><th>ACKNOWLEDGE</th><th>REPORT</th></tr>
           {rrws}
         </table></div>
       </div>
@@ -5095,7 +5623,7 @@ def _chatbot_loan_summary(loan, detailed=False):
         lines.append(f"💳 EMIs: {paid}/{total} paid  |  Outstanding: {fmt_inr(outstanding)}")
         if next_due:
             rem = float(next_due.get("remaining_amount") or next_due["emi_amount"])
-            lines.append(f"⏳ Next Due: Installment #{next_due['installment_no']} on {next_due['due_date']} — {fmt_inr(rem)} ({next_due['status']})")
+            lines.append(f"⏳ Next Due: Installment #{next_due['installment_no']} on {fmt_date(next_due['due_date'])} — {fmt_inr(rem)} ({next_due['status']})")
     else:
         lines.append("💳 EMI schedule not generated yet (loan pending approval).")
     if detailed:
@@ -5309,7 +5837,7 @@ def _chatbot_intent(msg, low):
         lines = [f"⏳ Upcoming EMIs (next {UPCOMING_DAYS} days) — {len(grouped)} loan(s):\n"]
         for g in grouped[:8]:
             days_left = (parse_date(g["oldest_due"]) - today).days
-            lines.append(f"• {g['loan_number']} ({g['customer_name']}) — {fmt_inr(g['total_due'])} due {g['oldest_due']} (in {days_left}d)")
+            lines.append(f"• {g['loan_number']} ({g['customer_name']}) — {fmt_inr(g['total_due'])} due {fmt_date(g['oldest_due'])} (in {days_left}d)")
         if len(grouped) > 8:
             lines.append(f"...and {len(grouped)-8} more. Check the Alerts page for full list.")
         return "\n".join(lines)
@@ -5325,7 +5853,7 @@ def _chatbot_intent(msg, low):
         top = grouped[0]
         return (f"🔴 Customer with the highest overdue amount:\n"
                 f"• {top['loan_number']} — {top['customer_name']}\n"
-                f"• Overdue: {fmt_inr(top['total_due'])} across {top['emi_count']} EMI(s), oldest due {top['oldest_due']}")
+                f"• Overdue: {fmt_inr(top['total_due'])} across {top['emi_count']} EMI(s), oldest due {fmt_date(top['oldest_due'])}")
 
     if "overdue" in low or "late payment" in low or "delayed" in low:
         overdue = get_overdue_emis()
@@ -5415,9 +5943,9 @@ def _chatbot_intent(msg, low):
 
             if metric == "profit":
                 return (f"📊 {unit_label}ly Profit Comparison:\n"
-                        f"• This {unit_label} ({this_s.isoformat()} to {this_e.isoformat()}): {fmt_inr(this_val)} "
+                        f"• This {unit_label} ({fmt_date(this_s)} to {fmt_date(this_e)}): {fmt_inr(this_val)} "
                         f"(collected: {fmt_inr(this_extra)})\n"
-                        f"• Last {unit_label} ({last_s.isoformat()} to {last_e.isoformat()}): {fmt_inr(last_val)} "
+                        f"• Last {unit_label} ({fmt_date(last_s)} to {fmt_date(last_e)}): {fmt_inr(last_val)} "
                         f"(collected: {fmt_inr(last_extra)})\n\n"
                         f"{arrow} by {fmt_inr(abs(diff))} ({abs(pct):.1f}%)")
             elif metric in ("disbursed","loans"):
@@ -5468,7 +5996,7 @@ def _chatbot_intent(msg, low):
             if result["n_installments"] == 0:
                 return (f"📈 Profit Projection — {period_label}:\n"
                         f"No EMIs are due in this period, so no profit is expected.")
-            return (f"📈 Profit Projection — {period_label} ({start.isoformat()} to {end.isoformat()}):\n"
+            return (f"📈 Profit Projection — {period_label} ({fmt_date(start)} to {fmt_date(end)}):\n"
                     f"• EMI installments due: {result['n_installments']}\n"
                     f"• Total expected profit (interest portion): {fmt_inr(result['total_profit'])}\n"
                     f"• Already collected: {fmt_inr(result['collected_profit'])}\n"
@@ -5525,7 +6053,7 @@ def _chatbot_intent(msg, low):
             if row["n"] == 0:
                 return f"💰 Expected Collections — {period_label}:\nNo EMIs are due in this period."
 
-            return (f"💰 Expected Collections — {period_label} ({start.isoformat()} to {end.isoformat()}):\n"
+            return (f"💰 Expected Collections — {period_label} ({fmt_date(start)} to {fmt_date(end)}):\n"
                     f"• EMI installments due: {row['n']}\n"
                     f"• Total expected collection: {fmt_inr(total)}\n"
                     f"• Already collected: {fmt_inr(collected)}\n"
@@ -5556,7 +6084,7 @@ def _chatbot_intent(msg, low):
             else:
                 period_label = f"{rel.capitalize()} {n} {unit.capitalize()}{'s' if n>1 else ''}"
 
-            return (f"💰 Disbursed — {period_label} ({start.isoformat()} to {end.isoformat()}):\n"
+            return (f"💰 Disbursed — {period_label} ({fmt_date(start)} to {fmt_date(end)}):\n"
                     f"• {row['n']} loan(s) disbursed, totaling {fmt_inr(row['amt'])}")
 
     # ── This week insights ──
@@ -5729,7 +6257,7 @@ def _chatbot_intent(msg, low):
         if rows:
             lines.append("\nUpcoming follow-ups:")
             for r in rows:
-                lines.append(f"• {r['loan_number']} — {_na(r['customer_name'])} on {r['follow_up_date']}: {r['remarks']}")
+                lines.append(f"• {r['loan_number']} — {_na(r['customer_name'])} on {fmt_date(r['follow_up_date'])}: {r['remarks']}")
         return "\n".join(lines)
 
     return None  # fall through to search
@@ -5974,15 +6502,18 @@ def emi_edit(emi_id):
           <td><b>{inst_no}.{i+1}</b></td><td>{fmt_inr(p.get('amount') or 0)}</td>
           <td>{fmt_inr(p.get('extra_interest') or 0)}</td>
           <td>{p.get('bill_number') or '—'}</td>
-          <td>{(p.get('paid_at') or '')[:10]}</td>
+          <td>{fmt_date((p.get('paid_at') or '')[:10], '')}</td>
           <td>{delay_badge(emi.get('due_date',''), (p.get('paid_at') or '')[:10]) if p.get('paid_at') else '—'}</td>
           <td>{p.get('paid_by') or '—'}</td>
         </tr>""" for i, p in enumerate(payments))
-    if payments and emi.get("status") == "Paid":
-        last_paid = (payments[-1].get('paid_at') or '')[:10]
+    half_date = half_paid_date(emi, payments) if payments else None
+    if payments and (half_date or emi.get("status") == "Paid"):
+        closed_txt = f"<b>✅ {inst_no} (Closed)</b> — " if emi.get("status") == "Paid" else ""
+        half_txt = (f"½ half of the EMI crossed on <b>{fmt_date(half_date)}</b> — {delay_badge(emi.get('due_date',''), half_date)}"
+                    f" — Late Payment Days: <b>{max(0, (parse_date(half_date) - parse_date(emi.get('due_date',''))).days)}</b>"
+                    if half_date else "half of the EMI not crossed yet")
         payment_rows += f"""<tr>
-          <td colspan="7" style="color:var(--green);"><b>✅ {inst_no} (Closed)</b>
-            {('— closed on ' + last_paid + ' — ' + delay_badge(emi.get('due_date',''), last_paid) + ' — Late Payment Days: <b>' + str(max(0, (parse_date(last_paid) - parse_date(emi.get('due_date',''))).days)) + '</b>') if last_paid else ''}</td>
+          <td colspan="7" style="color:var(--green);">{closed_txt}{half_txt}</td>
         </tr>"""
     payment_history_card = f"""
     <div class="card" style="margin-bottom:12px;">
