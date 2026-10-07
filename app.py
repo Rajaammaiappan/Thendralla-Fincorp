@@ -131,6 +131,64 @@ def fmt_date(v, empty="—"):
     try: return datetime.strptime(str(v)[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
     except ValueError: return str(v)
 
+def vehicle_label(row):
+    """Vehicle as people say it: the name (Splendor, Activa) with its model/year; falls back to the
+    vehicle type (e.g. 'Two Wheeler') only when no name was recorded."""
+    name = (row.get("vehicle_name") or "").strip()
+    model = (row.get("vehicle_model") or "").strip()
+    main = name or (row.get("vehicle_type") or "").strip()
+    if not main: return "—"
+    if model and model.lower() not in main.lower(): return f"{main} ({model})"
+    return main
+
+def vehicle_tag(v):
+    """Vehicle label with its registration number, e.g. 'Activa (6G 2023) · TN01AB1234'."""
+    num = (v.get("vehicle_number") or "").strip()
+    return f"{vehicle_label(v)} · {num}" if num else vehicle_label(v)
+
+def _xv_cache(attr, table):
+    """loan_id -> [rows] for an add-on table, loaded once per request."""
+    try: cached = getattr(g, attr, None)
+    except RuntimeError: cached = None
+    if cached is None:
+        c = get_cur(); c.execute(f"SELECT * FROM {table} ORDER BY loan_id, seq, 1")
+        cached = {}
+        for r in c.fetchall():
+            r = dict(r); cached.setdefault(r["loan_id"], []).append(r)
+        try: setattr(g, attr, cached)
+        except RuntimeError: pass
+    return cached
+
+def extra_vehicles_of(row):
+    return _xv_cache("_xv_vehicles", "LoanVehicles").get(row.get("loan_id") or row.get("id"), [])
+
+def extra_guarantors_of(row):
+    return _xv_cache("_xv_guarantors", "LoanGuarantors").get(row.get("loan_id") or row.get("id"), [])
+
+def vehicle_label_more(row):
+    """Plain-text vehicle label; adds '+N more' when the loan has add-on vehicles."""
+    n = len(extra_vehicles_of(row))
+    return vehicle_label(row) + (f" +{n} more" if n else "")
+
+def vehicle_html(row):
+    tip = " · ".join(x for x in [(row.get("vehicle_type") or "").strip(), (row.get("vehicle_number") or "").strip(),
+                                 (row.get("vehicle_colour") or "").strip()] if x)
+    extras = [] if row.get("_vehicle_scoped") else extra_vehicles_of(row)
+    if extras:
+        tip += "".join("\n+ " + vehicle_tag(x) for x in extras)
+    more = (f' <span class="badge badge-partial" style="font-size:10.5px;padding:1px 6px;">+{len(extras)} more</span>'
+            if extras else "")
+    return f'<span title="{html.escape(tip)}">{html.escape(vehicle_label(row))}{more}</span>'
+
+def loan_vehicles(loan):
+    """Every vehicle on a loan: the main one (vehicle_id None) first, then the add-on vehicles."""
+    keys = ("vehicle_type", "vehicle_number", "vehicle_name", "vehicle_model", "engine_number", "chassis_number",
+            "vehicle_colour", "key_received", "key_received_date", "rc_received", "rc_received_date",
+            "docs_received", "docs_received_date")
+    main = {"vehicle_id": None, "seq": 1, **{k: loan.get(k) for k in keys}}
+    c = get_cur(); c.execute("SELECT * FROM LoanVehicles WHERE loan_id=? ORDER BY seq, vehicle_id", (loan["id"],))
+    return [main] + [dict(r) for r in c.fetchall()]
+
 def add_months(d, m):
     month = d.month - 1 + m
     year  = d.year + month // 12
@@ -268,15 +326,195 @@ def extra_numbers_block(prefix, raw=None):
             f'<button type="button" class="btn btn-sm btn-amber" style="{hide_btn}width:fit-content;" '
             f'onclick="addExtraNumber(\'{prefix}\',this)">➕ Add another number</button></div>' + _EXTRA_NUMBERS_JS)
 
+# ── Add-on vehicles / guarantors: several of each under one loan number ─────────
+VEHICLE_TYPES = ["Two Wheeler", "Three Wheeler", "Four Wheeler", "Commercial Vehicle", "Other"]
+
+_EXTRA_BLOCKS_JS = """<script>
+if(!window.addExtraBlock){
+window.renumberExtra=function(){
+  ['vehicle','guarantor'].forEach(function(k){
+    var n=2;
+    document.querySelectorAll('.xblock[data-kind="'+k+'"]').forEach(function(b){
+      if(b.style.display==='none') return;
+      b.querySelector('.xn').textContent=n++;
+    });
+  });
+};
+window.addExtraBlock=function(kind){
+  var t=document.getElementById('tpl_'+kind), host=document.getElementById('xhost_'+kind);
+  host.appendChild(t.content.firstElementChild.cloneNode(true));
+  renumberExtra();
+  if(window.toggleReloan && document.querySelector('[name=is_reloan]')) toggleReloan(document.querySelector('[name=is_reloan]').value);
+  host.lastElementChild.scrollIntoView({behavior:'smooth',block:'center'});
+};
+window.removeExtraBlock=function(btn){
+  var b=btn.closest('.xblock');
+  if(b.dataset.existing==='1'){
+    b.querySelector('[name$="_del[]"]').value='1';
+    b.querySelectorAll('[required]').forEach(function(e){e.removeAttribute('required');});
+    b.style.display='none';
+  } else { b.remove(); }
+  renumberExtra();
+};
+window.xgGPS=function(btn){
+  var inp=btn.parentElement.querySelector('input');
+  if(!navigator.geolocation){alert('GPS is not supported on this browser.');return;}
+  var old=btn.textContent; btn.disabled=true; btn.textContent='Getting...';
+  navigator.geolocation.getCurrentPosition(function(p){
+    inp.value=p.coords.latitude.toFixed(6)+','+p.coords.longitude.toFixed(6); btn.textContent=old; btn.disabled=false;
+  },function(e){alert('GPS: '+e.message+' - enter it manually.'); btn.textContent=old; btn.disabled=false;},
+  {enableHighAccuracy:true,timeout:15000,maximumAge:0});
+};
+}
+</script>"""
+
+def _xblock_shell(kind, n, existing, inner, extra_note=""):
+    title = "Vehicle" if kind == "vehicle" else "Guarantor"
+    icon = "🚗" if kind == "vehicle" else "🛡️"
+    return (f'<div class="xblock" data-kind="{kind}" data-existing="{1 if existing else 0}" '
+            f'style="grid-column:1/-1;border:1px dashed var(--accent);border-radius:10px;padding:12px;margin:4px 0;background:var(--surface2);">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+            f'<b style="color:var(--accent);">{icon} {title} <span class="xn">{n}</span> '
+            f'<span style="font-size:11px;color:var(--muted);font-weight:500;">(add-on){extra_note}</span></b>'
+            f'<button type="button" class="btn btn-sm btn-danger" onclick="removeExtraBlock(this)">✖ Remove</button></div>'
+            f'<div class="form-grid">{inner}</div></div>')
+
+def _yn_select(name, required=True):
+    return (f'<select name="{name}"{" required" if required else ""}><option value="">-- Select --</option>'
+            f'<option value="yes">Yes</option><option value="no">No</option></select>')
+
+def extra_vehicle_block(v=None, n=2):
+    """One add-on vehicle. New blocks ask the key / RC / proof questions; saved ones show their status instead."""
+    v = v or {}
+    existing = bool(v.get("vehicle_id"))
+    val = lambda k: html.escape(str(v.get(k) or ""))
+    types = "".join(f'<option value="{t}"{" selected" if v.get("vehicle_type") == t else ""}>{t}</option>' for t in VEHICLE_TYPES)
+    def fld(label, name, key, extra=""):
+        return (f'<div class="form-group"><label>{label}</label>'
+                f'<input name="{name}" value="{val(key)}" class="vehicle-req-field" {extra}></div>')
+    inner = (f'<input type="hidden" name="xv_id[]" value="{v.get("vehicle_id") or ""}">'
+             f'<input type="hidden" name="xv_del[]" value="0">'
+             f'<div class="form-group"><label>Vehicle Type</label><select name="xv_type[]" class="vehicle-req-field">'
+             f'<option value="">-- Select --</option>{types}</select></div>'
+             + fld("Vehicle Number", "xv_number[]", "vehicle_number", "placeholder=\"TN01AB1234\" oninput=\"this.value=this.value.replace(/ /g,'').toUpperCase()\"")
+             + fld("Vehicle Name", "xv_name[]", "vehicle_name", "placeholder=\"e.g. Honda Activa\"")
+             + fld("Vehicle Model", "xv_model[]", "vehicle_model", "placeholder=\"e.g. 6G 2023\"")
+             + fld("Engine Number", "xv_engine[]", "engine_number")
+             + fld("Chassis Number", "xv_chassis[]", "chassis_number")
+             + fld("Vehicle Colour", "xv_colour[]", "vehicle_colour"))
+    if existing:
+        inner += ('<input type="hidden" name="xv_key[]" value=""><input type="hidden" name="xv_rc[]" value="">'
+                  '<input type="hidden" name="xv_docs[]" value="">'
+                  f'<div class="form-group full" style="font-size:12.5px;">{handover_status_html(v)}</div>')
+    else:
+        inner += (f'<div class="form-group"><label>Key Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 3 days)</span></label>{_yn_select("xv_key[]")}</div>'
+                  f'<div class="form-group"><label>RC Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 15 days)</span></label>{_yn_select("xv_rc[]")}</div>'
+                  f'<div class="form-group"><label>Proof &amp; Documents Collected? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 3 days)</span></label>{_yn_select("xv_docs[]")}</div>')
+    return _xblock_shell("vehicle", n, existing, inner)
+
+def extra_guarantor_block(g_=None, n=2):
+    g_ = g_ or {}
+    existing = bool(g_.get("guarantor_id"))
+    val = lambda k: html.escape(str(g_.get(k) or ""))
+    inner = (f'<input type="hidden" name="xg_id[]" value="{g_.get("guarantor_id") or ""}">'
+             f'<input type="hidden" name="xg_del[]" value="0">'
+             f'<div class="form-group"><label>Guarantor Name *</label><input name="xg_name[]" value="{val("name")}"></div>'
+             f'<div class="form-group"><label>Guarantor Mobile</label><input name="xg_mobile[]" value="{val("mobile")}" maxlength="10" '
+             f'oninput="this.value=this.value.replace(/[^0-9]/g,\'\').slice(0,10)"></div>'
+             f'<div class="form-group full"><label>Guarantor Address</label><textarea name="xg_address[]" rows="2">{val("address")}</textarea></div>'
+             f'<div class="form-group full"><label>📍 GPS Location</label><div style="display:flex;gap:8px;flex-wrap:wrap;">'
+             f'<input name="xg_location[]" value="{val("location")}" placeholder="e.g. 10.9876,78.1234 or area name" style="flex:1;min-width:160px;">'
+             f'<button type="button" class="btn btn-sm btn-amber" onclick="xgGPS(this)">📡 Get GPS</button></div></div>')
+    return _xblock_shell("guarantor", n, existing, inner)
+
+def extra_blocks_section(loan_id=None):
+    """The '+ Add another vehicle / guarantor' areas (hosts, templates and buttons) for the loan / edit forms."""
+    vs, gs = [], []
+    if loan_id:
+        c = get_cur()
+        c.execute("SELECT * FROM LoanVehicles WHERE loan_id=? ORDER BY seq, vehicle_id", (loan_id,)); vs = [dict(r) for r in c.fetchall()]
+        c.execute("SELECT * FROM LoanGuarantors WHERE loan_id=? ORDER BY seq, guarantor_id", (loan_id,)); gs = [dict(r) for r in c.fetchall()]
+    def area(kind, items, builder, btn_text, blank):
+        hosted = "".join(builder(it, i + 2) for i, it in enumerate(items))
+        return (f'<div id="xhost_{kind}" class="form-group full" style="gap:6px;">{hosted}</div>'
+                f'<template id="tpl_{kind}">{builder(None, 2)}</template>'
+                f'<div class="form-group full"><button type="button" class="btn btn-sm btn-amber" style="width:fit-content;" '
+                f'onclick="addExtraBlock(\'{kind}\')">{btn_text}</button></div>')
+    return (area("vehicle", vs, extra_vehicle_block, "➕ Add another vehicle", None),
+            area("guarantor", gs, extra_guarantor_block, "➕ Add another guarantor", None))
+
+def handover_status_html(v):
+    """Key / RC / Proof status of one vehicle, e.g. '🔑 Key ✔ 12/09/2026 · 📄 RC ✖ pending · 🗂️ Proof ✔ 12/09/2026'."""
+    out = []
+    for icon, label, flag, dt in (("🔑", "Key", "key_received", "key_received_date"),
+                                  ("📄", "RC", "rc_received", "rc_received_date"),
+                                  ("🗂️", "Proof", "docs_received", "docs_received_date")):
+        if v.get(flag) == "yes":
+            out.append(f'{icon} {label} <span style="color:var(--green);">✔ {fmt_date(v.get(dt), "received")}</span>')
+        else:
+            out.append(f'{icon} {label} <span style="color:var(--red);">✖ pending</span>')
+    return " · ".join(out)
+
+def _form_list(form, key, i):
+    lst = form.getlist(key)
+    return (lst[i] if i < len(lst) else "").strip()
+
+def parse_extra_vehicles(form, reloan):
+    """Reads the add-on vehicle blocks. Vehicle details are mandatory only for a reloan (same rule as the main
+    vehicle); every NEW block must answer the key / RC / proof questions."""
+    out = []
+    for i in range(len(form.getlist("xv_type[]"))):
+        r = dict(id=_form_list(form, "xv_id[]", i), delete=_form_list(form, "xv_del[]", i) == "1",
+                 vehicle_type=_form_list(form, "xv_type[]", i),
+                 vehicle_number=_form_list(form, "xv_number[]", i).replace(" ", "").upper(),
+                 vehicle_name=_form_list(form, "xv_name[]", i), vehicle_model=_form_list(form, "xv_model[]", i),
+                 engine_number=_form_list(form, "xv_engine[]", i), chassis_number=_form_list(form, "xv_chassis[]", i),
+                 vehicle_colour=_form_list(form, "xv_colour[]", i),
+                 key=_form_list(form, "xv_key[]", i), rc=_form_list(form, "xv_rc[]", i), docs=_form_list(form, "xv_docs[]", i))
+        if r["delete"] and r["id"]:
+            out.append(r); continue
+        label = f"Add-on vehicle {i + 2}"
+        if reloan:
+            for k, lab in (("vehicle_type", "Vehicle Type"), ("vehicle_number", "Vehicle Number"), ("vehicle_name", "Vehicle Name"),
+                           ("vehicle_model", "Vehicle Model"), ("engine_number", "Engine Number"),
+                           ("chassis_number", "Chassis Number"), ("vehicle_colour", "Vehicle Colour")):
+                if not r[k]: raise ValueError(f"{label}: {lab} is mandatory for a reloan.")
+        if not r["id"]:
+            for k, lab in (("key", "Key Received"), ("rc", "RC Received"), ("docs", "Proof & Documents Collected")):
+                if r[k] not in ("yes", "no"): raise ValueError(f"{label}: please answer '{lab}?' (Yes / No).")
+        out.append(r)
+    return out
+
+def parse_extra_guarantors(form):
+    out = []
+    for i in range(len(form.getlist("xg_name[]"))):
+        r = dict(id=_form_list(form, "xg_id[]", i), delete=_form_list(form, "xg_del[]", i) == "1",
+                 name=_form_list(form, "xg_name[]", i), mobile=re.sub(r"\D", "", _form_list(form, "xg_mobile[]", i)),
+                 address=_form_list(form, "xg_address[]", i), location=_form_list(form, "xg_location[]", i))
+        if r["delete"] and r["id"]:
+            out.append(r); continue
+        if not r["id"] and not (r["name"] or r["mobile"] or r["address"] or r["location"]):
+            continue        # an empty block that was never filled in
+        if not r["name"]: raise ValueError(f"Add-on guarantor {i + 2}: please enter the guarantor's name.")
+        if r["mobile"] and len(r["mobile"]) != 10: raise ValueError(f"Add-on guarantor {i + 2}: mobile number must be exactly 10 digits.")
+        out.append(r)
+    return out
+
 def customer_numbers_html(row):
     name = row.get("customer_name") or row.get("name") or "Customer"
     return contact_numbers_html(row.get("customer_mobile"), f"Primary — {name} (Customer)",
                                 row.get("customer_extra_numbers"), "Customer")
 
-def guarantor_numbers_html(row):
+def guarantor_numbers_html(row, include_addon=True):
     name = row.get("guarantor_name") or "Guarantor"
-    return contact_numbers_html(row.get("guarantor_mobile"), f"Primary — {name} (Guarantor)",
+    base = contact_numbers_html(row.get("guarantor_mobile"), f"Primary — {name} (Guarantor)",
                                 row.get("guarantor_extra_numbers"), "Guarantor")
+    parts = [] if base == "—" else [base]
+    if include_addon:
+        for gx in extra_guarantors_of(row):
+            if (gx.get("mobile") or "").strip():
+                parts.append(contact_numbers_html(gx["mobile"], f"{gx.get('name') or 'Guarantor'} (Guarantor {gx['seq']})", None, "Guarantor"))
+    return "<br>".join(parts) if parts else "—"
 
 def next_loan_number():
     START_SEQ = 2201   # T0101–T2200 already used; new loans start from T2201
@@ -503,6 +741,58 @@ def init_db():
         FOREIGN KEY(emi_id) REFERENCES EMI(emi_id),
         FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
     );
+    CREATE TABLE IF NOT EXISTS LoanClosure (
+        closure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        loan_id INTEGER,
+        kind TEXT,
+        status TEXT,
+        created_at TEXT,
+        approved_by TEXT,
+        approved_at TEXT,
+        ack_requested_by TEXT,
+        ack_requested_at TEXT,
+        ack_note TEXT,
+        acked_by TEXT,
+        acked_at TEXT,
+        closed_at TEXT,
+        FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
+    );
+    CREATE TABLE IF NOT EXISTS ClosureItems (
+        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        closure_id INTEGER,
+        loan_id INTEGER,
+        item TEXT,
+        status TEXT,
+        returned_on TEXT,
+        handed_by TEXT,
+        note TEXT,
+        recorded_by TEXT,
+        recorded_at TEXT,
+        FOREIGN KEY(closure_id) REFERENCES LoanClosure(closure_id)
+    );
+    CREATE TABLE IF NOT EXISTS LoanVehicles (
+        vehicle_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        loan_id INTEGER,
+        seq INTEGER,
+        vehicle_type TEXT,
+        vehicle_number TEXT,
+        vehicle_name TEXT,
+        vehicle_model TEXT,
+        engine_number TEXT,
+        chassis_number TEXT,
+        vehicle_colour TEXT,
+        key_received TEXT, key_received_date TEXT,
+        rc_received TEXT, rc_received_date TEXT,
+        docs_received TEXT, docs_received_date TEXT,
+        FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
+    );
+    CREATE TABLE IF NOT EXISTS LoanGuarantors (
+        guarantor_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        loan_id INTEGER,
+        seq INTEGER,
+        name TEXT, mobile TEXT, address TEXT, location TEXT,
+        FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
+    );
     CREATE TABLE IF NOT EXISTS PendingPayments (
         pp_id INTEGER PRIMARY KEY AUTOINCREMENT,
         emi_id INTEGER,
@@ -651,6 +941,7 @@ def init_db():
         "ALTER TABLE LoanEntry ADD COLUMN aadhar_number TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN vehicle_name TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN loan_date TEXT",
+        "ALTER TABLE ClosureItems ADD COLUMN vehicle_id INTEGER",
     ]:
         try: cur.execute(m)
         except: pass
@@ -675,6 +966,11 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_customers_status ON Customers(status)",
         "CREATE INDEX IF NOT EXISTS idx_followup_loan_id ON FollowUp(loan_id)",
         "CREATE INDEX IF NOT EXISTS idx_followup_status ON FollowUp(status)",
+        "CREATE INDEX IF NOT EXISTS idx_closure_loan ON LoanClosure(loan_id)",
+        "CREATE INDEX IF NOT EXISTS idx_closure_status ON LoanClosure(status)",
+        "CREATE INDEX IF NOT EXISTS idx_closureitems_closure ON ClosureItems(closure_id)",
+        "CREATE INDEX IF NOT EXISTS idx_loanvehicles_loan ON LoanVehicles(loan_id)",
+        "CREATE INDEX IF NOT EXISTS idx_loanguarantors_loan ON LoanGuarantors(loan_id)",
         "CREATE INDEX IF NOT EXISTS idx_pp_status ON PendingPayments(status)",
         "CREATE INDEX IF NOT EXISTS idx_pp_emi ON PendingPayments(emi_id)",
         "CREATE INDEX IF NOT EXISTS idx_penalties_status ON Penalties(status)",
@@ -748,13 +1044,78 @@ def record_handover_details(loan_id, loan_date_val, field_visit, field_visit_dat
                answers["docs_received"], loan_iso if answers["docs_received"] == "yes" else None,
                loan_id))
     get_db().commit()
-    plan = (("key_received",  "key",  "Key Collection",    3,  "Collect vehicle key from customer"),
-            ("rc_received",   "rc",   "Proof & Documents", 15, "Collect RC book from customer"),
-            ("docs_received", "docs", "Proof & Documents", 3,  "Collect proof & documents from customer"))
-    for field, item, category, days, remark in plan:
-        if answers[field] == "no":
-            add_follow_up(loan_id, (loan_date_val + timedelta(days=days)).isoformat(),
-                          remark, username, category, item)
+    schedule_handover_followups(loan_id, loan_date_val, answers, username)
+
+HANDOVER_PLAN = (("key_received",  "key",  "Key Collection",    3,  "Collect vehicle key from customer"),
+                 ("rc_received",   "rc",   "Proof & Documents", 15, "Collect RC book from customer"),
+                 ("docs_received", "docs", "Proof & Documents", 3,  "Collect proof & documents from customer"))
+
+def schedule_handover_followups(loan_id, base_date, answers, username, vehicle_id=None, vtag=""):
+    """A 'No' answer for key / RC / proof creates a follow-up (key 3 days, proof 3 days, RC 15 days after base_date).
+    For an add-on vehicle the follow-up carries the vehicle id in ref_id, so resolving it updates that vehicle only."""
+    for field, item, category, days, remark in HANDOVER_PLAN:
+        if answers.get(field) == "no":
+            add_follow_up(loan_id, (base_date + timedelta(days=days)).isoformat(),
+                          remark + (f" — {vtag}" if vtag else ""), username, category, item, ref_id=vehicle_id)
+
+def save_extra_vehicles(loan_id, rows, base_date, username):
+    """Creates / updates / removes add-on vehicles. New ones are stamped with base_date when received
+    and get follow-ups for whatever was not received."""
+    c = get_cur()
+    for r in rows:
+        if r["id"]:
+            vid = int(r["id"])
+            c.execute("SELECT vehicle_id FROM LoanVehicles WHERE vehicle_id=? AND loan_id=?", (vid, loan_id))
+            if not c.fetchone(): continue
+            if r["delete"]:
+                c.execute("DELETE FROM LoanVehicles WHERE vehicle_id=?", (vid,))
+                c.execute("""DELETE FROM FollowUp WHERE loan_id=? AND ref_id=? AND item IN ('key','rc','docs')
+                             AND status IN ('Pending','AwaitingAck')""", (loan_id, vid))
+                c.execute("DELETE FROM ClosureItems WHERE vehicle_id=? AND status='Pending'", (vid,))
+            else:
+                c.execute("""UPDATE LoanVehicles SET vehicle_type=?, vehicle_number=?, vehicle_name=?, vehicle_model=?,
+                             engine_number=?, chassis_number=?, vehicle_colour=? WHERE vehicle_id=?""",
+                          (r["vehicle_type"], r["vehicle_number"], r["vehicle_name"], r["vehicle_model"],
+                           r["engine_number"], r["chassis_number"], r["vehicle_colour"], vid))
+            continue
+        c.execute("SELECT COALESCE(MAX(seq),1) as m FROM LoanVehicles WHERE loan_id=?", (loan_id,))
+        seq = int(c.fetchone()["m"]) + 1
+        stamp = base_date.isoformat()
+        c.execute("""INSERT INTO LoanVehicles (loan_id,seq,vehicle_type,vehicle_number,vehicle_name,vehicle_model,
+                       engine_number,chassis_number,vehicle_colour,key_received,key_received_date,rc_received,
+                       rc_received_date,docs_received,docs_received_date)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (loan_id, seq, r["vehicle_type"], r["vehicle_number"], r["vehicle_name"], r["vehicle_model"],
+                   r["engine_number"], r["chassis_number"], r["vehicle_colour"],
+                   r["key"], stamp if r["key"] == "yes" else None,
+                   r["rc"], stamp if r["rc"] == "yes" else None,
+                   r["docs"], stamp if r["docs"] == "yes" else None))
+        vid = c.lastrowid
+        get_db().commit()
+        schedule_handover_followups(loan_id, base_date,
+                                    {"key_received": r["key"], "rc_received": r["rc"], "docs_received": r["docs"]},
+                                    username, vid, vehicle_tag(r))
+        c = get_cur()
+    get_db().commit()
+
+def save_extra_guarantors(loan_id, rows):
+    c = get_cur()
+    for r in rows:
+        if r["id"]:
+            gid = int(r["id"])
+            c.execute("SELECT guarantor_id FROM LoanGuarantors WHERE guarantor_id=? AND loan_id=?", (gid, loan_id))
+            if not c.fetchone(): continue
+            if r["delete"]:
+                c.execute("DELETE FROM LoanGuarantors WHERE guarantor_id=?", (gid,))
+            else:
+                c.execute("UPDATE LoanGuarantors SET name=?, mobile=?, address=?, location=? WHERE guarantor_id=?",
+                          (r["name"], r["mobile"], r["address"], r["location"], gid))
+            continue
+        c.execute("SELECT COALESCE(MAX(seq),1) as m FROM LoanGuarantors WHERE loan_id=?", (loan_id,))
+        seq = int(c.fetchone()["m"]) + 1
+        c.execute("INSERT INTO LoanGuarantors (loan_id,seq,name,mobile,address,location) VALUES (?,?,?,?,?,?)",
+                  (loan_id, seq, r["name"], r["mobile"], r["address"], r["location"]))
+    get_db().commit()
 
 # ── Billing (printed-style receipts) ────────────────────────────────────────────
 _ONES = ["","One","Two","Three","Four","Five","Six","Seven","Eight","Nine","Ten","Eleven","Twelve",
@@ -913,6 +1274,7 @@ def request_preclosure(loan_id, username):
     if not loan: raise ValueError("Loan not found")
     if loan["status"] != "Approved": raise ValueError("Only active (approved) loans can be pre-closed.")
     if preclosure_in_progress(loan_id): raise ValueError("A pre-closure request is already open for this loan.")
+    if get_open_closure(loan_id): raise ValueError("This loan is already being closed.")
     c.execute("""INSERT INTO PreClosure (loan_id,status,requested_by,requested_at,original_rate)
                  VALUES (?,?,?,?,?)""",
               (loan_id, "Pending", username, datetime.now(timezone.utc).isoformat(), float(loan["interest_rate"])))
@@ -961,15 +1323,13 @@ def complete_preclosure(preclose_id, bill_number, paid_on, username):
     if pd > date.today(): raise ValueError("Paid On date cannot be in the future.")
     lid = pc["loan_id"]; now = datetime.now(timezone.utc).isoformat()
     c.execute("UPDATE EMI SET status='PreClosed', remaining_amount=0 WHERE loan_id=? AND status!='Paid'", (lid,))
-    c.execute("UPDATE LoanEntry SET status='Closed' WHERE id=?", (lid,))
-    c.execute("UPDATE Customers SET status='Closed' WHERE loan_id=?", (lid,))
-    c.execute("INSERT OR REPLACE INTO ClosedLoans (loan_id,closure_date,created_at) VALUES (?,?,?)",
-              (lid, pd.isoformat(), now))
     c.execute("""UPDATE FollowUp SET status='Resolved', resolved_at=?
                  WHERE loan_id=? AND status='Pending' AND COALESCE(category,'Loans')='Loans'""", (now, lid))
     c.execute("""UPDATE PreClosure SET status='Completed', bill_number=?, paid_on=?, closed_by=?, closed_at=?
                  WHERE preclose_id=?""", (bill_number, pd.isoformat(), username, now, preclose_id))
     get_db().commit()
+    # The money side is done; the loan itself closes after the key / document return is acknowledged.
+    start_closure(lid, "PreClosure")
 
 def approve_loan(loan_id, override_emi=None):
     c = get_cur()
@@ -1070,15 +1430,14 @@ def pay_emi(emi_id, pay_amount=None, extra_interest=0.0, bill_number="", paid_on
         c.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status='Paid' THEN 1 ELSE 0 END) as pc FROM EMI WHERE loan_id=?", (lid,))
         ct = c.fetchone()
         if ct["total"] > 0 and ct["pc"] == ct["total"]:
-            c.execute("UPDATE LoanEntry SET status='Closed' WHERE id=?", (lid,))
-            c.execute("UPDATE Customers SET status='Closed' WHERE loan_id=?", (lid,))
-            c.execute("INSERT OR REPLACE INTO ClosedLoans (loan_id,closure_date,created_at) VALUES (?,?,?)",
-                      (lid, date.today().isoformat(), now))
-            get_db().commit(); _notify_closure(lid)
+            # All EMIs are paid, but the loan is not closed directly: it goes to admin approval, then the
+            # penalty / key & document return steps, then acknowledgement (see "Loan closing" below).
+            start_closure(lid, "Regular")
+            return "EMI paid successfully! All EMIs are paid, so the loan now needs closing approval."
         return "EMI paid successfully!"
 
 # ── Payment acknowledgement (second-level cross-check) & late-payment penalties ──
-PENALTY_FOLLOWUP_DAYS = 3      # penalty-collection follow-up falls due this many days after approval
+PENALTY_FOLLOWUP_DAYS = 1      # penalty-collection follow-up falls due this many days after approval (collect within a day)
 
 def pending_payment_for_emi(emi_id):
     c = get_cur()
@@ -1193,7 +1552,7 @@ def approve_penalty(penalty_id, rate, username):
     if final <= 0:
         c.execute("""UPDATE Penalties SET status='Waived', final_rate=0, final_amount=0, decided_by=?, decided_at=?
                      WHERE penalty_id=?""", (username, now, penalty_id))
-        get_db().commit(); return 0.0
+        get_db().commit(); closure_advance(pen["loan_id"]); return 0.0
     c.execute("SELECT loan_number FROM LoanEntry WHERE id=?", (pen["loan_id"],))
     loan_no = c.fetchone()["loan_number"]
     fu_id = add_follow_up(pen["loan_id"], (date.today() + timedelta(days=PENALTY_FOLLOWUP_DAYS)).isoformat(),
@@ -1207,18 +1566,181 @@ def approve_penalty(penalty_id, rate, username):
     return final
 
 def reject_penalty(penalty_id, reason, username):
-    c = get_cur(); c.execute("SELECT status FROM Penalties WHERE penalty_id=?", (penalty_id,))
+    c = get_cur(); c.execute("SELECT status, loan_id FROM Penalties WHERE penalty_id=?", (penalty_id,))
     pen = c.fetchone()
     if not pen or pen["status"] != "Pending": raise ValueError("This penalty is not pending.")
     c.execute("""UPDATE Penalties SET status='Rejected', decided_by=?, decided_at=?, decision_remarks=?
                  WHERE penalty_id=?""", (username, datetime.now(timezone.utc).isoformat(), (reason or "").strip() or "No reason given", penalty_id))
     get_db().commit()
+    closure_advance(pen["loan_id"])
 
 def get_penalties_by_emi(loan_id):
     """Latest non-rejected penalty per installment of a loan (emi_id -> row)."""
     c = get_cur()
     c.execute("SELECT * FROM Penalties WHERE loan_id=? AND status!='Rejected' ORDER BY penalty_id ASC", (loan_id,))
     return {r["emi_id"]: dict(r) for r in c.fetchall()}
+
+# ── Loan closing: admin approval -> penalty collection -> key/document return -> acknowledgement ──
+CLOSURE_ITEM_INFO = {"key": ("🔑", "Key returned"), "rc": ("📄", "RC returned"),
+                     "docs": ("🗂️", "Proof & Documents returned"), "noc": ("✅", "NOC provided")}
+CLOSURE_ITEM_ORDER = ["key", "rc", "docs", "noc"]
+CLOSURE_STAGE_TEXT = {"AwaitApproval": "Waiting for admin approval",
+                      "Penalty": "Penalty to be collected (within a day)",
+                      "Return": "Return of key & documents",
+                      "AckPending": "Waiting for acknowledgement",
+                      "Closed": "Closed"}
+
+def closure_required_items(loan):
+    """Items to hand back, vehicle by vehicle: what was collected for that vehicle at the start, plus its NOC.
+    Returns dicts {item, vehicle_id, vtag, vseq}; vtag is empty when the loan has a single vehicle."""
+    vs = loan_vehicles(loan)
+    multi = len(vs) > 1
+    items = []
+    for v in vs:
+        tag = vehicle_tag(v) if multi else ""
+        wanted = [k for k, flag in (("key", "key_received"), ("rc", "rc_received"), ("docs", "docs_received"))
+                  if v.get(flag) == "yes"] + ["noc"]
+        for k in wanted:
+            items.append({"item": k, "vehicle_id": v["vehicle_id"], "vtag": tag, "vseq": v.get("seq") or 1})
+    return items
+
+def closure_item_title(i):
+    """'🔑 Key returned' (plus '— Activa · TN01AB1234' when the loan has several vehicles)."""
+    icon, label = CLOSURE_ITEM_INFO[i["item"]]
+    tag = (f' <span style="color:var(--muted);font-weight:500;">— {html.escape(i["vtag"])}</span>' if i.get("vtag") else "")
+    return f"{icon} {label}{tag}"
+
+def get_closure(loan_id):
+    c = get_cur()
+    c.execute("SELECT * FROM LoanClosure WHERE loan_id=? ORDER BY closure_id DESC LIMIT 1", (loan_id,))
+    r = c.fetchone()
+    return dict(r) if r else None
+
+def get_open_closure(loan_id):
+    cl = get_closure(loan_id)
+    return cl if cl and cl["status"] != "Closed" else None
+
+def closure_items(closure_id):
+    c = get_cur()
+    c.execute("SELECT * FROM ClosureItems WHERE closure_id=?", (closure_id,))
+    rows = [dict(r) for r in c.fetchall()]
+    if rows:
+        c.execute("SELECT * FROM LoanEntry WHERE id=?", (rows[0]["loan_id"],))
+        loan = c.fetchone()
+        vs = loan_vehicles(dict(loan)) if loan else []
+        info = {v["vehicle_id"]: (v.get("seq") or 1, vehicle_tag(v) if len(vs) > 1 else "") for v in vs}
+        for r in rows:
+            r["vseq"], r["vtag"] = info.get(r.get("vehicle_id"), (99, ""))
+    return sorted(rows, key=lambda r: (r.get("vseq", 1),
+                                       CLOSURE_ITEM_ORDER.index(r["item"]) if r["item"] in CLOSURE_ITEM_ORDER else 99))
+
+def start_closure(loan_id, kind="Regular"):
+    """Opens the closing process. Regular closures start with admin approval; a pre-closure was already
+    approved, so it goes straight to the key / document return."""
+    existing = get_open_closure(loan_id)
+    if existing: return existing["closure_id"]
+    c = get_cur(); c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
+    loan = c.fetchone()
+    if not loan: raise ValueError("Loan not found")
+    loan = dict(loan)
+    stage = "AwaitApproval" if kind == "Regular" else "Return"
+    c.execute("INSERT INTO LoanClosure (loan_id,kind,status,created_at) VALUES (?,?,?,?)",
+              (loan_id, kind, stage, datetime.now(timezone.utc).isoformat()))
+    cid = c.lastrowid
+    for it in closure_required_items(loan):
+        c.execute("INSERT INTO ClosureItems (closure_id,loan_id,item,status,vehicle_id) VALUES (?,?,?,?,?)",
+                  (cid, loan_id, it["item"], "Pending", it["vehicle_id"]))
+    get_db().commit()
+    return cid
+
+def closure_advance(loan_id):
+    """Penalty stage -> return stage once every penalty of the loan is collected / waived."""
+    cl = get_open_closure(loan_id)
+    if not cl or cl["status"] != "Penalty": return
+    c = get_cur()
+    c.execute("SELECT COUNT(*) as n FROM Penalties WHERE loan_id=? AND status IN ('Pending','Approved')", (loan_id,))
+    if c.fetchone()["n"] == 0:
+        c.execute("UPDATE LoanClosure SET status='Return' WHERE closure_id=?", (cl["closure_id"],))
+        get_db().commit()
+
+def approve_closure(closure_id, rates, username):
+    """Admin approval of the closing. `rates` maps penalty_id -> final per-day rate for penalties still pending."""
+    c = get_cur(); c.execute("SELECT * FROM LoanClosure WHERE closure_id=?", (closure_id,))
+    cl = c.fetchone()
+    if not cl or cl["status"] != "AwaitApproval": raise ValueError("This closing request is not waiting for approval.")
+    c.execute("SELECT * FROM Penalties WHERE loan_id=? AND status='Pending' ORDER BY penalty_id", (cl["loan_id"],))
+    pend = [dict(r) for r in c.fetchall()]
+    chosen = {}
+    for p in pend:   # validate everything before changing anything
+        raw = rates.get(p["penalty_id"])
+        try: val = float(raw) if raw not in (None, "") else float(p["requested_rate"])
+        except (TypeError, ValueError): raise ValueError("Enter a valid per-day penalty amount.")
+        if val < 0: raise ValueError("Penalty per day cannot be negative.")
+        chosen[p["penalty_id"]] = val
+    for p in pend:
+        approve_penalty(p["penalty_id"], chosen[p["penalty_id"]], username)
+    c = get_cur()
+    c.execute("UPDATE LoanClosure SET status='Penalty', approved_by=?, approved_at=? WHERE closure_id=?",
+              (username, datetime.now(timezone.utc).isoformat(), closure_id))
+    get_db().commit()
+    closure_advance(cl["loan_id"])
+
+def record_closure_item(item_id, returned_on, handed_by, note, username):
+    c = get_cur()
+    c.execute("""SELECT i.*, cl.status as cstatus FROM ClosureItems i JOIN LoanClosure cl ON cl.closure_id=i.closure_id
+                 WHERE i.item_id=?""", (item_id,))
+    it = c.fetchone()
+    if not it: raise ValueError("Item not found.")
+    if it["cstatus"] != "Return": raise ValueError("Key and documents can be recorded only in the return step.")
+    if not (handed_by or "").strip(): raise ValueError("Enter who handed it over.")
+    try: d = datetime.strptime((returned_on or "").strip(), "%Y-%m-%d").date()
+    except ValueError: raise ValueError("Enter a valid date.")
+    if d > date.today(): raise ValueError("Date cannot be in the future.")
+    c.execute("""UPDATE ClosureItems SET status='Returned', returned_on=?, handed_by=?, note=?, recorded_by=?, recorded_at=?
+                 WHERE item_id=?""", (d.isoformat(), handed_by.strip(), (note or "").strip(), username,
+                                      datetime.now(timezone.utc).isoformat(), item_id))
+    get_db().commit()
+
+def request_closure_ack(closure_id, username):
+    c = get_cur(); c.execute("SELECT * FROM LoanClosure WHERE closure_id=?", (closure_id,))
+    cl = c.fetchone()
+    if not cl or cl["status"] != "Return": raise ValueError("The closing is not in the return step.")
+    if any(i["status"] != "Returned" for i in closure_items(closure_id)):
+        raise ValueError("Record every item as returned before sending for acknowledgement.")
+    c.execute("""UPDATE LoanClosure SET status='AckPending', ack_requested_by=?, ack_requested_at=?, ack_note=NULL
+                 WHERE closure_id=?""", (username, datetime.now(timezone.utc).isoformat(), closure_id))
+    get_db().commit()
+
+def finalize_closure(closure_id, username):
+    c = get_cur(); c.execute("SELECT * FROM LoanClosure WHERE closure_id=?", (closure_id,))
+    cl = dict(c.fetchone()); lid = cl["loan_id"]
+    now = datetime.now(timezone.utc).isoformat()
+    c.execute("UPDATE LoanClosure SET status='Closed', acked_by=?, acked_at=?, closed_at=? WHERE closure_id=?",
+              (username, now, now, closure_id))
+    c.execute("UPDATE LoanEntry SET status='Closed' WHERE id=?", (lid,))
+    c.execute("UPDATE Customers SET status='Closed' WHERE loan_id=?", (lid,))
+    c.execute("INSERT OR REPLACE INTO ClosedLoans (loan_id,closure_date,created_at) VALUES (?,?,?)",
+              (lid, date.today().isoformat(), now))
+    c.execute("""UPDATE FollowUp SET status='Resolved', resolved_at=?
+                 WHERE loan_id=? AND status='Pending' AND COALESCE(category,'Loans')='Loans'""", (now, lid))
+    get_db().commit()
+    if cl["kind"] == "Regular": _notify_closure(lid)
+
+def acknowledge_closure(closure_id, username):
+    c = get_cur(); c.execute("SELECT * FROM LoanClosure WHERE closure_id=?", (closure_id,))
+    cl = c.fetchone()
+    if not cl or cl["status"] != "AckPending": raise ValueError("This closing is not waiting for acknowledgement.")
+    recorders = {i["recorded_by"] for i in closure_items(closure_id)} | {cl["ack_requested_by"]}
+    if username in recorders: raise ValueError("You recorded this hand-over, so someone else must acknowledge it.")
+    finalize_closure(closure_id, username)
+
+def reject_closure_ack(closure_id, reason, username):
+    c = get_cur(); c.execute("SELECT status FROM LoanClosure WHERE closure_id=?", (closure_id,))
+    cl = c.fetchone()
+    if not cl or cl["status"] != "AckPending": raise ValueError("This closing is not waiting for acknowledgement.")
+    c.execute("UPDATE LoanClosure SET status='Return', ack_note=? WHERE closure_id=?",
+              (f"Not acknowledged by {username}: {(reason or '').strip() or 'no reason given'}", closure_id))
+    get_db().commit()
 
 # ── Query helpers ──────────────────────────────────────────────────────────────
 def list_pending_loans(search=""):
@@ -1234,6 +1756,7 @@ def list_all_loans(search=""):
 def list_customers(search=""):
     q=f"%{search}%"; c=get_cur()
     c.execute("""SELECT cu.*, le.loan_number, le.customer_name, le.customer_mobile, le.customer_extra_numbers,
+                        le.vehicle_name, le.vehicle_model, le.vehicle_number, le.vehicle_colour,
                         le.guarantor_name, le.guarantor_mobile, le.guarantor_extra_numbers
                  FROM Customers cu
                  LEFT JOIN LoanEntry le ON le.id = cu.loan_id
@@ -1355,7 +1878,8 @@ def format_bill_ref(installment_no, payments, is_paid):
 
 def list_closed_loans(search=""):
     q=f"%{search}%"; c=get_cur()
-    c.execute("""SELECT le.id as loan_id,le.loan_number,le.customer_name,le.vehicle_type,le.loan_amount,cl.closure_date
+    c.execute("""SELECT le.id as loan_id,le.loan_number,le.customer_name,le.vehicle_type,le.vehicle_name,le.vehicle_model,
+                        le.vehicle_number,le.vehicle_colour,le.loan_amount,cl.closure_date
                  FROM LoanEntry le JOIN ClosedLoans cl ON cl.loan_id=le.id
                  WHERE le.loan_number LIKE ? OR le.customer_name LIKE ? ORDER BY cl.created_at DESC""",(q,q))
     rows = [dict(r) for r in c.fetchall()]
@@ -1365,6 +1889,9 @@ def list_closed_loans(search=""):
                       WHERE loan_id=? AND status='Completed' ORDER BY preclose_id DESC LIMIT 1""", (r["loan_id"],))
         pc = c2.fetchone()
         r["preclosure"] = dict(pc) if pc else None
+        cl = get_closure(r["loan_id"])
+        r["closure"] = cl if cl and cl["status"] == "Closed" else None
+        r["closure_items"] = closure_items(cl["closure_id"]) if r["closure"] else []
     return rows
 
 def list_rejected_loans(search=""):
@@ -1449,12 +1976,18 @@ def resolve_follow_up(followup_id):
     c.execute("UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE followup_id=?", (now, followup_id))
     if row and row["item"] in FU_ITEM_COLUMNS:
         col, col_date = FU_ITEM_COLUMNS[row["item"]]
-        c.execute(f"UPDATE LoanEntry SET {col}='yes', {col_date}=? WHERE id=?",
-                  (date.today().isoformat(), row["loan_id"]))
+        if row["ref_id"]:       # an add-on vehicle's key / RC / proof
+            c.execute(f"UPDATE LoanVehicles SET {col}='yes', {col_date}=? WHERE vehicle_id=?",
+                      (date.today().isoformat(), row["ref_id"]))
+        else:
+            c.execute(f"UPDATE LoanEntry SET {col}='yes', {col_date}=? WHERE id=?",
+                      (date.today().isoformat(), row["loan_id"]))
     if row and row["item"] == "penalty" and row["ref_id"]:
         c.execute("UPDATE Penalties SET status='Collected', collected_at=? WHERE penalty_id=? AND status='Approved'",
                   (now, row["ref_id"]))
     get_db().commit()
+    if row and row["item"] == "penalty":
+        closure_advance(row["loan_id"])     # last penalty collected -> key / document return unlocks
 
 def request_followup_ack(followup_id, username, note=""):
     """A follow-up is not closed directly: it goes to the acknowledger for a cross-check first."""
@@ -1507,7 +2040,8 @@ def list_follow_ups(search="", category=""):
                         f.created_by, f.created_at, f.resolved_at,
                         COALESCE(f.category,'Loans') as category, f.item, f.ref_id,
                         f.ack_requested_by, f.ack_requested_at, f.ack_note,
-                        le.loan_number, le.vehicle_type, le.customer_name, le.customer_mobile, le.customer_extra_numbers,
+                        le.loan_number, le.vehicle_type, le.vehicle_name, le.vehicle_model, le.vehicle_number, le.vehicle_colour,
+                        le.customer_name, le.customer_mobile, le.customer_extra_numbers,
                         le.guarantor_name, le.guarantor_mobile, le.guarantor_extra_numbers,
                         le.customer_address, le.customer_permanent_address, le.customer_location, le.guarantor_location
                  FROM FollowUp f JOIN LoanEntry le ON f.loan_id=le.id
@@ -1519,6 +2053,13 @@ def list_follow_ups(search="", category=""):
     sql += " ORDER BY f.follow_up_date ASC"
     c.execute(sql, tuple(params))
     rows = [dict(r) for r in c.fetchall()]
+    xv_by_id = {v["vehicle_id"]: v for lst in _xv_cache("_xv_vehicles", "LoanVehicles").values() for v in lst}
+    for r in rows:      # key / RC / proof follow-ups of an add-on vehicle show THAT vehicle
+        v = xv_by_id.get(r.get("ref_id")) if r["item"] in FU_ITEM_COLUMNS else None
+        if v:
+            for k in ("vehicle_type", "vehicle_name", "vehicle_model", "vehicle_number", "vehicle_colour"):
+                r[k] = v.get(k)
+            r["_vehicle_scoped"] = True
     today_s = date.today().isoformat()
     per_loan = {}
     for r in rows:
@@ -1835,7 +2376,7 @@ def generate_followup_pdf(path, items):
         else: status = "Pending"
         data.append([
             r["loan_number"], r.get("customer_name") or "", r.get("customer_mobile") or "",
-            r.get("vehicle_type") or "", (r.get("customer_address") or "")[:36], fmt_date(r["follow_up_date"]), status,
+            vehicle_label(r), (r.get("customer_address") or "")[:36], fmt_date(r["follow_up_date"]), status,
             f"Rs {r['overdue_amount']:,.2f}", f"Rs {r['outstanding']:,.2f}", (r.get("remarks") or "")[:50], r.get("created_by") or ""
         ])
     tbl = Table(data, repeatRows=1,
@@ -2250,7 +2791,7 @@ def _nav_links(role, active):
     if ROLES.get(role,{}).get("can_pay", False): links += lnk("/billing","🧾","Billing","billing")
     if ROLES.get(role,{}).get("can_ack", False):
         try:
-            n_p, n_f = ack_counts(); n_ack = n_p + n_f
+            n_p, n_f, n_k = ack_counts(); n_ack = n_p + n_f + n_k
         except Exception:
             n_ack = 0
         links += lnk("/acknowledgements","🔎",f"Acknowledgements" + (f' <span style="background:#dc2626;color:#fff;border-radius:999px;padding:1px 7px;font-size:11px;margin-left:4px;">{n_ack}</span>' if n_ack else ""),"ack")
@@ -2615,15 +3156,19 @@ def waiting_items_html():
     role = session.get("role", "")
     bits = []
     if role in ACK_ROLES:
-        n_p, n_f = ack_counts()
-        if n_p or n_f:
-            bits.append(f'<a href="/acknowledgements" style="color:inherit;"><b>{n_p}</b> payment(s) and <b>{n_f}</b> follow-up(s) '
-                        f'awaiting acknowledgement →</a>')
+        n_p, n_f, n_k = ack_counts()
+        if n_p or n_f or n_k:
+            bits.append(f'<a href="/acknowledgements" style="color:inherit;"><b>{n_p}</b> payment(s), <b>{n_f}</b> follow-up(s) and '
+                        f'<b>{n_k}</b> loan closing hand-over(s) awaiting acknowledgement →</a>')
     if role in DIRECT_ROLES:
         c = get_cur(); c.execute("SELECT COUNT(*) as n FROM Penalties WHERE status='Pending'")
         n_pen = c.fetchone()["n"]
         if n_pen:
             bits.append(f'<a href="/approval" style="color:inherit;"><b>{n_pen}</b> late-payment penalty(ies) awaiting your approval →</a>')
+        c.execute("SELECT COUNT(*) as n FROM LoanClosure WHERE status='AwaitApproval'")
+        n_cl = c.fetchone()["n"]
+        if n_cl:
+            bits.append(f'<a href="/approval" style="color:inherit;"><b>{n_cl}</b> loan closing(s) awaiting your approval →</a>')
     if not bits: return ""
     return ('<div style="background:#eff6ff;border:1px solid #93c5fd;border-left:6px solid #1d6fdb;border-radius:12px;'
             'padding:10px 14px;margin-bottom:12px;font-size:13.5px;">🔔 ' + " &nbsp;|&nbsp; ".join(bits) + '</div>')
@@ -2844,7 +3389,7 @@ def loans():
         sc = {"PendingApproval":"pending","Approved":"approved","Rejected":"rejected","Closed":"closed"}.get(l["status"],"pending")
         rows += f"""<tr>
           <td><b>{l['loan_number']}</b></td><td>{l['customer_name']}</td>
-          <td>{l.get('customer_mobile','')}</td><td>{l['vehicle_type']}</td>
+          <td>{l.get('customer_mobile','')}</td><td>{vehicle_html(l)}</td>
           <td>₹{l['loan_amount']:,.2f}</td><td>{l['interest_rate']*100:.1f}%</td>
           <td>{l['tenure']}m</td>
           <td><span class="badge badge-{sc}">{l['status']}</span></td>
@@ -2859,7 +3404,7 @@ def loans():
     </form>
     <div class="card"><div class="table-wrap">
       <table>
-        <tr><th>Loan #</th><th>Customer</th><th>Mobile</th><th>Type</th>
+        <tr><th>Loan #</th><th>Customer</th><th>Mobile</th><th>Vehicle</th>
             <th>Amount</th><th>Rate</th><th>Tenure</th><th>Status</th><th>EMIs</th></tr>
         {rows or '<tr><td colspan="9" style="text-align:center;color:var(--muted);">No loans found</td></tr>'}
       </table>
@@ -2897,6 +3442,12 @@ def add_loan():
                 if not f.get(field,"").strip():
                     flash(f"{label} is mandatory for a reloan.","danger")
                     return redirect(url_for("add_loan"))
+        try:
+            extra_vehicles = parse_extra_vehicles(f, is_reloan_flag)
+            extra_guarantors = parse_extra_guarantors(f)
+        except ValueError as e:
+            flash(str(e),"danger")
+            return redirect(url_for("add_loan"))
         current_addr = f.get("customer_address","").strip()
         if not current_addr:
             flash("Current address is mandatory.","danger")
@@ -3024,6 +3575,8 @@ def add_loan():
             record_handover_details(new_loan_id, loan_date_val, field_visit, field_visit_date,
                                     field_visit_remark, handover, session.get("username",""),
                                     field_visited_by)
+            save_extra_vehicles(new_loan_id, extra_vehicles, loan_date_val, session.get("username",""))
+            save_extra_guarantors(new_loan_id, extra_guarantors)
             flash("Loan submitted for approval.","success")
             return redirect(url_for("loans"))
         except Exception as e:
@@ -3034,8 +3587,10 @@ def add_loan():
 
     try: next_ln = next_loan_number()
     except: next_ln = f"LN-{datetime.now().year}-01"
+    xv_area, xg_area = extra_blocks_section()
 
     content = f"""
+    {_EXTRA_BLOCKS_JS}
     <h1>➕ New Loan Application</h1>
     <div class="card">
     <form method="POST" id="loanForm" enctype="multipart/form-data">
@@ -3223,6 +3778,7 @@ def add_loan():
           </div>
           <small id="g_gps_status" style="color:var(--muted);font-size:11px;margin-top:2px;"></small>
         </div>
+        {xg_area}
 
         <div class="section-title">🚗 Vehicle Details <span id="vehicle_mandatory_note">(optional unless Reloan = Yes)</span></div>
         <div class="form-group">
@@ -3270,6 +3826,10 @@ def add_loan():
             <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option>
           </select>
         </div>
+        <div class="form-group full" style="font-size:12px;color:var(--muted);">
+          🚗 Giving two or three vehicles under this one loan number? Add each extra vehicle below &mdash; every vehicle has its own key / RC / proof status.
+        </div>
+        {xv_area}
 
         <div class="section-title">📎 Documents & Remarks</div>
         <div class="form-group">
@@ -3718,7 +4278,7 @@ def approval():
             <div>
               <b style="font-size:15px;color:var(--accent);">{l['loan_number']}</b> — {l['customer_name']}
               <div style="font-size:12px;color:var(--muted);margin-top:2px;">
-                📱 {l.get('customer_mobile','')} &nbsp;|&nbsp; 🚗 {l['vehicle_type']} &nbsp;|&nbsp; 📅 Start: {fmt_date(l['start_date'])}
+                📱 {l.get('customer_mobile','')} &nbsp;|&nbsp; 🚗 {html.escape(vehicle_label_more(l))} &nbsp;|&nbsp; 📅 Start: {fmt_date(l['start_date'])}
               </div>
             </div>
             <div style="text-align:right;">
@@ -3761,7 +4321,8 @@ def approval():
         </div>"""
 
     c = get_cur()
-    c.execute("""SELECT p.*, le.loan_number, le.customer_name, le.customer_mobile, le.vehicle_type, le.loan_amount,
+    c.execute("""SELECT p.*, le.loan_number, le.customer_name, le.customer_mobile, le.vehicle_type, le.vehicle_name,
+                        le.vehicle_model, le.vehicle_number, le.vehicle_colour, le.loan_amount,
                         le.tenure, le.loan_date, le.start_date
                  FROM PreClosure p JOIN LoanEntry le ON le.id=p.loan_id
                  WHERE p.status='Pending' ORDER BY p.preclose_id ASC""")
@@ -3777,7 +4338,7 @@ def approval():
             <div>
               <b style="font-size:15px;color:var(--accent);">{html.escape(p['loan_number'])}</b> — {html.escape(p['customer_name'] or '')}
               <div style="font-size:12px;color:var(--muted);margin-top:2px;">
-                📱 {html.escape(p.get('customer_mobile') or '')} &nbsp;|&nbsp; 🚗 {html.escape(p.get('vehicle_type') or '')}
+                📱 {html.escape(p.get('customer_mobile') or '')} &nbsp;|&nbsp; 🚗 {html.escape(vehicle_label_more(p))}
                 &nbsp;|&nbsp; Requested by <b>{html.escape(p.get('requested_by') or '')}</b> on {fmt_date((p.get('requested_at') or '')[:10])}
               </div>
             </div>
@@ -3853,9 +4414,53 @@ def approval():
             <button type="submit" class="btn btn-danger btn-sm">❌ Reject</button>
           </form>
         </div>"""
+    c = get_cur()
+    c.execute("""SELECT cl.*, le.loan_number, le.customer_name, le.customer_mobile
+                 FROM LoanClosure cl JOIN LoanEntry le ON le.id=cl.loan_id
+                 WHERE cl.status='AwaitApproval' ORDER BY cl.closure_id ASC""")
+    cl_rows = [dict(r) for r in c.fetchall()]
+    cl_cards = ""
+    for k in cl_rows:
+        c.execute("""SELECT pn.*, e.due_date FROM Penalties pn JOIN EMI e ON e.emi_id=pn.emi_id
+                     WHERE pn.loan_id=? AND pn.status!='Rejected' ORDER BY pn.installment_no""", (k["loan_id"],))
+        kp = [dict(r) for r in c.fetchall()]
+        pen_lines = ""
+        for p in kp:
+            if p["status"] == "Pending":
+                pen_lines += (f'<tr><td>{ordinal_due(p["installment_no"])}</td><td>{fmt_date(p["due_date"])}</td>'
+                              f'<td><b style="color:var(--red);">{int(p["days"])} days</b></td>'
+                              f'<td><input type="number" name="rate_{p["penalty_id"]}" class="cl-rate" data-days="{int(p["days"])}" '
+                              f'value="{float(p["requested_rate"]):.2f}" min="0" step="0.01" oninput="clPreview(this)" style="width:110px;font-size:12px;padding:5px 6px;"></td>'
+                              f'<td class="cl-line">—</td></tr>')
+            else:
+                amt = float(p["final_amount"] if p["final_amount"] is not None else p["requested_amount"] or 0)
+                pen_lines += (f'<tr><td>{ordinal_due(p["installment_no"])}</td><td>{fmt_date(p["due_date"])}</td>'
+                              f'<td><b>{int(p["days"])} days</b></td><td>{fmt_inr(p["final_rate"] or 0)}/day (already {p["status"].lower()})</td>'
+                              f'<td class="cl-fixed" data-amt="{amt}">{fmt_inr(amt)}</td></tr>')
+        pen_table = (f'<div class="table-wrap"><table><tr><th>Installment</th><th>Due</th><th>Delay (fixed)</th><th>Penalty per day (₹)</th><th>Penalty</th></tr>{pen_lines}</table></div>'
+                     if kp else '<div style="font-size:13px;color:var(--green);">No late-payment penalty on this loan.</div>')
+        items_txt = " · ".join(closure_item_title(i) for i in closure_items(k["closure_id"]))
+        cl_cards += f"""
+        <div class="card cl-card">
+          <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
+            <div>
+              <b style="font-size:15px;color:var(--accent);">{html.escape(k['loan_number'])}</b> — {html.escape(k['customer_name'] or '')}
+              <div style="font-size:12px;color:var(--muted);margin-top:2px;">All EMIs are paid · closing request raised {fmt_date((k.get('created_at') or '')[:10])}</div>
+            </div>
+            <a class="btn btn-sm btn-primary" href="/emis/{k['loan_id']}">View EMIs</a>
+          </div>
+          <form method="POST" action="/closure/approve/{k['closure_id']}">
+            {pen_table}
+            <div class="cl-note" style="margin:8px 0;font-size:14px;font-weight:700;"></div>
+            <div style="font-size:12px;color:var(--muted);margin-bottom:8px;">After approval: any penalty must be collected within a day, then to be handed back: {items_txt}. An Associate Manager acknowledges the hand-over before the loan closes.</div>
+            <button type="submit" class="btn btn-success btn-sm">✅ Approve closing</button>
+          </form>
+        </div>"""
     parts = ""
+    if cl_rows:
+        parts += f'<h2 style="margin:6px 0 10px;">🔒 Loan Closing Requests ({len(cl_rows)})</h2>{cl_cards}'
     if pen_rows:
-        parts += f'<h2 style="margin:6px 0 10px;">💰 Late Payment Penalties ({len(pen_rows)})</h2>{pen_cards}'
+        parts += f'<h2 style="margin:18px 0 10px;">💰 Late Payment Penalties ({len(pen_rows)})</h2>{pen_cards}'
     if pc_rows:
         parts += f'<h2 style="margin:18px 0 10px;">⏩ Pre-closure Requests ({len(pc_rows)})</h2>{pc_cards}'
     pc_section = (parts + '<h2 style="margin:18px 0 10px;">🆕 New Loan Applications</h2>') if parts else ""
@@ -3888,6 +4493,21 @@ def approval():
         + (amt>0 ? '' : ' <span style="color:var(--muted);">(waived)</span>');
     }}
     window.addEventListener('DOMContentLoaded',function(){{ document.querySelectorAll('.pen-rate').forEach(penPreview); }});
+    function clPreview(input){{
+      const card = input.closest('.cl-card');
+      let total = 0;
+      card.querySelectorAll('.cl-rate').forEach(function(r){{
+        const amt = Math.round(parseInt(r.dataset.days)*(parseFloat(r.value)||0)*100)/100;
+        r.closest('tr').querySelector('.cl-line').textContent = fmtINR(amt);
+        total += amt;
+      }});
+      card.querySelectorAll('.cl-fixed').forEach(function(f){{ total += parseFloat(f.dataset.amt)||0; }});
+      card.querySelector('.cl-note').innerHTML = total>0 ? 'Total penalty to collect: <span style="color:var(--red);">'+fmtINR(total)+'</span>' : 'No penalty to collect';
+    }}
+    window.addEventListener('DOMContentLoaded',function(){{ document.querySelectorAll('.cl-card').forEach(function(card){{
+      const first = card.querySelector('.cl-rate'); if(first) clPreview(first); else card.querySelector('.cl-note').innerHTML='';
+      if(!first){{ let t=0; card.querySelectorAll('.cl-fixed').forEach(function(f){{ t+=parseFloat(f.dataset.amt)||0; }}); card.querySelector('.cl-note').innerHTML = t>0?'Total penalty: <span style="color:var(--red);">'+fmtINR(t)+'</span>':''; }}
+    }}); }});
     function fmtINR(v){{return '₹'+v.toLocaleString('en-IN',{{minimumFractionDigits:2,maximumFractionDigits:2}});}}
     function previewSchedule(input){{
       const card = input.closest('.card');
@@ -3935,7 +4555,7 @@ def customers():
         edit_btn = f'<a class="btn btn-sm btn-amber" href="/customer/edit/{lid}">&#9998; Edit</a>' if can_edit else ""
         loan_no = c.get('loan_number') or '—'
         rows += f"""<tr>
-          <td><b style="color:var(--accent);">{loan_no}</b> — {c['name']}</td><td>{c['vehicle_type']}</td>
+          <td><b style="color:var(--accent);">{loan_no}</b> — {c['name']}</td><td>{vehicle_html(c)}</td>
           <td>{customer_numbers_html(c)}</td><td>{guarantor_numbers_html(c)}</td>
           <td>₹{c['loan_amount']:,.2f}</td><td><b>₹{c['emi_amount']:,.2f}</b></td>
           <td><span class="badge badge-{sc}">{c['status']}</span></td>
@@ -3974,11 +4594,13 @@ def customer_edit(loan_id):
         try:
             customer_extra = parse_extra_numbers_form(f, "customer", "Customer")
             guarantor_extra = parse_extra_numbers_form(f, "guarantor", "Guarantor")
+            xv_rows = parse_extra_vehicles(f, bool(loan.get("is_reloan")))
+            xg_rows = parse_extra_guarantors(f)
             c.execute("""UPDATE LoanEntry SET customer_extra_numbers=?, guarantor_extra_numbers=? WHERE id=?""",
                       (customer_extra or None, guarantor_extra or None, loan_id))
             c.execute("""UPDATE LoanEntry SET
                 customer_name=?, customer_mobile=?, customer_address=?, customer_permanent_address=?, customer_location=?,
-                customer_email=?, vehicle_type=?, vehicle_number=?, vehicle_model=?,
+                customer_email=?, vehicle_type=?, vehicle_number=?, vehicle_name=?, vehicle_model=?,
                 engine_number=?, chassis_number=?, vehicle_colour=?,
                 guarantor_name=?, guarantor_address=?, guarantor_mobile=?, guarantor_location=?,
                 loan_amount=?, interest_rate=?, tenure=?, start_date=?, remarks=?
@@ -3991,6 +4613,7 @@ def customer_edit(loan_id):
                  f.get("customer_email","").strip(),
                  f.get("vehicle_type","").strip(),
                  f.get("vehicle_number","").strip(),
+                 f.get("vehicle_name","").strip(),
                  f.get("vehicle_model","").strip(),
                  f.get("engine_number","").strip(),
                  f.get("chassis_number","").strip(),
@@ -4014,6 +4637,8 @@ def customer_edit(loan_id):
             c.execute("UPDATE Customers SET name=?,vehicle_type=?,loan_amount=?,emi_amount=? WHERE loan_id=?",
                       (f.get("customer_name","").strip(), f.get("vehicle_type","").strip(), new_amt, emi_amt, loan_id))
             get_db().commit()
+            save_extra_vehicles(loan_id, xv_rows, date.today(), session.get("username",""))
+            save_extra_guarantors(loan_id, xg_rows)
             flash("Customer / Loan details updated successfully!", "success")
             return redirect(url_for("customers"))
         except Exception as e:
@@ -4021,8 +4646,10 @@ def customer_edit(loan_id):
 
     # Display rate as percentage
     rate_display = round(float(loan.get("interest_rate",0))*100, 4)
+    xv_area, xg_area = extra_blocks_section(loan_id)
 
     content = f"""
+    {_EXTRA_BLOCKS_JS}
     <h1>✏️ Edit Customer — {loan.get('loan_number','')}</h1>
     <div class="alert alert-warning">⚠️ <b>Super Admin Edit:</b> Changes here directly update the database. Proceed with care.</div>
     <div class="card">
@@ -4095,6 +4722,10 @@ def customer_edit(loan_id):
           <input name="vehicle_number" value="{loan.get('vehicle_number','')}">
         </div>
         <div class="form-group">
+          <label>Vehicle Name</label>
+          <input name="vehicle_name" value="{html.escape(loan.get('vehicle_name') or '')}">
+        </div>
+        <div class="form-group">
           <label>Vehicle Model</label>
           <input name="vehicle_model" value="{loan.get('vehicle_model','')}">
         </div>
@@ -4110,6 +4741,8 @@ def customer_edit(loan_id):
           <label>Vehicle Colour</label>
           <input name="vehicle_colour" value="{loan.get('vehicle_colour','')}">
         </div>
+        <div class="form-group full" style="font-size:12.5px;">🚗 Vehicle 1 &mdash; {handover_status_html(loan)}</div>
+        {xv_area}
 
         <div class="section-title">🛡️ Guarantor Details</div>
         <div class="form-group">
@@ -4130,6 +4763,7 @@ def customer_edit(loan_id):
           <label>Guarantor GPS Location</label>
           <input name="guarantor_location" value="{loan.get('guarantor_location') or ''}">
         </div>
+        {xg_area}
 
         <div class="section-title">📝 Remarks</div>
         <div class="form-group full">
@@ -4143,6 +4777,71 @@ def customer_edit(loan_id):
     </form>
     </div>"""
     return page("Edit Customer", content, "customers")
+
+def closing_section_html(loan, can_pay, penalties, today):
+    """Rows at the end of the EMI table: closing banner, penalty summary, and one row per item to hand back
+    (key / RC / proof & documents if collected, plus NOC)."""
+    lid = loan["id"]
+    cl = get_closure(lid)
+    stage = cl["status"] if cl else None
+    items = closure_items(cl["closure_id"]) if cl else \
+        [{**k, "status": "Pending", "item_id": None} for k in closure_required_items(loan)]
+    msg = {None: "Closing checklist — starts when the last EMI is paid: admin approval → penalty collection (within a day) → "
+                 "return of key &amp; documents → acknowledgement → loan closes.",
+           "AwaitApproval": "⏳ Waiting for admin approval of the closing (the admin reviews the delay days and penalty).",
+           "Penalty": "⏳ Penalty must be collected within a day. The key &amp; document return starts after it is collected.",
+           "Return": "📝 Record each item as returned, then send it for acknowledgement.",
+           "AckPending": "⏳ Waiting for acknowledgement by an Associate Manager / admin.",
+           "Closed": f"✅ Loan closed on {fmt_date((cl or {}).get('closed_at'))}."}[stage]
+    if cl and cl["kind"] == "PreClosure" and stage != "Closed":
+        msg = "⏩ Pre-closure bill paid. " + msg
+    note = (f'<div style="color:var(--red);font-weight:600;margin-top:4px;">{html.escape(cl["ack_note"])}</div>'
+            if cl and cl.get("ack_note") and stage == "Return" else "")
+    banner_bg = {"Closed": "#d1fae5", "Return": "#e0f2fe"}.get(stage, "#eef2ff")
+    out = (f'<tr id="closing"><td colspan="11" style="background:{banner_bg};padding:10px 12px;">'
+           f'<b>🔒 Loan closing</b> — {msg}{note}</td></tr>')
+    # penalty summary row
+    pens = list(penalties.values())
+    if pens:
+        days = sum(int(p["days"]) for p in pens)
+        total = sum(float(p["final_amount"] if p["status"] != "Pending" and p["final_amount"] is not None
+                          else (p["requested_amount"] or 0)) for p in pens)
+        counts = {}
+        for p in pens: counts[p["status"]] = counts.get(p["status"], 0) + 1
+        pen_txt = (f'<b style="color:#7c3aed;">{fmt_inr(total)}</b> — {days} delay day(s) over {len(pens)} installment(s) '
+                   f'({", ".join(str(n) + " " + k.lower() for k, n in counts.items())})')
+    else:
+        pen_txt = '<span style="color:var(--muted);">No penalty</span>'
+    out += f'<tr><td colspan="2"><b>💰 Penalty</b></td><td colspan="9">{pen_txt}</td></tr>'
+    # item rows
+    lock_txt = {None: "Not started — unlocks after the last EMI is paid, admin approval and penalty collection",
+                "AwaitApproval": "🔒 Unlocks after admin approval and penalty collection",
+                "Penalty": "🔒 Unlocks after the penalty is collected"}.get(stage, "")
+    for it in items:
+        returned = it.get("status") == "Returned"
+        parts = ""
+        if returned:
+            parts = (f'✅ Returned on <b>{fmt_date(it["returned_on"])}</b> · handed over by <b>{html.escape(it.get("handed_by") or "")}</b>'
+                     + (f' · {html.escape(it["note"])}' if it.get("note") else "")
+                     + f' <span style="color:var(--muted);font-size:11.5px;">(recorded by {html.escape(it.get("recorded_by") or "")})</span>')
+        if stage == "Return" and can_pay:
+            form = (f'<form method="POST" action="/closure/item/{it["item_id"]}" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:{4 if returned else 0}px;">'
+                    f'<input type="hidden" name="loan_id" value="{lid}">'
+                    f'<input type="date" name="returned_on" value="{it.get("returned_on") or today.isoformat()}" max="{today.isoformat()}" required style="width:135px;font-size:12px;padding:5px 6px;" title="Date returned">'
+                    f'<input name="handed_by" value="{html.escape(it.get("handed_by") or "")}" placeholder="Handed over by *" required style="width:150px;font-size:12px;padding:5px 6px;">'
+                    f'<input name="note" value="{html.escape(it.get("note") or "")}" placeholder="Note (optional)" style="width:150px;font-size:12px;padding:5px 6px;">'
+                    f'<button class="btn btn-success btn-sm">{"Update" if returned else "Mark returned"}</button></form>')
+            parts += form
+        elif not returned:
+            parts = f'<span style="color:var(--muted);">{lock_txt or "Not returned yet"}</span>'
+        out += f'<tr><td colspan="2"><b>{closure_item_title(it)}</b></td><td colspan="9">{parts}</td></tr>'
+    if stage == "Return" and can_pay:
+        all_done = all(i.get("status") == "Returned" for i in items)
+        out += (f'<tr><td colspan="11"><form method="POST" action="/closure/send_ack/{cl["closure_id"]}" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">'
+                f'<input type="hidden" name="loan_id" value="{lid}">'
+                f'<button class="btn btn-primary btn-sm" {"" if all_done else "disabled"}>📤 Send for acknowledgement</button>'
+                f'<span style="font-size:12px;color:var(--muted);">{"All items recorded." if all_done else "Record every item above first."}</span></form></td></tr>')
+    return out
 
 # ── EMIs ────────────────────────────────────────────────────────────────────────
 @app.route("/emis/<int:loan_id>")
@@ -4241,10 +4940,26 @@ def emis(loan_id):
     </div>"""
 
     guarantor_header = ""
-    g_nums = guarantor_numbers_html(loan)
+    g_nums = guarantor_numbers_html(loan, include_addon=False)
     if g_nums != "—":
         guarantor_header = (f"<div><b>Guarantor:</b> {html.escape(loan.get('guarantor_name') or '')} — "
                             f"{g_nums.replace('<br>', ' &nbsp;·&nbsp; ')}</div>")
+    for gx in extra_guarantors_of(loan):
+        guarantor_header += (f"<div><b>Guarantor {gx['seq']}:</b> {html.escape(gx.get('name') or '')} — "
+                             f"{contact_numbers_html(gx.get('mobile'), (gx.get('name') or 'Guarantor') + ' (Guarantor ' + str(gx['seq']) + ')', None, 'Guarantor')}"
+                             f"{(' · ' + html.escape(gx['address'])) if gx.get('address') else ''}"
+                             f"{(' · ' + _location_link(gx['location'])) if gx.get('location') else ''}</div>")
+    xvs = extra_vehicles_of(loan)
+    vehicle_extra_header = ""
+    if xvs:
+        vehicle_extra_header = (f'<div style="grid-column:1/-1;font-size:13px;line-height:1.8;">'
+                                f'<b>🚗 Vehicle 1:</b> {html.escape(vehicle_tag(loan))} &nbsp;<span style="font-size:12px;">{handover_status_html(loan)}</span>')
+        for v in xvs:
+            vehicle_extra_header += (f'<br><b>🚗 Vehicle {v["seq"]}:</b> {html.escape(vehicle_tag(v))}'
+                                     f'{(" · " + html.escape(v["vehicle_type"])) if v.get("vehicle_type") else ""}'
+                                     f'{(" · " + html.escape(v["vehicle_colour"])) if v.get("vehicle_colour") else ""}'
+                                     f' &nbsp;<span style="font-size:12px;">{handover_status_html(v)}</span>')
+        vehicle_extra_header += '</div>'
     preclose_box = ""
     if pc and pc["status"] == "Pending":
         preclose_box = (f'<span class="badge badge-pending" style="font-size:13px;padding:8px 12px;">'
@@ -4275,7 +4990,11 @@ def emis(loan_id):
         preclose_box = (f'<span class="badge badge-closed" style="font-size:13px;padding:8px 12px;">'
                         f'⏩ Pre-closed on {fmt_date(pc.get("paid_on"), "")} — settled ₹{float(pc["settlement_amount"] or 0):,.2f} '
                         f'(bill {html.escape(pc.get("bill_number") or "—")})</span>')
-    elif loan.get("status") == "Approved" and can_pay:
+    elif pc and pc["status"] == "Completed":
+        preclose_box = (f'<span class="badge badge-partial" style="font-size:13px;padding:8px 12px;">'
+                        f'⏩ Pre-closure bill paid on {fmt_date(pc.get("paid_on"), "")} (₹{float(pc["settlement_amount"] or 0):,.2f}) — '
+                        f'key &amp; document return is in progress below</span>')
+    elif loan.get("status") == "Approved" and can_pay and not get_open_closure(loan_id):
         rejected_note = ""
         if pc and pc["status"] == "Rejected":
             rejected_note = (f'<div style="font-size:12px;color:var(--red);margin-bottom:6px;text-align:right;">'
@@ -4284,6 +5003,7 @@ def emis(loan_id):
                         f'onsubmit="return confirm(\'Send a pre-closure request to the admin for approval?\')">'
                         f'<button class="btn btn-amber">⏩ Pre-Close Loan</button></form></div>')
     preclose_row = f'<div style="display:flex;justify-content:flex-end;margin-bottom:10px;">{preclose_box}</div>' if preclose_box else ""
+    closing_section = closing_section_html(loan, can_pay, penalty_by_emi, today) if loan.get("status") in ("Approved", "Closed") else ""
     content = f"""
     <h1>💳 EMI Schedule — {loan.get('loan_number','')}</h1>
     <div class="card" style="margin-bottom:12px;">
@@ -4292,8 +5012,9 @@ def emis(loan_id):
         <div><b>Customer:</b> {loan.get('customer_name','')}</div>
         <div><b>Mobile:</b> {customer_numbers_html(loan).replace("<br>", " &nbsp;·&nbsp; ")}</div>
         {guarantor_header}
-        <div><b>Vehicle:</b> {loan.get('vehicle_type','')} — {loan.get('vehicle_number','')}</div>
-        <div><b>Model:</b> {loan.get('vehicle_model','')}</div>
+        <div><b>Vehicle:</b> {html.escape(vehicle_label_more(loan))} — {loan.get('vehicle_number','')}</div>
+        <div><b>Type:</b> {html.escape(loan.get('vehicle_type') or '—')}{(' · ' + html.escape(loan['vehicle_colour'])) if loan.get('vehicle_colour') else ''}</div>
+        {vehicle_extra_header}
         <div><b>Loan Amount:</b> ₹{float(loan.get('loan_amount',0)):,.2f}</div>
         <div><b>Tenure:</b> {loan.get('tenure','')} months | <b>Status:</b> {loan.get('status','')}</div>
         <div style="grid-column:1/-1;background:#fef3c7;border-radius:6px;padding:10px;border-left:4px solid #d97706;">
@@ -4311,6 +5032,7 @@ def emis(loan_id):
         <tr><th>#</th><th>Due Date</th><th>EMI</th><th>Paid</th><th>Remaining</th>
             <th>Status</th><th>Bill No</th><th>Paid On</th><th>Payment Status</th><th>Late Payment Days</th><th>Action</th></tr>
         {rows or '<tr><td colspan="11" style="text-align:center;">No EMIs</td></tr>'}
+        {closing_section}
       </table></div>
     </div>
     <script>
@@ -4384,7 +5106,7 @@ def billing():
                 <div>
                   <b style="color:var(--accent);font-size:15px;">{html.escape(l['loan_number'])}</b> — {html.escape(l['customer_name'] or '')}
                   <div style="font-size:12px;color:var(--muted);margin:2px 0 6px;">
-                    🚗 {html.escape(l.get('vehicle_number') or '—')} &nbsp;|&nbsp; 📱 {customer_numbers_html(l).replace('<br>', ' · ')}
+                    🚗 {html.escape(vehicle_label_more(l))} · {html.escape(l.get('vehicle_number') or '—')} &nbsp;|&nbsp; 📱 {customer_numbers_html(l).replace('<br>', ' · ')}
                   </div>
                   <div style="font-size:13px;">Next EMI: {due_txt}</div>
                 </div>
@@ -4857,7 +5579,8 @@ def ack_counts():
     c = get_cur()
     c.execute("SELECT COUNT(*) as n FROM PendingPayments WHERE status='Pending'"); p = c.fetchone()["n"]
     c.execute("SELECT COUNT(*) as n FROM FollowUp WHERE status='AwaitingAck'"); f = c.fetchone()["n"]
-    return p, f
+    c.execute("SELECT COUNT(*) as n FROM LoanClosure WHERE status='AckPending'"); k = c.fetchone()["n"]
+    return p, f, k
 
 @app.route("/acknowledgements")
 @login_required
@@ -4920,6 +5643,35 @@ def acknowledgements():
                 <button class="btn btn-danger btn-sm">❌ Not done</button></form>'''}
             </div>
           </div></div>"""
+    c.execute("""SELECT cl.*, le.loan_number, le.customer_name FROM LoanClosure cl
+                 JOIN LoanEntry le ON le.id=cl.loan_id WHERE cl.status='AckPending' ORDER BY cl.closure_id ASC""")
+    closures = [dict(r) for r in c.fetchall()]
+    cl_cards = ""
+    for k in closures:
+        its = closure_items(k["closure_id"])
+        recorders = {i["recorded_by"] for i in its} | {k["ack_requested_by"]}
+        own = me in recorders
+        lines = "".join(
+            f'<div style="padding:3px 0;"><b>{closure_item_title(i)}</b> — returned on '
+            f'{fmt_date(i["returned_on"])} · handed over by <b>{html.escape(i.get("handed_by") or "")}</b>'
+            f'{(" · " + html.escape(i["note"])) if i.get("note") else ""}</div>' for i in its)
+        cl_cards += f"""<div class="card" style="margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+            <div>
+              <b style="color:var(--accent);font-size:15px;">{html.escape(k['loan_number'])}</b> — {html.escape(k['customer_name'] or '')}
+              <span class="badge badge-partial" style="margin-left:6px;">{'Pre-closure' if k['kind'] == 'PreClosure' else 'Regular closing'}</span>
+              <div style="font-size:12.5px;margin-top:6px;line-height:1.7;">{lines}
+                <span style="color:var(--muted);">Sent by <b>{html.escape(k.get('ack_requested_by') or '')}</b> on {fmt_date((k.get('ack_requested_at') or '')[:10])}</span></div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;">
+              {'<span style="font-size:12px;color:var(--muted);">You recorded this hand-over, so someone else must acknowledge it.</span>' if own else f'''
+              <form method="POST" action="/ack/closure/{k['closure_id']}" onsubmit="return confirm('Acknowledge the hand-over and CLOSE this loan?')">
+                <input type="hidden" name="action" value="ack"><button class="btn btn-success btn-sm">✅ Acknowledge &amp; close loan</button></form>
+              <form method="POST" action="/ack/closure/{k['closure_id']}" onsubmit="return getReason(this)">
+                <input type="hidden" name="action" value="reject"><input type="hidden" name="reason" class="reason_inp">
+                <button class="btn btn-danger btn-sm">❌ Not correct</button></form>'''}
+            </div>
+          </div></div>"""
     content = f"""
     <h1>🔎 Acknowledgements</h1>
     <p style="font-size:12.5px;color:var(--muted);margin-bottom:12px;">Second-level cross-check: confirm that the payment or follow-up
@@ -4928,6 +5680,8 @@ def acknowledgements():
     {pay_cards or '<div class="card"><p style="text-align:center;color:var(--muted);">No payments waiting.</p></div>'}
     <h3 style="margin:18px 0 10px;">📞 Follow-ups awaiting acknowledgement ({len(fus)})</h3>
     {fu_cards or '<div class="card"><p style="text-align:center;color:var(--muted);">No follow-ups waiting.</p></div>'}
+    <h3 style="margin:18px 0 10px;">🔒 Loan closing — key &amp; documents returned ({len(closures)})</h3>
+    {cl_cards or '<div class="card"><p style="text-align:center;color:var(--muted);">No loan closings waiting.</p></div>'}
     <script>
     function getReason(form){{
       const r=prompt('Reason:'); if(!r) return false;
@@ -4977,6 +5731,60 @@ def penalty_approve(penalty_id):
     except Exception as e:
         flash(str(e), "danger")
     return redirect(url_for("approval"))
+
+@app.route("/closure/approve/<int:closure_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin")
+def closure_approve(closure_id):
+    rates = {}
+    for k, v in request.form.items():
+        if k.startswith("rate_") and k[5:].isdigit(): rates[int(k[5:])] = v
+    try:
+        approve_closure(closure_id, rates, session.get("username",""))
+        flash("Closing approved. Penalties (if any) become collection tasks due within a day; "
+              "the key and document return starts once they are collected.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("approval"))
+
+@app.route("/closure/item/<int:item_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def closure_item_save(item_id):
+    f = request.form
+    try:
+        record_closure_item(item_id, f.get("returned_on",""), f.get("handed_by",""), f.get("note",""), session.get("username",""))
+        flash("Recorded.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("emis", loan_id=int(f.get("loan_id", 0) or 0)) + "#closing")
+
+@app.route("/closure/send_ack/<int:closure_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def closure_send_ack(closure_id):
+    loan_id = int(request.form.get("loan_id", 0) or 0)
+    try:
+        request_closure_ack(closure_id, session.get("username",""))
+        flash("Sent for acknowledgement. The loan closes once it is acknowledged.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("emis", loan_id=loan_id) + "#closing")
+
+@app.route("/ack/closure/<int:closure_id>", methods=["POST"])
+@login_required
+@role_required(*ACK_ROLES)
+def ack_closure(closure_id):
+    try:
+        if request.form.get("action") == "ack":
+            acknowledge_closure(closure_id, session.get("username",""))
+            flash("Acknowledged. The loan is now closed.", "success")
+        else:
+            reject_closure_ack(closure_id, request.form.get("reason",""), session.get("username",""))
+            flash("Sent back to the return step.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("acknowledgements"))
 
 @app.route("/penalty/reject/<int:penalty_id>", methods=["POST"])
 @login_required
@@ -5062,7 +5870,7 @@ def followups():
           <td><span class="badge badge-partial">{html.escape(r['category'])}</span></td>
           <td>{r['customer_name']}</td>
           <td>{customer_numbers_html(r)}{('<br><span style="font-size:11px;color:var(--muted);">🛡️ Guarantor</span><br>' + guarantor_numbers_html(r)) if guarantor_numbers_html(r) != '—' else ''}</td>
-          <td>{html.escape(r.get('vehicle_type') or '—')}</td>
+          <td>{vehicle_html(r)}</td>
           <td>{('₹{:,.2f}'.format(r['emi_amount'])) if r.get('emi_amount') is not None else '—'}</td>
           <td>{fmt_date(r.get('oldest_due'))}</td>
           <td style="text-align:center;">{r['pending_dues']}</td>
@@ -5132,7 +5940,7 @@ def followup_export_csv():
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["Loan Number","Category","Customer","Mobile","Customer Other Numbers","Guarantor Numbers",
-                      "Vehicle Type","EMI Amount","Oldest Due Date","Pending Dues","Overdue Amount","Outstanding Amount","Last Paid Date",
+                      "Vehicle","EMI Amount","Oldest Due Date","Pending Dues","Overdue Amount","Outstanding Amount","Last Paid Date",
                       "Current Address","Permanent Address","Location","Guarantor Location",
                       "Follow-up Date","Remarks","Status","Created By"])
     for r in items:
@@ -5147,7 +5955,7 @@ def followup_export_csv():
             "; ".join(x for x in [
                 f"{r.get('guarantor_mobile')} (Primary - {r.get('guarantor_name') or 'Guarantor'})" if r.get("guarantor_mobile") else "",
                 contact_numbers_text(r.get("guarantor_extra_numbers"))] if x),
-            r.get("vehicle_type") or "",
+            vehicle_label(r),
             f"{r['emi_amount']:.2f}" if r.get("emi_amount") is not None else "",
             fmt_date(r.get("oldest_due"), ""), r["pending_dues"],
             f"{r['overdue_amount']:.2f}", f"{r['outstanding']:.2f}", fmt_date(r.get("last_paid_date"), ""),
@@ -5185,10 +5993,27 @@ def closed():
         return (f'<span class="badge badge-partial">⏩ Pre-closed</span><br>'
                 f'<span style="font-size:11px;color:var(--muted);">Settled ₹{float(pc["settlement_amount"] or 0):,.2f} · '
                 f'rate {float(pc["original_rate"] or 0)*100:.2f}% → {float(pc["new_rate"] or 0)*100:.2f}% · bill {html.escape(str(pc["bill_number"] or ""))}</span>')
+    def handover_cell(l):
+        k = l.get("closure")
+        if not k: return '<span style="color:var(--muted);">—</span>'
+        its = l["closure_items"]
+        chips = " ".join(f'{CLOSURE_ITEM_INFO[i["item"]][0]}{"✔" if i["status"] == "Returned" else "✖"}' for i in its)
+        det = "".join(
+            f'<tr><td>{closure_item_title(i)}</td><td>{fmt_date(i["returned_on"])}</td>'
+            f'<td>{html.escape(i.get("handed_by") or "")}</td><td>{html.escape(i.get("recorded_by") or "")}</td>'
+            f'<td>{html.escape(i.get("note") or "")}</td></tr>' for i in its)
+        body = (f'<div class="table-wrap"><table><tr><th>Item</th><th>Returned on</th><th>Handed over by</th><th>Recorded by</th><th>Note</th></tr>{det}</table></div>'
+                f'<div style="font-size:12px;color:var(--muted);margin-top:8px;">{"Pre-closure" if k["kind"] == "PreClosure" else "Regular closing"} · '
+                f'approved by {html.escape(k.get("approved_by") or "—")} · hand-over acknowledged by <b>{html.escape(k.get("acked_by") or "—")}</b> '
+                f'on {fmt_date((k.get("acked_at") or "")[:10])}</div>')
+        title = html.escape(f"{l['loan_number']} — key & documents handed over", quote=True)
+        return (f'<span style="white-space:nowrap;">{chips}</span> '
+                f'<button type="button" class="btn btn-sm btn-primary" onclick="showHandover(\'ho{l["loan_id"]}\',\'{title}\')">View</button>'
+                f'<div id="ho{l["loan_id"]}" hidden>{body}</div>')
     rows = "".join(f"""<tr>
         <td><b>{l['loan_number']}</b></td><td>{l['customer_name']}</td>
-        <td>{l['vehicle_type']}</td><td>₹{l['loan_amount']:,.2f}</td>
-        <td>{fmt_date(l['closure_date'])}</td><td>{closure_label(l)}</td></tr>""" for l in ll)
+        <td>{vehicle_html(l)}</td><td>₹{l['loan_amount']:,.2f}</td>
+        <td>{fmt_date(l['closure_date'])}</td><td>{closure_label(l)}</td><td>{handover_cell(l)}</td></tr>""" for l in ll)
     content = f"""
     <h1>🔒 Closed Loans</h1>
     <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;">
@@ -5196,9 +6021,23 @@ def closed():
       <button class="btn btn-primary btn-sm">Search</button>
     </form>
     <div class="card"><div class="table-wrap"><table>
-      <tr><th>Loan #</th><th>Customer</th><th>Type</th><th>Amount</th><th>Closed On</th><th>Closure</th></tr>
-      {rows or '<tr><td colspan="6" style="text-align:center;color:var(--muted);">No closed loans</td></tr>'}
-    </table></div></div>"""
+      <tr><th>Loan #</th><th>Customer</th><th>Vehicle</th><th>Amount</th><th>Closed On</th><th>Closure</th><th>Key &amp; documents</th></tr>
+      {rows or '<tr><td colspan="7" style="text-align:center;color:var(--muted);">No closed loans</td></tr>'}
+    </table></div></div>
+    <div class="fu-modal-overlay" id="hoModal" onclick="if(event.target===this)this.classList.remove('open')">
+      <div class="fu-modal" style="max-width:640px;">
+        <h3 id="hoTitle">Key &amp; documents handed over</h3>
+        <div id="hoBody" style="font-size:13px;margin-top:8px;"></div>
+        <div style="margin-top:12px;text-align:right;"><button type="button" class="btn btn-primary btn-sm" onclick="document.getElementById('hoModal').classList.remove('open')">Close</button></div>
+      </div>
+    </div>
+    <script>
+    function showHandover(id, title){{
+      document.getElementById('hoTitle').textContent = title;
+      document.getElementById('hoBody').innerHTML = document.getElementById(id).innerHTML;
+      document.getElementById('hoModal').classList.add('open');
+    }}
+    </script>"""
     return page("Closed Loans", content, "closed")
 
 @app.route("/rejected")
@@ -5674,7 +6513,7 @@ def _chatbot_loan_summary(loan, detailed=False):
     lines = []
     lines.append(f"📋 Loan: {loan['loan_number']}  ({loan['status']})")
     lines.append(f"👤 Customer: {_na(loan.get('customer_name'))}  |  📱 {_na(loan.get('customer_mobile'))}")
-    lines.append(f"🚗 Vehicle: {_na(loan.get('vehicle_type'))} — {_na(loan.get('vehicle_number'))} ({_na(loan.get('vehicle_model'))})")
+    lines.append(f"🚗 Vehicle: {_na(vehicle_label(loan))} — {_na(loan.get('vehicle_number'))} ({_na(loan.get('vehicle_type'))})")
     lines.append(f"💰 Loan Amount: {fmt_inr(loan.get('loan_amount',0))}  |  Rate: {float(loan.get('interest_rate',0))*100:.1f}%  |  Tenure: {loan.get('tenure','-')}m")
     if total:
         lines.append(f"💳 EMIs: {paid}/{total} paid  |  Outstanding: {fmt_inr(outstanding)}")
