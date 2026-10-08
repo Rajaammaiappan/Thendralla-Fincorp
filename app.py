@@ -85,8 +85,8 @@ ROLES = {
     "admin":    {"label":"Admin",    "can_approve":True,  "can_reject":True,  "can_add":True,  "can_pay":True,  "can_report":True, "can_edit":False,"can_db":False,"can_ack":True},
     "manager":  {"label":"Manager",  "can_approve":False, "can_reject":False, "can_add":True,  "can_pay":True,  "can_report":True, "can_edit":False,"can_db":False,"can_ack":False},
     "fieldpia": {"label":"Fieldpia", "can_approve":False, "can_reject":False, "can_add":True,  "can_pay":True,  "can_report":False,"can_edit":False,"can_db":False,"can_ack":False},
-    # Associate Manager: second-level cross-check only (acknowledges payments and follow-ups); no decision-making approvals
-    "assocmgr": {"label":"Associate Manager","can_approve":False,"can_reject":False,"can_add":False,"can_pay":False,"can_report":True,"can_edit":False,"can_db":False,"can_ack":True},
+    # Account Manager: second-level cross-check only (acknowledges payments and follow-ups); no decision-making approvals
+    "assocmgr": {"label":"Account Manager","can_approve":False,"can_reject":False,"can_add":False,"can_pay":False,"can_report":True,"can_edit":False,"can_db":False,"can_ack":True},
     "viewer":   {"label":"Viewer",   "can_approve":False, "can_reject":False, "can_add":False, "can_pay":False, "can_report":True, "can_edit":False,"can_db":False,"can_ack":False},
 }
 ACK_ROLES = ("superadmin", "admin", "assocmgr")     # may acknowledge
@@ -1677,7 +1677,7 @@ def queue_payment(emi, amount, bill_number, paid_on, user, penalty_rate=None, re
 
 def submit_payment(emi_id, amount, bill_number, paid_on, user, role, penalty_rate=None):
     """Admin / Super Admin payments are applied straight away. Everyone else's payment is held back as
-    'awaiting acknowledgement' until an Associate Manager (or an admin) cross-checks and confirms it."""
+    'awaiting acknowledgement' until an Account Manager (or an admin) cross-checks and confirms it."""
     emi = validate_payment(emi_id, amount, bill_number, paid_on)
     if role in DIRECT_ROLES:
         msg = pay_emi(emi_id, float(amount), bill_number=bill_number, paid_on=paid_on or None, paid_by=user)
@@ -1978,13 +1978,13 @@ def set_setting(key, value):
               (key, str(value), str(value)))
     get_db().commit()
 
-# ── Vehicle seizure: request -> admin approval -> key / RC received -> Associate Manager acknowledgement ──
+# ── Vehicle seizure: request -> admin approval -> key / RC received -> Account Manager acknowledgement ──
 SEIZURE_DEFAULT_MIN = 3        # the "Vehicle Seized" option appears from this many overdue EMIs (Super Admin can change it)
 SEIZURE_ITEM_INFO = {"key": ("🔑", "Key received"), "rc": ("📄", "RC received")}
 SEIZURE_LIVE = ("Pending", "Return", "AckPending", "Seized")
 SEIZURE_STAGE_TEXT = {"Pending": "Waiting for admin approval",
                       "Return": "Key and RC to be received and recorded",
-                      "AckPending": "Waiting for Associate Manager acknowledgement",
+                      "AckPending": "Waiting for Account Manager acknowledgement",
                       "Seized": "Seizure completed"}
 
 def seizure_threshold():
@@ -3612,7 +3612,7 @@ FOLLOWUP_SOON_DAYS = 2   # same "due within 2 days" rule as the Follow Up page
 ATTENTION_ROWS = 5
 
 def waiting_items_html():
-    """Short banner on the dashboard: payments/follow-ups waiting for acknowledgement (Associate Manager,
+    """Short banner on the dashboard: payments/follow-ups waiting for acknowledgement (Account Manager,
     Admin, Super Admin) and penalties waiting for approval (Admin, Super Admin)."""
     role = session.get("role", "")
     bits = []
@@ -4953,7 +4953,7 @@ def approval():
           <form method="POST" action="/closure/approve/{k['closure_id']}">
             {pen_table}
             <div class="cl-note" style="margin:8px 0;font-size:14px;font-weight:700;"></div>
-            <div style="font-size:12px;color:var(--muted);margin-bottom:8px;">After approval: any penalty must be collected within a day, then to be handed back: {items_txt}. An Associate Manager acknowledges the hand-over before the loan closes.</div>
+            <div style="font-size:12px;color:var(--muted);margin-bottom:8px;">After approval: any penalty must be collected within a day, then to be handed back: {items_txt}. An Account Manager acknowledges the hand-over before the loan closes.</div>
             <button type="submit" class="btn btn-success btn-sm">✅ Approve closing</button>
           </form>
         </div>"""
@@ -4989,7 +4989,7 @@ def approval():
           <div class="table-wrap" style="margin:8px 0;"><table><tr><th>Overdue EMI</th><th>Due</th><th>Overdue by</th><th>Outstanding</th></tr>{od_lines}</table></div>
           <div style="background:#fee2e2;border-radius:8px;padding:8px 12px;font-size:13.5px;margin-bottom:8px;">
             If approved: <b>{fmt_inr(total_wo)}</b> is written off (all unpaid EMIs close as Seized)
-            {(f'and <b>{n_pen}</b> pending penalty(ies) are waived') if n_pen else ''}. Key and RC then have to be recorded and an Associate Manager acknowledges.
+            {(f'and <b>{n_pen}</b> pending penalty(ies) are waived') if n_pen else ''}. Key and RC then have to be recorded and an Account Manager acknowledges.
           </div>
           <form method="POST" action="/seizure/approve/{z['seizure_id']}"
                 onsubmit="return confirm('Approve the seizure? The outstanding amount will be written off.')">
@@ -5345,7 +5345,7 @@ def closing_section_html(loan, can_pay, penalties, today):
            "AwaitApproval": "⏳ Waiting for admin approval of the closing (the admin reviews the delay days and penalty).",
            "Penalty": "⏳ Penalty must be collected within a day. The key &amp; document return starts after it is collected.",
            "Return": "📝 Record each item as returned, then send it for acknowledgement.",
-           "AckPending": "⏳ Waiting for acknowledgement by an Associate Manager / admin.",
+           "AckPending": "⏳ Waiting for acknowledgement by an Account Manager / admin.",
            "Closed": f"✅ Loan closed on {fmt_date((cl or {}).get('closed_at'))}."}[stage]
     if cl and cl["kind"] == "PreClosure" and stage != "Closed":
         msg = "⏩ Pre-closure bill paid. " + msg
@@ -5418,7 +5418,7 @@ def seizure_card_html(loan, sz, can_pay, can_reopen, today):
     info += '</div>'
     msg = {"Pending": "⏳ Waiting for admin approval.",
            "Return": "📝 Record the key and RC received for each vehicle, then send it for acknowledgement.",
-           "AckPending": "⏳ Waiting for the Associate Manager to check the seizure details and legal issues.",
+           "AckPending": "⏳ Waiting for the Account Manager to check the seizure details and legal issues.",
            "Seized": "🚫 Vehicle seized — the remaining EMIs are closed and the outstanding amount is written off."}[st]
     note = (f'<div style="color:var(--red);font-weight:600;margin-top:4px;">{html.escape(sz["ack_note"])}</div>'
             if st == "Return" and sz.get("ack_note") else "")
@@ -6344,7 +6344,7 @@ def followup_resolve(followup_id):
             flash("Follow-up marked as resolved.","success")
         else:
             request_followup_ack(followup_id, session.get("username",""), request.form.get("note",""), recv_date, recv_by)
-            flash("Sent for acknowledgement. The follow-up closes once an Associate Manager or admin acknowledges it.","success")
+            flash("Sent for acknowledgement. The follow-up closes once an Account Manager or admin acknowledges it.","success")
     except Exception as e:
         flash(str(e),"danger")
     return redirect(request.form.get("next") or url_for("followups"))
@@ -6676,7 +6676,7 @@ def seizure_item_save(item_id):
 def seizure_send_ack(seizure_id):
     try:
         request_seizure_ack(seizure_id, session.get("username",""))
-        flash("Sent to the Associate Manager for acknowledgement.", "success")
+        flash("Sent to the Account Manager for acknowledgement.", "success")
     except Exception as e:
         flash(str(e), "danger")
     return _back_to_emis(request.form.get("loan_id", 0))
@@ -6802,7 +6802,7 @@ def followups():
             resolve_tip = "Closes this follow-up"
         else:
             resolve_label = "✔ Mark done"
-            resolve_tip = "Goes to an Associate Manager / admin for acknowledgement before it closes"
+            resolve_tip = "Goes to an Account Manager / admin for acknowledgement before it closes"
         recv_fields = ""
         if r.get("item") in FU_ITEM_COLUMNS:
             recv_fields = (f'<input type="date" name="recv_date" value="{today.isoformat()}" max="{today.isoformat()}" required title="When collected" '
@@ -6873,7 +6873,7 @@ def followups():
         Loan collection follow-ups (saved from the Alerts page) plus the automatic Key Collection and
         Proof &amp; Documents follow-ups created when a loan is submitted with Key / RC / Documents = No, and
         Penalty Collection tasks created when an admin approves a late-payment penalty. Marking a follow-up done
-        sends it to an Associate Manager / admin for acknowledgement before it closes.
+        sends it to an Account Manager / admin for acknowledgement before it closes.
         Rows are ordered by follow-up date. <b>Overdue Amt</b> = already past due; <b>Outstanding</b> = total balance
         of the loan still to be collected; <b>Oldest Due Date</b> = earliest unpaid EMI.
       </p>
