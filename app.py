@@ -1022,6 +1022,9 @@ def init_db():
         "ALTER TABLE LoanVehicles ADD COLUMN docs_collected_by TEXT",
         "ALTER TABLE FollowUp ADD COLUMN recv_date TEXT",
         "ALTER TABLE FollowUp ADD COLUMN recv_by TEXT",
+        "ALTER TABLE Receipts ADD COLUMN extra_label TEXT",
+        "ALTER TABLE Receipts ADD COLUMN extra_amount REAL",
+        "ALTER TABLE Receipts ADD COLUMN batch_id TEXT",
         "ALTER TABLE EMI ADD COLUMN penalty_due REAL DEFAULT 0",
         "ALTER TABLE EMI ADD COLUMN penalty_paid REAL DEFAULT 0",
         "ALTER TABLE EMIPayments ADD COLUMN penalty_part REAL DEFAULT 0",
@@ -1310,6 +1313,9 @@ def generate_receipt_pdf(r):
     c.setFillColor(colors.black); c.setFont("Helvetica", 11); c.drawString(xv, y, str(r["installment_label"] or ""))
     c.setFont("Helvetica-Bold", 8.5); c.setFillColor(blue); c.drawString(W/2 + 0.2*cm, y, "Loan No.")
     c.setFillColor(colors.black); c.setFont("Helvetica", 11); c.drawString(W/2 + 1.9*cm, y, str(r["loan_number"] or ""))
+    if r.get("extra_amount"):
+        c.setFont("Helvetica", 8); c.setFillColor(colors.black)
+        c.drawString(xv, y - 0.45*cm, f"(incl. Rs. {float(r['extra_amount']):,.2f} towards {r.get('extra_label') or 'next due'})")
     y -= 0.7*cm
     # amount block
     block_top = y; block_bottom = block_top - 4.6*cm; mid = W/2 + 0.3*cm
@@ -1630,7 +1636,7 @@ def pending_payment_for_emi(emi_id):
     r = c.fetchone()
     return dict(r) if r else None
 
-def validate_payment(emi_id, amount, bill_number, paid_on):
+def validate_payment(emi_id, amount, bill_number, paid_on, in_batch=()):
     """Same rules pay_emi enforces, checked up front so a bad payment is refused before it is queued."""
     c = get_cur(); c.execute("SELECT * FROM EMI WHERE emi_id=?", (emi_id,))
     emi = c.fetchone()
@@ -1645,8 +1651,12 @@ def validate_payment(emi_id, amount, bill_number, paid_on):
     if pending_payment_for_emi(emi_id):
         raise ValueError("A payment for this installment is already awaiting acknowledgement.")
     if not can_pay_emi(emi["loan_id"], emi["installment_no"]):
-        raise ValueError(f"Cannot pay installment {emi['installment_no']}. Complete previous first "
-                         f"(a payment awaiting acknowledgement counts as not yet paid).")
+        c.execute("SELECT emi_id FROM EMI WHERE loan_id=? AND installment_no<? AND status!='Paid'",
+                  (emi["loan_id"], emi["installment_no"]))
+        # allowed only when every earlier unpaid installment is part of this same bill batch (paid in order)
+        if not in_batch or any(r["emi_id"] not in in_batch for r in c.fetchall()):
+            raise ValueError(f"Cannot pay installment {emi['installment_no']}. Complete previous first "
+                             f"(a payment awaiting acknowledgement counts as not yet paid).")
     if not (bill_number or "").strip(): raise ValueError("Bill number is mandatory before payment.")
     if not amount or float(amount) <= 0: raise ValueError("Enter a payment amount.")
     if paid_on:
@@ -1681,6 +1691,12 @@ def acknowledge_payment(pp_id, username):
     pp = c.fetchone()
     if not pp or pp["status"] != "Pending": raise ValueError("This payment is no longer awaiting acknowledgement.")
     if pp["requested_by"] == username: raise ValueError("You cannot acknowledge your own entry.")
+    c.execute("""SELECT installment_no FROM PendingPayments WHERE loan_id=? AND status='Pending' AND installment_no<?
+                 ORDER BY installment_no LIMIT 1""", (pp["loan_id"], pp["installment_no"]))
+    earlier = c.fetchone()
+    if earlier:
+        raise ValueError(f"Acknowledge the earlier installment first ({ordinal_due(earlier['installment_no'])}): "
+                         f"an EMI cannot be closed while the one before it is still open.")
     msg = pay_emi(pp["emi_id"], float(pp["amount"]), bill_number=pp["bill_number"], paid_on=pp["paid_on"],
                   paid_by=pp["requested_by"])
     c = get_cur()
@@ -1700,6 +1716,18 @@ def reject_payment(pp_id, reason, username):
                  WHERE pp_id=?""", (username, datetime.now(timezone.utc).isoformat(), (reason or "").strip() or "No reason given", pp_id))
     if pp["receipt_id"]:
         c.execute("UPDATE Receipts SET recorded_on_emi=3 WHERE receipt_id=?", (pp["receipt_id"],))
+        # later installments of the same bill batch cannot be recorded without this one: reject them too
+        c.execute("SELECT batch_id FROM Receipts WHERE receipt_id=?", (pp["receipt_id"],))
+        bt = c.fetchone()
+        if bt and bt["batch_id"]:
+            c.execute("""SELECT p.pp_id, p.receipt_id FROM PendingPayments p JOIN Receipts r ON r.receipt_id=p.receipt_id
+                         WHERE p.loan_id=? AND p.status='Pending' AND p.installment_no>? AND r.batch_id=?""",
+                      (pp["loan_id"], pp["installment_no"], bt["batch_id"]))
+            for later in [dict(x) for x in c.fetchall()]:
+                c.execute("""UPDATE PendingPayments SET status='Rejected', decided_by=?, decided_at=?, decision_remarks=?
+                             WHERE pp_id=?""", (username, datetime.now(timezone.utc).isoformat(),
+                                                "Earlier installment of the same bill was rejected", later["pp_id"]))
+                c.execute("UPDATE Receipts SET recorded_on_emi=3 WHERE receipt_id=?", (later["receipt_id"],))
     get_db().commit()
 
 def create_penalty_if_needed(emi_id, rate, requested_by):
@@ -5452,6 +5480,7 @@ def emis(loan_id):
     total_remaining = sum(float(e.get("remaining_amount") or e["emi_amount"]) + emi_penalty_out(e)
                           for e in emi_list if e["status"] not in ("Paid", "PreClosed", "Seized"))
     rows = ""
+    next_no = min((x["installment_no"] for x in emi_list if x["status"] not in ("Paid", "PreClosed", "Seized")), default=None)
     for e in emi_list:
         due_d = parse_date(e["due_date"])
         is_paid = e["status"] == "Paid"
@@ -5478,6 +5507,8 @@ def emis(loan_id):
             pay_form = (f'<div style="font-size:12px;background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:6px 8px;white-space:normal;max-width:230px;">'
                         f'⏳ <b>₹{float(pend["amount"]):,.2f}</b> awaiting acknowledgement<br>'
                         f'<span style="color:var(--muted);">bill {html.escape(pend["bill_number"])} · entered by {html.escape(pend["requested_by"] or "")}</span></div>')
+        elif can_pay and not is_paid and not is_pre and not pc_open and e["installment_no"] != next_no:
+            pay_form = '<span style="font-size:11.5px;color:var(--muted);">Pay the earlier EMI first — EMIs close in order.</span>'
         elif can_pay and not is_paid and not is_pre and not pc_open:
             penalty_box = ""
             if is_overdue and not pen:
@@ -5783,6 +5814,63 @@ def billing():
     </table></div></div>"""
     return page("Billing", content, "billing")
 
+_BILLING_JS = """<script>
+(function(){
+var rows=[].slice.call(document.querySelectorAll('input[name=emi_ids]'));
+var extraVals=[], edited=[];
+var preset=__PRESET__;
+preset.forEach(function(v,i){ if(v){ extraVals[i+1]=v; edited[i+1]=true; } });
+function inr(v){return '\\u20b9'+v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function r2(x){return Math.round(x*100)/100;}
+function incr(s,k){ var m=/^(.*?)(\\d+)$/.exec(s||''); if(!m) return (s||'')+'-'+k; var n=String(parseInt(m[2],10)+1); while(n.length<m[2].length) n='0'+n; return m[1]+n; }
+window.tick=function(cb){
+  var i=rows.indexOf(cb);
+  if(cb.checked){ for(var j=0;j<i;j++) rows[j].checked=true; }
+  else { for(var j=i+1;j<rows.length;j++) rows[j].checked=false; }
+  window.recalc();
+};
+var wt=null;
+window.recalc=function(){
+  var total=r2((parseFloat(document.getElementById('cash').value)||0)+(parseFloat(document.getElementById('online').value)||0));
+  document.getElementById('totalAmt').textContent=inr(total);
+  clearTimeout(wt);
+  wt=setTimeout(function(){
+    if(total<=0){document.getElementById('wordsAmt').textContent='';return;}
+    fetch('/billing/words?amount='+total).then(function(r){return r.json();}).then(function(d){document.getElementById('wordsAmt').textContent='Rupees: '+d.words;});
+  },200);
+  var ticked=rows.filter(function(r){return r.checked;});
+  var sum=0; ticked.forEach(function(r){ sum+=parseFloat(r.dataset.rem); });
+  document.getElementById('remHint').textContent=ticked.length?('Ticked: '+ticked.length+' installment(s), pending '+inr(r2(sum))+(ticked.length>1?' - one bill is made for each EMI.':'')):'Tick the installment(s) being paid.';
+  var left=total, bills=[];
+  ticked.forEach(function(r){ var rem=parseFloat(r.dataset.rem), a=r2(Math.min(left,rem)); if(a>0.004) bills.push({label:r.dataset.label,amt:a}); left=r2(left-a); });
+  var spill=null;
+  if(left>0.004 && ticked.length){
+    var nxt=rows[rows.indexOf(ticked[ticked.length-1])+1];
+    if(nxt){ var a2=r2(Math.min(left,parseFloat(nxt.dataset.rem))); spill={label:nxt.dataset.label,amt:a2}; left=r2(left-a2); }
+  }
+  var box=document.getElementById('alloc');
+  [].slice.call(box.querySelectorAll('input[name="receipt_nos[]"]')).forEach(function(inp,i){
+    extraVals[i+1]=inp.value; if(inp.dataset.touched==='1') edited[i+1]=true; });
+  if(!bills.length){ box.innerHTML='<div style="font-size:12.5px;color:var(--muted);">Enter the amount to see the bills.</div>'; return; }
+  var nums=[document.getElementById('receipt_no').value];
+  var h='<table style="width:100%;font-size:13px;"><tr><th style="text-align:left;">Bill</th><th style="text-align:left;">Installment</th><th style="text-align:right;">Amount</th><th style="text-align:left;">Receipt no</th></tr>';
+  bills.forEach(function(b,i){
+    var amt=b.amt, lab=b.label;
+    if(i===bills.length-1 && spill){ amt=r2(amt+spill.amt); lab+=' <span style="color:var(--accent);">+ '+inr(spill.amt)+' towards '+spill.label+'</span>'; }
+    var cell;
+    if(i===0){ cell='<b>'+(nums[0]||'(enter above)')+'</b>'; }
+    else { nums[i]=(edited[i]&&extraVals[i])?extraVals[i]:incr(nums[i-1],i);
+      cell='<input name="receipt_nos[]" value="'+nums[i].replace(/"/g,'&quot;')+'" data-touched="'+(edited[i]?1:0)+'" oninput="this.dataset.touched=1" style="width:140px;font-size:12px;padding:4px 6px;" required>'; }
+    h+='<tr><td>'+(i+1)+'</td><td>'+lab+'</td><td style="text-align:right;"><b>'+inr(amt)+'</b></td><td>'+cell+'</td></tr>';
+  });
+  h+='</table>';
+  if(left>0.004) h+='<div style="color:var(--red);font-weight:600;font-size:12.5px;margin-top:6px;">'+inr(left)+' is more than the ticked installments plus the next due - tick more installments.</div>';
+  box.innerHTML=h;
+};
+window.recalc();
+})();
+</script>"""
+
 def _billing_form(loan_id, values=None):
     values = values or {}
     c = get_cur(); c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
@@ -5793,17 +5881,21 @@ def _billing_form(loan_id, values=None):
     if loan["status"] != "Approved":
         flash("Bills can only be made for active (approved) loans.","danger"); return redirect(url_for("billing"))
     emis_open = _unpaid_emis(loan_id)
-    sel_emi = str(values.get("emi_id") or request.args.get("emi") or (emis_open[0]["emi_id"] if emis_open else ""))
+    sel = [str(x) for x in (values.get("emi_ids") or ([request.args.get("emi")] if request.args.get("emi") else []))]
+    if not sel and emis_open: sel = [str(emis_open[0]["emi_id"])]
     pc_open = preclosure_in_progress(loan_id)
     opts = "".join(
-        f'<option value="{e["emi_id"]}" data-rem="{_emi_remaining(e):.2f}" data-label="{ordinal_due(e["installment_no"])}" '
-        f'{"selected" if str(e["emi_id"]) == sel_emi else ""}>{ordinal_due(e["installment_no"])} — due {fmt_date(e["due_date"])} — pending ₹{_emi_remaining(e):,.2f}</option>'
+        f'<label style="display:flex;gap:8px;align-items:center;padding:7px 10px;border-bottom:1px solid var(--border);cursor:pointer;'
+        f'text-transform:none;font-size:13px;font-weight:500;margin:0;">'
+        f'<input type="checkbox" name="emi_ids" value="{e["emi_id"]}" data-rem="{_emi_remaining(e):.2f}" data-label="{ordinal_due(e["installment_no"])}" '
+        f'onchange="tick(this)" {"checked" if str(e["emi_id"]) in sel else ""} style="width:auto;min-height:0;margin:0;">'
+        f'<span><b>{ordinal_due(e["installment_no"])}</b> — due {fmt_date(e["due_date"])} — pending <b>₹{_emi_remaining(e):,.2f}</b>'
+        f'{(" (incl. penalty ₹" + format(emi_penalty_out(e), ",.2f") + ")") if emi_penalty_out(e) else ""}</span></label>'
         for e in emis_open)
     c.execute("SELECT receipt_no FROM Receipts ORDER BY receipt_id DESC LIMIT 1")
     last = c.fetchone(); last_txt = f"Last receipt: <b>{html.escape(last['receipt_no'])}</b>" if last else "No receipts yet"
-    rec_checked = "" if (values and not values.get("record_on_emi")) else "checked"
-    pc_note = ('<div class="alert alert-warning" style="font-size:12px;">A pre-closure is in progress for this loan, so the payment '
-               'cannot be recorded on the EMI. You can still make a receipt (untick the box).</div>') if pc_open else ""
+    pc_note = ('<div class="alert alert-warning" style="font-size:12px;">A pre-closure is in progress for this loan, so payments are paused '
+               'and a bill cannot be made until it is finished.</div>') if pc_open else ""
     content = f"""
     <h1>🧾 Make Bill — {html.escape(loan['loan_number'])}</h1>
     {pc_note}
@@ -5811,8 +5903,8 @@ def _billing_form(loan_id, values=None):
       <input type="hidden" name="loan_id" value="{loan_id}">
       <div class="form-grid">
         <div class="form-group">
-          <label>Receipt No * <span style="font-size:10px;color:var(--muted);">({last_txt})</span></label>
-          <input name="receipt_no" value="{html.escape(values.get('receipt_no',''))}" required placeholder="e.g. B745">
+          <label>Receipt No * <span style="font-size:10px;color:var(--muted);">({last_txt}; for several EMIs this is the first bill)</span></label>
+          <input name="receipt_no" id="receipt_no" value="{html.escape(values.get('receipt_no',''))}" required placeholder="e.g. B745" oninput="recalc()">
         </div>
         <div class="form-group">
           <label>Date *</label>
@@ -5831,58 +5923,39 @@ def _billing_form(loan_id, values=None):
           <input value="{html.escape(loan['loan_number'])}" readonly style="background:var(--surface2);">
         </div>
         <div class="form-group">
-          <label>Installment * <span style="font-size:10px;color:var(--muted);">(next upcoming EMI is pre-selected)</span></label>
-          <select name="emi_id" id="emi_sel" required onchange="hint()">{opts}</select>
-        </div>
-        <div class="form-group">
           <label>Cash (₹)</label>
           <input type="number" name="cash" id="cash" min="0" step="0.01" value="{html.escape(str(values.get('cash','')))}" oninput="recalc()">
+        </div>
+        <div class="form-group full">
+          <label>Installments * <span style="font-size:10px;color:var(--muted);">(tick every EMI paid now — they close in order, one bill each; the next upcoming EMI is pre-ticked)</span></label>
+          <div style="max-height:230px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--surface);">{opts}</div>
         </div>
         <div class="form-group">
           <label>Online (₹)</label>
           <input type="number" name="online" id="online" min="0" step="0.01" value="{html.escape(str(values.get('online','')))}" oninput="recalc()">
         </div>
+        <div class="form-group">
+          <label>Penalty per day (₹) <span style="font-size:10px;color:var(--muted);">(optional — only for an EMI paid late; goes to admin approval)</span></label>
+          <input type="number" name="penalty_rate" min="0" step="0.01" value="{html.escape(str(values.get('penalty_rate','')))}" placeholder="e.g. 50">
+        </div>
         <div class="form-group full">
           <div style="background:var(--surface2);border-radius:8px;padding:10px 12px;">
             <div style="font-size:12px;color:var(--muted);" id="remHint"></div>
             <div style="font-size:18px;font-weight:800;margin-top:2px;">Total: <span id="totalAmt">₹0.00</span></div>
-            <div style="font-size:13px;margin-top:2px;" id="wordsAmt" ></div>
+            <div style="font-size:13px;margin-top:2px;" id="wordsAmt"></div>
+            <div id="alloc" style="margin-top:8px;"></div>
           </div>
-        </div>
-        <div class="form-group">
-          <label>Penalty per day (₹) <span style="font-size:10px;color:var(--muted);">(optional — only if this EMI is paid late; goes to admin approval)</span></label>
-          <input type="number" name="penalty_rate" min="0" step="0.01" value="{html.escape(str(values.get('penalty_rate','')))}" placeholder="e.g. 50">
-        </div>
-        <div class="form-group full">
-          <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;font-weight:600;cursor:pointer;">
-            <input type="checkbox" name="record_on_emi" value="yes" {rec_checked} style="width:auto;min-height:0;margin:0;" {"disabled" if (pc_open or not emis_open) else ""}>
-            Also record this payment on the EMI (receipt no becomes the EMI’s Bill No; a full payment closes the EMI)
-          </label>
+          <div style="font-size:12px;color:var(--muted);margin-top:6px;">The amount is spread over the ticked EMIs in order (a penalty on an EMI is cleared first). Any excess goes
+            to the next due on the same bill. Every bill is recorded on the EMI only after it is acknowledged (an Admin / Super Admin's own bill is recorded straight away).</div>
         </div>
       </div>
+      <input type="hidden" name="record_on_emi" value="yes">
       <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
-        <button type="submit" class="btn btn-primary">🧾 Generate Bill</button>
+        <button type="submit" class="btn btn-primary" {"disabled" if (pc_open or not emis_open) else ""}>🧾 Generate Bill(s)</button>
         <a href="/billing" class="btn" style="background:var(--surface2);color:var(--text);">Cancel</a>
       </div>
     </form></div>
-    <script>
-    function inr(v){{return '₹'+v.toLocaleString('en-IN',{{minimumFractionDigits:2,maximumFractionDigits:2}});}}
-    let wt=null;
-    function recalc(){{
-      const t=(parseFloat(document.getElementById('cash').value)||0)+(parseFloat(document.getElementById('online').value)||0);
-      document.getElementById('totalAmt').textContent=inr(t);
-      clearTimeout(wt);
-      wt=setTimeout(()=>{{
-        if(t<=0){{document.getElementById('wordsAmt').textContent='';return;}}
-        fetch('/billing/words?amount='+t).then(r=>r.json()).then(d=>{{document.getElementById('wordsAmt').textContent='Rupees: '+d.words;}});
-      }},200);
-    }}
-    function hint(){{
-      const o=document.getElementById('emi_sel').selectedOptions[0];
-      document.getElementById('remHint').textContent=o?('Pending on '+o.dataset.label+': '+inr(parseFloat(o.dataset.rem))):'';
-    }}
-    hint(); recalc();
-    </script>"""
+    """ + _BILLING_JS.replace("__PRESET__", json.dumps(values.get("receipt_nos") or []))
     return page("Make Bill", content, "billing")
 
 @app.route("/billing/new/<int:loan_id>")
@@ -5904,16 +5977,18 @@ def billing_create():
     f = request.form
     loan_id = int(f.get("loan_id", 0) or 0)
     def back(msg):
-        flash(msg, "danger"); return _billing_form(loan_id, dict(f))
+        flash(msg, "danger")
+        vals = dict(f); vals["emi_ids"] = f.getlist("emi_ids"); vals["receipt_nos"] = f.getlist("receipt_nos[]")
+        return _billing_form(loan_id, vals)
     c = get_cur(); c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
     loan = c.fetchone()
     if not loan or loan["status"] != "Approved":
         flash("Bills can only be made for active (approved) loans.","danger"); return redirect(url_for("billing"))
     loan = dict(loan)
+    if preclosure_in_progress(loan_id):
+        return back("A pre-closure is in progress for this loan, so payments are paused. Finish or reject the pre-closure first.")
     receipt_no = f.get("receipt_no","").strip()
     if not receipt_no: return back("Receipt number is required.")
-    c.execute("SELECT 1 FROM Receipts WHERE LOWER(receipt_no)=LOWER(?)", (receipt_no,))
-    if c.fetchone(): return back(f"Receipt number '{receipt_no}' has already been used.")
     try: rdate = datetime.strptime(f.get("receipt_date","").strip(), "%Y-%m-%d").date()
     except ValueError: return back("Enter a valid date.")
     if rdate > date.today(): return back("Date cannot be in the future.")
@@ -5925,43 +6000,79 @@ def billing_create():
     if total <= 0: return back("Enter a Cash or Online amount.")
     received_from = f.get("received_from","").strip()
     if not received_from: return back("'Received From' is required.")
-    emi = next((e for e in _unpaid_emis(loan_id) if str(e["emi_id"]) == f.get("emi_id","")), None)
-    if not emi: return back("Please choose an unpaid installment.")
+
+    # which installments: the earliest unpaid ones, in order, none skipped
+    unpaid = _unpaid_emis(loan_id)
+    ids = [int(x) for x in f.getlist("emi_ids") if str(x).isdigit()]
+    if not ids: return back("Tick at least one installment.")
+    k = len(ids)
+    if sorted(ids) != sorted(e["emi_id"] for e in unpaid[:k]):
+        return back("Tick the installments in order: the earliest unpaid EMI first, with none skipped (an EMI cannot be closed while the one before it is open).")
+    left = total; bills = []
+    for e in unpaid[:k]:
+        a = round(min(left, _emi_remaining(e)), 2)
+        left = round(left - a, 2)
+        if a > 0.004: bills.append([e, a])
+    spill = None
+    if left > 0.004:
+        nxt = unpaid[k] if len(unpaid) > k else None
+        if not nxt:
+            return back(f"The amount is more than the {fmt_inr(sum(_emi_remaining(e) for e in unpaid))} pending on this loan.")
+        sa = round(min(left, _emi_remaining(nxt)), 2)
+        left = round(left - sa, 2)
+        spill = (nxt, sa)
+        if left > 0.004:
+            return back("The amount is more than the ticked installments plus the next due. Tick more installments.")
+    n = len(bills)
+    nos = [receipt_no] + [x.strip() for x in f.getlist("receipt_nos[]")]
+    if len(nos) < n or any(not nos[i] for i in range(n)):
+        return back(f"Enter a receipt number for each of the {n} bills.")
+    nos = nos[:n]
+    if len({x.lower() for x in nos}) != n: return back("Each bill needs its own receipt number.")
+    for no in nos:
+        c.execute("SELECT 1 FROM Receipts WHERE LOWER(receipt_no)=LOWER(?)", (no,))
+        if c.fetchone(): return back(f"Receipt number '{no}' has already been used.")
+
     user, role = session.get("username",""), session.get("role","")
     penalty_rate = f.get("penalty_rate")
-    recorded = 0          # 0 receipt only · 1 recorded on the EMI · 2 awaiting acknowledgement
-    queue_after = False
-    pen_msg = ""
-    if f.get("record_on_emi") == "yes":
-        if total > _emi_remaining(emi) + 0.005:
-            return back(f"The amount is more than the ₹{_emi_remaining(emi):,.2f} pending on this installment.")
-        try:
-            emi_row = validate_payment(emi["emi_id"], total, receipt_no, rdate.isoformat())
-            if role in DIRECT_ROLES:
-                pay_emi(emi["emi_id"], total, bill_number=receipt_no, paid_on=rdate.isoformat(), paid_by=user)
-                pen_msg = create_penalty_if_needed(emi["emi_id"], penalty_rate, user)
-                recorded = 1
-            else:
-                recorded, queue_after = 2, True
-        except Exception as e:
-            return back(str(e))
-    c = get_cur()
-    c.execute("""INSERT INTO Receipts (receipt_no,loan_id,emi_id,installment_no,installment_label,received_from,receipt_date,
-                 vehicle_number,loan_number,cash,online,total,amount_words,cashier,recorded_on_emi,created_at)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-              (receipt_no, loan_id, emi["emi_id"], emi["installment_no"], ordinal_due(emi["installment_no"]), received_from,
-               rdate.isoformat(), loan.get("vehicle_number") or "", loan["loan_number"], cash, online, total,
-               amount_in_words(total), user, recorded, datetime.now(timezone.utc).isoformat()))
-    get_db().commit()
-    receipt_id = c.lastrowid
-    if queue_after:
-        queue_payment(emi_row, total, receipt_no, rdate.isoformat(), user, penalty_rate, receipt_id=receipt_id)
-    msg = "Bill generated"
-    if recorded == 1: msg += " and the payment was recorded on the EMI."
-    elif recorded == 2: msg += ". The payment is awaiting acknowledgement before it is recorded on the EMI."
-    else: msg += "."
-    flash(msg + ((" " + pen_msg) if pen_msg else ""), "success")
-    return redirect(url_for("billing_receipt", receipt_id=receipt_id))
+    batch_emis = {e["emi_id"] for e, _ in bills} | ({spill[0]["emi_id"]} if spill else set())
+    plan = [(e, a, nos[i]) for i, (e, a) in enumerate(bills)]
+    if spill: plan.append((spill[0], spill[1], nos[-1]))          # excess goes on the last bill
+    try:                                                        # check every payment before anything is saved
+        emi_rows = {e["emi_id"]: validate_payment(e["emi_id"], a, no, rdate.isoformat(), in_batch=batch_emis) for e, a, no in plan}
+    except Exception as ex:
+        return back(str(ex))
+
+    batch_id = secrets.token_hex(6) if n > 1 or spill else None
+    cash_left = cash
+    receipt_ids, pen_msgs = [], []
+    direct = role in DIRECT_ROLES
+    for i, (e, a) in enumerate(bills):
+        amt = round(a + (spill[1] if (spill and i == n - 1) else 0), 2)
+        cpart = round(min(cash_left, amt), 2); cash_left = round(cash_left - cpart, 2); opart = round(amt - cpart, 2)
+        c = get_cur()
+        c.execute("""INSERT INTO Receipts (receipt_no,loan_id,emi_id,installment_no,installment_label,received_from,receipt_date,
+                     vehicle_number,loan_number,cash,online,total,amount_words,cashier,recorded_on_emi,created_at,extra_label,extra_amount,batch_id)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (nos[i], loan_id, e["emi_id"], e["installment_no"], ordinal_due(e["installment_no"]), received_from,
+                   rdate.isoformat(), loan.get("vehicle_number") or "", loan["loan_number"], cpart, opart, amt,
+                   amount_in_words(amt), user, 1 if direct else 2, datetime.now(timezone.utc).isoformat(),
+                   ordinal_due(spill[0]["installment_no"]) if (spill and i == n - 1) else None,
+                   spill[1] if (spill and i == n - 1) else None, batch_id))
+        get_db().commit()
+        receipt_ids.append(c.lastrowid)
+    for j, (e, a, no) in enumerate(plan):
+        rid = receipt_ids[min(j, n - 1)]
+        if direct:
+            pay_emi(e["emi_id"], a, bill_number=no, paid_on=rdate.isoformat(), paid_by=user)
+            m = create_penalty_if_needed(e["emi_id"], penalty_rate, user)
+            if m: pen_msgs.append(m)
+        else:
+            queue_payment(emi_rows[e["emi_id"]], a, no, rdate.isoformat(), user, penalty_rate, receipt_id=rid)
+    msg = f"{n} bills generated" if n > 1 else "Bill generated"
+    msg += (" and recorded on the EMIs." if direct else ". Each payment is awaiting acknowledgement before it is recorded on its EMI (in order).")
+    flash(msg + ((" " + pen_msgs[0]) if pen_msgs else ""), "success")
+    return redirect(url_for("billing_receipt", receipt_id=receipt_ids[0]))
 
 def _get_receipt(receipt_id):
     c = get_cur(); c.execute("SELECT * FROM Receipts WHERE receipt_id=?", (receipt_id,))
@@ -5977,6 +6088,16 @@ def billing_receipt(receipt_id):
         flash("Receipt not found.","danger"); return redirect(url_for("billing"))
     def row(label, value): return (f'<div style="display:flex;gap:10px;border-bottom:1px dotted var(--border);padding:8px 0;">'
                                    f'<div style="width:130px;font-weight:700;color:var(--accent);font-size:12px;">{label}</div><div>{html.escape(str(value or ""))}</div></div>')
+    batch_box = ""
+    if r.get("batch_id"):
+        c = get_cur(); c.execute("SELECT * FROM Receipts WHERE batch_id=? ORDER BY receipt_id", (r["batch_id"],))
+        sibs = [dict(x) for x in c.fetchall()]
+        if len(sibs) > 1:
+            batch_box = ('<div class="card" style="max-width:560px;margin-top:12px;"><b>Bills made together</b><div style="margin-top:6px;line-height:2;">'
+                         + "".join(f'<div>{"➡️ " if x["receipt_id"] == receipt_id else ""}<a href="/billing/receipt/{x["receipt_id"]}">'
+                                   f'{html.escape(x["receipt_no"])}</a> — {html.escape(x["installment_label"] or "")} — ₹{float(x["total"]):,.2f} '
+                                   f'<a href="/billing/receipt/{x["receipt_id"]}/pdf" style="font-size:12px;">⬇ PDF</a></div>' for x in sibs)
+                         + '</div></div>')
     content = f"""
     <h1>🧾 Receipt {html.escape(r['receipt_no'])}</h1>
     <div class="card" style="max-width:560px;border:2px solid var(--accent);">
@@ -5988,6 +6109,7 @@ def billing_receipt(receipt_id):
       </div>
       {row('Received From', r['received_from'])}{row('Date', datetime.strptime(r['receipt_date'], '%Y-%m-%d').strftime('%d/%m/%Y'))}
       {row('Vehicle No.', r['vehicle_number'])}{row('Installment No.', r['installment_label'])}{row('Loan No.', r['loan_number'])}
+      {row('Also paid', f"₹{float(r['extra_amount']):,.2f} towards {r.get('extra_label') or 'the next due'} (excess on the same bill)") if r.get('extra_amount') else ''}
       {row('Cash', f"₹{float(r['cash'] or 0):,.2f}")}{row('Online', f"₹{float(r['online'] or 0):,.2f}")}
       <div style="display:flex;gap:10px;padding:10px 0;font-size:18px;font-weight:800;"><div style="width:130px;color:var(--accent);">Total</div><div>₹{float(r['total']):,.2f}</div></div>
       {row('Rupees', r['amount_words'])}{row('Cashier', r['cashier'])}
@@ -5996,6 +6118,7 @@ def billing_receipt(receipt_id):
            2:'⏳ Payment is awaiting acknowledgement; it will be recorded on the EMI once acknowledged.',
            3:'❌ The payment was not acknowledged, so it was NOT recorded on the EMI.'}).get(r['recorded_on_emi'], 'Receipt only — no EMI payment was recorded.')}</div>
     </div>
+    {batch_box}
     <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
       <a class="btn btn-success" href="/billing/receipt/{receipt_id}/pdf">⬇ Download Bill (PDF)</a>
       <a class="btn btn-primary" href="/billing">🧾 New Bill / Search</a>
