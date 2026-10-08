@@ -184,7 +184,7 @@ def loan_vehicles(loan):
     """Every vehicle on a loan: the main one (vehicle_id None) first, then the add-on vehicles."""
     keys = ("vehicle_type", "vehicle_number", "vehicle_name", "vehicle_model", "engine_number", "chassis_number",
             "vehicle_colour", "key_received", "key_received_date", "rc_received", "rc_received_date",
-            "docs_received", "docs_received_date")
+            "docs_received", "docs_received_date", "key_collected_by", "rc_collected_by", "docs_collected_by")
     main = {"vehicle_id": None, "seq": 1, **{k: loan.get(k) for k in keys}}
     c = get_cur(); c.execute("SELECT * FROM LoanVehicles WHERE loan_id=? ORDER BY seq, vehicle_id", (loan["id"],))
     return [main] + [dict(r) for r in c.fetchall()]
@@ -347,6 +347,14 @@ window.addExtraBlock=function(kind){
   if(window.toggleReloan && document.querySelector('[name=is_reloan]')) toggleReloan(document.querySelector('[name=is_reloan]').value);
   host.lastElementChild.scrollIntoView({behavior:'smooth',block:'center'});
 };
+window.toggleHO=function(sel){
+  var g=sel.closest('.form-group'), d=g.querySelector('.ho-detail'); if(!d) return;
+  var yes=sel.value==='yes', by=d.querySelector('input:not([type=date])'), dt=d.querySelector('input[type=date]');
+  d.style.display=yes?'flex':'none';
+  if(yes){ by.setAttribute('required','required');
+    if(!dt.value){ var ld=document.getElementById('loan_date'); dt.value=(ld&&ld.value)?ld.value:new Date().toISOString().slice(0,10); } }
+  else { by.removeAttribute('required'); }
+};
 window.removeExtraBlock=function(btn){
   var b=btn.closest('.xblock');
   if(b.dataset.existing==='1'){
@@ -379,8 +387,14 @@ def _xblock_shell(kind, n, existing, inner, extra_note=""):
             f'<button type="button" class="btn btn-sm btn-danger" onclick="removeExtraBlock(this)">✖ Remove</button></div>'
             f'<div class="form-grid">{inner}</div></div>')
 
+def handover_detail_html(date_name, by_name):
+    """'When collected' + 'Collected by' inputs, shown only when the answer is Yes (toggleHO)."""
+    return (f'<div class="ho-detail" style="display:none;gap:6px;flex-wrap:wrap;margin-top:6px;">'
+            f'<input type="date" name="{date_name}" max="{date.today().isoformat()}" title="When collected" style="flex:1;min-width:130px;">'
+            f'<input name="{by_name}" placeholder="Collected by *" style="flex:1;min-width:130px;"></div>')
+
 def _yn_select(name, required=True):
-    return (f'<select name="{name}"{" required" if required else ""}><option value="">-- Select --</option>'
+    return (f'<select name="{name}" onchange="toggleHO(this)"{" required" if required else ""}><option value="">-- Select --</option>'
             f'<option value="yes">Yes</option><option value="no">No</option></select>')
 
 def extra_vehicle_block(v=None, n=2):
@@ -405,11 +419,14 @@ def extra_vehicle_block(v=None, n=2):
     if existing:
         inner += ('<input type="hidden" name="xv_key[]" value=""><input type="hidden" name="xv_rc[]" value="">'
                   '<input type="hidden" name="xv_docs[]" value="">'
+                  + "".join(f'<input type="hidden" name="xv_{k}_{w}[]" value="">' for k in ("key", "rc", "docs") for w in ("date", "by")) +
+                  ''
                   f'<div class="form-group full" style="font-size:12.5px;">{handover_status_html(v)}</div>')
     else:
-        inner += (f'<div class="form-group"><label>Key Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 3 days)</span></label>{_yn_select("xv_key[]")}</div>'
-                  f'<div class="form-group"><label>RC Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 15 days)</span></label>{_yn_select("xv_rc[]")}</div>'
-                  f'<div class="form-group"><label>Proof &amp; Documents Collected? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 3 days)</span></label>{_yn_select("xv_docs[]")}</div>')
+        def ho(question, short):
+            return (f'<div class="form-group"><label>{question} * <span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days(short)} days)</span></label>'
+                    f'{_yn_select("xv_" + short + "[]")}{handover_detail_html("xv_" + short + "_date[]", "xv_" + short + "_by[]")}</div>')
+        inner += ho("Key Received?", "key") + ho("RC Received?", "rc") + ho("Proof &amp; Documents Collected?", "docs")
     return _xblock_shell("vehicle", n, existing, inner)
 
 def extra_guarantor_block(g_=None, n=2):
@@ -446,11 +463,12 @@ def extra_blocks_section(loan_id=None):
 def handover_status_html(v):
     """Key / RC / Proof status of one vehicle, e.g. '🔑 Key ✔ 12/09/2026 · 📄 RC ✖ pending · 🗂️ Proof ✔ 12/09/2026'."""
     out = []
-    for icon, label, flag, dt in (("🔑", "Key", "key_received", "key_received_date"),
-                                  ("📄", "RC", "rc_received", "rc_received_date"),
-                                  ("🗂️", "Proof", "docs_received", "docs_received_date")):
+    for icon, label, flag, dt, by in (("🔑", "Key", "key_received", "key_received_date", "key_collected_by"),
+                                      ("📄", "RC", "rc_received", "rc_received_date", "rc_collected_by"),
+                                      ("🗂️", "Proof", "docs_received", "docs_received_date", "docs_collected_by")):
         if v.get(flag) == "yes":
-            out.append(f'{icon} {label} <span style="color:var(--green);">✔ {fmt_date(v.get(dt), "received")}</span>')
+            who = f' by {html.escape(v[by])}' if v.get(by) else ""
+            out.append(f'{icon} {label} <span style="color:var(--green);">✔ {fmt_date(v.get(dt), "received")}{who}</span>')
         else:
             out.append(f'{icon} {label} <span style="color:var(--red);">✖ pending</span>')
     return " · ".join(out)
@@ -482,6 +500,9 @@ def parse_extra_vehicles(form, reloan):
         if not r["id"]:
             for k, lab in (("key", "Key Received"), ("rc", "RC Received"), ("docs", "Proof & Documents Collected")):
                 if r[k] not in ("yes", "no"): raise ValueError(f"{label}: please answer '{lab}?' (Yes / No).")
+                if r[k] == "yes":
+                    r[k + "_date"], r[k + "_by"] = parse_collected(_form_list(form, f"xv_{k}_date[]", i), _form_list(form, f"xv_{k}_by[]", i),
+                                                                   f"{label}: {lab}")
         out.append(r)
     return out
 
@@ -990,6 +1011,17 @@ def init_db():
         "ALTER TABLE LoanEntry ADD COLUMN vehicle_name TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN loan_date TEXT",
         "ALTER TABLE ClosureItems ADD COLUMN vehicle_id INTEGER",
+        "ALTER TABLE PreClosure ADD COLUMN requested_rate REAL",
+        "ALTER TABLE PreClosure ADD COLUMN penalty_amount REAL",
+        "ALTER TABLE PreClosure ADD COLUMN penalty_days INTEGER",
+        "ALTER TABLE LoanEntry ADD COLUMN key_collected_by TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN rc_collected_by TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN docs_collected_by TEXT",
+        "ALTER TABLE LoanVehicles ADD COLUMN key_collected_by TEXT",
+        "ALTER TABLE LoanVehicles ADD COLUMN rc_collected_by TEXT",
+        "ALTER TABLE LoanVehicles ADD COLUMN docs_collected_by TEXT",
+        "ALTER TABLE FollowUp ADD COLUMN recv_date TEXT",
+        "ALTER TABLE FollowUp ADD COLUMN recv_by TEXT",
         "ALTER TABLE EMI ADD COLUMN penalty_due REAL DEFAULT 0",
         "ALTER TABLE EMI ADD COLUMN penalty_paid REAL DEFAULT 0",
         "ALTER TABLE EMIPayments ADD COLUMN penalty_part REAL DEFAULT 0",
@@ -1084,19 +1116,23 @@ def create_loan(ln, cname, cmobile, caddr, cloc,
     get_db().commit(); return c.lastrowid
 
 def record_handover_details(loan_id, loan_date_val, field_visit, field_visit_date,
-                            field_visit_remark, answers, username, visited_by=""):
+                            field_visit_remark, answers, username, visited_by="", collected=None):
     """Saves the field-visit / key / RC / documents answers. 'Yes' items are stamped with the
     loan date; 'No' items get an automatic follow-up (key 3 days, proof & documents 3 days,
     RC 15 days after the loan date)."""
     loan_iso = loan_date_val.isoformat()
+    col = collected or {}
+    def got(short, flag):       # (collected date, collected by) of a 'Yes' item
+        if answers[flag] != "yes": return None, None
+        d, by = col.get(short, (None, None))
+        return (d or loan_iso), (by or None)
+    kd, kb = got("key", "key_received"); rd, rb = got("rc", "rc_received"); dd, db_ = got("docs", "docs_received")
     c = get_cur()
     c.execute("""UPDATE LoanEntry SET field_visit=?, field_visit_date=?, field_visit_remark=?, field_visited_by=?,
-                    key_received=?, key_received_date=?, rc_received=?, rc_received_date=?,
-                    docs_received=?, docs_received_date=? WHERE id=?""",
+                    key_received=?, key_received_date=?, key_collected_by=?, rc_received=?, rc_received_date=?, rc_collected_by=?,
+                    docs_received=?, docs_received_date=?, docs_collected_by=? WHERE id=?""",
               (field_visit, field_visit_date, field_visit_remark or None, visited_by or None,
-               answers["key_received"],  loan_iso if answers["key_received"]  == "yes" else None,
-               answers["rc_received"],   loan_iso if answers["rc_received"]   == "yes" else None,
-               answers["docs_received"], loan_iso if answers["docs_received"] == "yes" else None,
+               answers["key_received"], kd, kb, answers["rc_received"], rd, rb, answers["docs_received"], dd, db_,
                loan_id))
     get_db().commit()
     schedule_handover_followups(loan_id, loan_date_val, answers, username)
@@ -1104,13 +1140,32 @@ def record_handover_details(loan_id, loan_date_val, field_visit, field_visit_dat
 HANDOVER_PLAN = (("key_received",  "key",  "Key Collection",    3,  "Collect vehicle key from customer"),
                  ("rc_received",   "rc",   "Proof & Documents", 15, "Collect RC book from customer"),
                  ("docs_received", "docs", "Proof & Documents", 3,  "Collect proof & documents from customer"))
+HANDOVER_DEFAULT_DAYS = {"key": 3, "rc": 15, "docs": 3}
+HANDOVER_LABELS = {"key": "Key", "rc": "RC", "docs": "Proof & Documents"}
+
+def handover_days(item):
+    """Follow-up days for a 'No' answer (key / rc / docs); the Super Admin sets them on the Users page."""
+    try: return max(1, int(get_setting(f"followup_days_{item}", HANDOVER_DEFAULT_DAYS[item])))
+    except (TypeError, ValueError): return HANDOVER_DEFAULT_DAYS[item]
+
+def parse_collected(date_s, by_s, label, default_iso=""):
+    """'When collected' (optional, defaults to default_iso) and 'Collected by' (free text, required)."""
+    by = (by_s or "").strip()
+    if not by: raise ValueError(f"{label}: please enter who collected it.")
+    d = default_iso
+    if (date_s or "").strip():
+        try: dd = datetime.strptime(date_s.strip(), "%Y-%m-%d").date()
+        except ValueError: raise ValueError(f"{label}: invalid collected date.")
+        if dd > date.today(): raise ValueError(f"{label}: the collected date cannot be in the future.")
+        d = dd.isoformat()
+    return d, by
 
 def schedule_handover_followups(loan_id, base_date, answers, username, vehicle_id=None, vtag=""):
     """A 'No' answer for key / RC / proof creates a follow-up (key 3 days, proof 3 days, RC 15 days after base_date).
     For an add-on vehicle the follow-up carries the vehicle id in ref_id, so resolving it updates that vehicle only."""
-    for field, item, category, days, remark in HANDOVER_PLAN:
+    for field, item, category, _days, remark in HANDOVER_PLAN:
         if answers.get(field) == "no":
-            add_follow_up(loan_id, (base_date + timedelta(days=days)).isoformat(),
+            add_follow_up(loan_id, (base_date + timedelta(days=handover_days(item))).isoformat(),
                           remark + (f" — {vtag}" if vtag else ""), username, category, item, ref_id=vehicle_id)
 
 def save_extra_vehicles(loan_id, rows, base_date, username):
@@ -1136,15 +1191,16 @@ def save_extra_vehicles(loan_id, rows, base_date, username):
         c.execute("SELECT COALESCE(MAX(seq),1) as m FROM LoanVehicles WHERE loan_id=?", (loan_id,))
         seq = int(c.fetchone()["m"]) + 1
         stamp = base_date.isoformat()
+        def got(k):         # (collected date, collected by) for a 'Yes' item
+            return ((r.get(k + "_date") or stamp), r.get(k + "_by")) if r[k] == "yes" else (None, None)
+        (kd, kb), (rd, rb), (dd, db_) = got("key"), got("rc"), got("docs")
         c.execute("""INSERT INTO LoanVehicles (loan_id,seq,vehicle_type,vehicle_number,vehicle_name,vehicle_model,
-                       engine_number,chassis_number,vehicle_colour,key_received,key_received_date,rc_received,
-                       rc_received_date,docs_received,docs_received_date)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       engine_number,chassis_number,vehicle_colour,key_received,key_received_date,key_collected_by,
+                       rc_received,rc_received_date,rc_collected_by,docs_received,docs_received_date,docs_collected_by)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (loan_id, seq, r["vehicle_type"], r["vehicle_number"], r["vehicle_name"], r["vehicle_model"],
                    r["engine_number"], r["chassis_number"], r["vehicle_colour"],
-                   r["key"], stamp if r["key"] == "yes" else None,
-                   r["rc"], stamp if r["rc"] == "yes" else None,
-                   r["docs"], stamp if r["docs"] == "yes" else None))
+                   r["key"], kd, kb, r["rc"], rd, rb, r["docs"], dd, db_))
         vid = c.lastrowid
         get_db().commit()
         schedule_handover_followups(loan_id, base_date,
@@ -1325,7 +1381,7 @@ def preclosure_in_progress(loan_id):
     pc = get_preclosure(loan_id)
     return bool(pc and pc["status"] in ("Pending", "Approved"))
 
-def request_preclosure(loan_id, username):
+def request_preclosure(loan_id, username, penalty_rate=None):
     c = get_cur()
     c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
     loan = c.fetchone()
@@ -1334,12 +1390,27 @@ def request_preclosure(loan_id, username):
     if preclosure_in_progress(loan_id): raise ValueError("A pre-closure request is already open for this loan.")
     if get_open_closure(loan_id): raise ValueError("This loan is already being closed.")
     if get_open_seizure(loan_id): raise ValueError("A vehicle seizure is open for this loan.")
-    c.execute("""INSERT INTO PreClosure (loan_id,status,requested_by,requested_at,original_rate)
-                 VALUES (?,?,?,?,?)""",
-              (loan_id, "Pending", username, datetime.now(timezone.utc).isoformat(), float(loan["interest_rate"])))
+    try: rate = float(penalty_rate) if str(penalty_rate or "").strip() else 0.0
+    except ValueError: raise ValueError("Enter a valid penalty per day.")
+    if rate < 0: raise ValueError("Penalty per day cannot be negative.")
+    c.execute("""INSERT INTO PreClosure (loan_id,status,requested_by,requested_at,original_rate,requested_rate)
+                 VALUES (?,?,?,?,?,?)""",
+              (loan_id, "Pending", username, datetime.now(timezone.utc).isoformat(), float(loan["interest_rate"]), rate or None))
     get_db().commit()
 
-def approve_preclosure(preclose_id, new_rate_pct, username):
+def preclosure_overdue_rows(loan_id):
+    """Overdue unpaid EMIs that do not have a penalty yet: [(emi, days overdue)] — these get the pre-closure penalty."""
+    out = []
+    c = get_cur()
+    for e in overdue_emis(loan_id):
+        c.execute("SELECT 1 FROM Penalties WHERE emi_id=? AND status!='Rejected'", (e["emi_id"],))
+        if c.fetchone(): continue
+        days = (date.today() - parse_date(e["due_date"])).days
+        if days > 0: out.append((e, days))
+    return out
+
+def approve_preclosure(preclose_id, new_rate_pct, username, pending_rates=None, overdue_rates=None):
+    pending_rates, overdue_rates = pending_rates or {}, overdue_rates or {}
     c = get_cur()
     c.execute("SELECT * FROM PreClosure WHERE preclose_id=?", (preclose_id,))
     pc = c.fetchone()
@@ -1351,11 +1422,38 @@ def approve_preclosure(preclose_id, new_rate_pct, username):
     if new_rate < 0: raise ValueError("Interest rate cannot be negative.")
     if new_rate > float(pc["original_rate"]) + 1e-9:
         raise ValueError(f"The reduced rate cannot be higher than the loan's rate ({float(pc['original_rate'])*100:.2f}%).")
+    # validate every penalty rate before anything is changed
+    lid = pc["loan_id"]
+    c.execute("SELECT * FROM Penalties WHERE loan_id=? AND status='Pending' ORDER BY penalty_id", (lid,))
+    pend = [dict(r) for r in c.fetchall()]
+    def _rate(raw, default):
+        try: val = float(raw) if raw not in (None, "") else float(default or 0)
+        except (TypeError, ValueError): raise ValueError("Enter a valid penalty per day.")
+        if val < 0: raise ValueError("Penalty per day cannot be negative.")
+        return val
+    chosen_p = {p["penalty_id"]: _rate(pending_rates.get(p["penalty_id"]), p["requested_rate"]) for p in pend}
+    chosen_o = []
+    for e, days in preclosure_overdue_rows(lid):
+        val = _rate(overdue_rates.get(e["emi_id"]), pc["requested_rate"])
+        if val > 0: chosen_o.append((e, days, val))
+    now = datetime.now(timezone.utc).isoformat()
+    for p in pend:              # penalties raised on earlier payments: approved (added to the unpaid EMI) or waived at 0
+        approve_penalty(p["penalty_id"], chosen_p[p["penalty_id"]], username)
+    c = get_cur()
+    for e, days, val in chosen_o:   # overdue days of the unpaid EMIs: penalty = days x rate, added to that EMI
+        amt = round(days * val, 2)
+        c.execute("""INSERT INTO Penalties (loan_id,emi_id,installment_no,days,requested_rate,requested_amount,requested_by,requested_at,
+                     status,final_rate,final_amount,decided_by,decided_at,merged_emi_id,decision_remarks)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (lid, e["emi_id"], e["installment_no"], days, val, amt, pc["requested_by"], pc["requested_at"], "Approved",
+                   val, amt, username, now, e["emi_id"], "Pre-closure: overdue days"))
+        c.execute("UPDATE EMI SET penalty_due=COALESCE(penalty_due,0)+? WHERE emi_id=?", (amt, e["emi_id"]))
+    get_db().commit()
     fig = preclosure_figures(loan, new_rate)
+    total_days = sum(d for _, d, _ in chosen_o)
     c.execute("""UPDATE PreClosure SET status='Approved', new_rate=?, months_elapsed=?, paid_before=?,
-                 settlement_amount=?, approved_by=?, approved_at=? WHERE preclose_id=?""",
-              (new_rate, fig["months"], fig["paid"], fig["settlement"], username,
-               datetime.now(timezone.utc).isoformat(), preclose_id))
+                 settlement_amount=?, penalty_amount=?, penalty_days=?, approved_by=?, approved_at=? WHERE preclose_id=?""",
+              (new_rate, fig["months"], fig["paid"], fig["settlement"], fig["penalty"], total_days, username, now, preclose_id))
     get_db().commit()
 
 def reject_preclosure(preclose_id, reason, username):
@@ -2212,7 +2310,7 @@ def list_closed_loans(search=""):
     rows = [dict(r) for r in c.fetchall()]
     for r in rows:
         c2 = get_cur()
-        c2.execute("""SELECT new_rate, original_rate, settlement_amount, bill_number FROM PreClosure
+        c2.execute("""SELECT new_rate, original_rate, settlement_amount, bill_number, penalty_amount FROM PreClosure
                       WHERE loan_id=? AND status='Completed' ORDER BY preclose_id DESC LIMIT 1""", (r["loan_id"],))
         pc = c2.fetchone()
         r["preclosure"] = dict(pc) if pc else None
@@ -2297,21 +2395,25 @@ def add_follow_up(loan_id, follow_up_date, remarks, created_by, category="Loans"
     get_db().commit()
     return c.lastrowid
 
-def resolve_follow_up(followup_id):
+FU_ITEM_BY = {"key": "key_collected_by", "rc": "rc_collected_by", "docs": "docs_collected_by"}
+
+def resolve_follow_up(followup_id, recv_date=None, recv_by=None):
     """Closes the follow-up. For Key / RC / Proof follow-ups it also marks that item as received (with
     today's date) on the loan record; for a Penalty follow-up it marks the penalty as collected."""
     c = get_cur(); now = datetime.now(timezone.utc).isoformat()
-    c.execute("SELECT loan_id, item, ref_id FROM FollowUp WHERE followup_id=?", (followup_id,))
+    c.execute("SELECT loan_id, item, ref_id, recv_date, recv_by FROM FollowUp WHERE followup_id=?", (followup_id,))
     row = c.fetchone()
     c.execute("UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE followup_id=?", (now, followup_id))
     if row and row["item"] in FU_ITEM_COLUMNS:
         col, col_date = FU_ITEM_COLUMNS[row["item"]]
+        by_col = FU_ITEM_BY[row["item"]]
+        rd = recv_date or row["recv_date"] or date.today().isoformat()
+        rb = recv_by or row["recv_by"]
+        c.execute("UPDATE FollowUp SET recv_date=?, recv_by=? WHERE followup_id=?", (rd, rb, followup_id))
         if row["ref_id"]:       # an add-on vehicle's key / RC / proof
-            c.execute(f"UPDATE LoanVehicles SET {col}='yes', {col_date}=? WHERE vehicle_id=?",
-                      (date.today().isoformat(), row["ref_id"]))
+            c.execute(f"UPDATE LoanVehicles SET {col}='yes', {col_date}=?, {by_col}=? WHERE vehicle_id=?", (rd, rb, row["ref_id"]))
         else:
-            c.execute(f"UPDATE LoanEntry SET {col}='yes', {col_date}=? WHERE id=?",
-                      (date.today().isoformat(), row["loan_id"]))
+            c.execute(f"UPDATE LoanEntry SET {col}='yes', {col_date}=?, {by_col}=? WHERE id=?", (rd, rb, row["loan_id"]))
     if row and row["item"] == "penalty" and row["ref_id"]:
         c.execute("UPDATE Penalties SET status='Collected', collected_at=? WHERE penalty_id=? AND status='Approved'",
                   (now, row["ref_id"]))
@@ -2319,13 +2421,14 @@ def resolve_follow_up(followup_id):
     if row and row["item"] == "penalty":
         closure_advance(row["loan_id"])     # last penalty collected -> key / document return unlocks
 
-def request_followup_ack(followup_id, username, note=""):
+def request_followup_ack(followup_id, username, note="", recv_date=None, recv_by=None):
     """A follow-up is not closed directly: it goes to the acknowledger for a cross-check first."""
     c = get_cur(); c.execute("SELECT status FROM FollowUp WHERE followup_id=?", (followup_id,))
     row = c.fetchone()
     if not row or row["status"] != "Pending": raise ValueError("This follow-up is not open.")
-    c.execute("""UPDATE FollowUp SET status='AwaitingAck', ack_requested_by=?, ack_requested_at=?, ack_note=?
-                 WHERE followup_id=?""", (username, datetime.now(timezone.utc).isoformat(), (note or "").strip(), followup_id))
+    c.execute("""UPDATE FollowUp SET status='AwaitingAck', ack_requested_by=?, ack_requested_at=?, ack_note=?,
+                 recv_date=COALESCE(?,recv_date), recv_by=COALESCE(?,recv_by) WHERE followup_id=?""",
+              (username, datetime.now(timezone.utc).isoformat(), (note or "").strip(), recv_date, recv_by, followup_id))
     get_db().commit()
 
 def acknowledge_followup(followup_id, username):
@@ -3872,6 +3975,15 @@ def add_loan():
                 flash(f"Please answer '{label}?' (Yes / No).","danger")
                 return redirect(url_for("add_loan"))
             handover[key] = ans
+        collected = {}
+        try:
+            for short, flag, lab in (("key", "key_received", "Key Received"), ("rc", "rc_received", "RC Received"),
+                                     ("docs", "docs_received", "Proof & Documents Collected")):
+                if handover[flag] == "yes":
+                    collected[short] = parse_collected(f.get(short + "_date"), f.get(short + "_by"), lab, loan_date_val.isoformat())
+        except ValueError as e:
+            flash(str(e), "danger")
+            return redirect(url_for("add_loan"))
 
         # Resolve interest rate depending on calc_mode
         calc_mode = f.get("calc_mode","rate")
@@ -3908,7 +4020,7 @@ def add_loan():
             get_db().commit()
             record_handover_details(new_loan_id, loan_date_val, field_visit, field_visit_date,
                                     field_visit_remark, handover, session.get("username",""),
-                                    field_visited_by)
+                                    field_visited_by, collected)
             save_extra_vehicles(new_loan_id, extra_vehicles, loan_date_val, session.get("username",""))
             save_extra_guarantors(new_loan_id, extra_guarantors)
             flash("Loan submitted for approval.","success")
@@ -4149,16 +4261,18 @@ def add_loan():
           <input name="vehicle_colour" id="vehicle_colour" class="vehicle-req-field">
         </div>
         <div class="form-group">
-          <label>Key Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 3 days)</span></label>
-          <select name="key_received" id="key_received" required>
+          <label>Key Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days('key')} days)</span></label>
+          <select name="key_received" id="key_received" required onchange="toggleHO(this)">
             <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option>
           </select>
+          {handover_detail_html('key_date', 'key_by')}
         </div>
         <div class="form-group">
-          <label>RC Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 15 days)</span></label>
-          <select name="rc_received" id="rc_received" required>
+          <label>RC Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days('rc')} days)</span></label>
+          <select name="rc_received" id="rc_received" required onchange="toggleHO(this)">
             <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option>
           </select>
+          {handover_detail_html('rc_date', 'rc_by')}
         </div>
         <div class="form-group full" style="font-size:12px;color:var(--muted);">
           🚗 Giving two or three vehicles under this one loan number? Add each extra vehicle below &mdash; every vehicle has its own key / RC / proof status.
@@ -4167,10 +4281,11 @@ def add_loan():
 
         <div class="section-title">📎 Documents & Remarks</div>
         <div class="form-group">
-          <label>Proof &amp; Documents Collected? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in 3 days)</span></label>
-          <select name="docs_received" id="docs_received" required>
+          <label>Proof &amp; Documents Collected? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days('docs')} days)</span></label>
+          <select name="docs_received" id="docs_received" required onchange="toggleHO(this)">
             <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option>
           </select>
+          {handover_detail_html('docs_date', 'docs_by')}
         </div>
         <div class="form-group full">
           <label>Attachment <span style="font-size:10px;color:var(--muted);">(Upload to Google Drive)</span></label>
@@ -4666,6 +4781,28 @@ def approval():
         loan_like = dict(p); loan_like["id"] = p["loan_id"]
         fig = preclosure_figures(loan_like, 0.0)
         orig_pct = float(p["original_rate"]) * 100
+        c.execute("""SELECT pn.*, e.due_date FROM Penalties pn JOIN EMI e ON e.emi_id=pn.emi_id
+                     WHERE pn.loan_id=? AND pn.status='Pending' ORDER BY pn.installment_no""", (p["loan_id"],))
+        pc_pend = [dict(r) for r in c.fetchall()]
+        pc_over = preclosure_overdue_rows(p["loan_id"])
+        req_rate = float(p.get("requested_rate") or 0)
+        pen_lines = "".join(
+            f'<tr><td>{ordinal_due(x["installment_no"])}</td><td>{fmt_date(x["due_date"])}</td>'
+            f'<td><b>{int(x["days"])} days</b> <span style="color:var(--muted);font-size:11px;">(late payment)</span></td>'
+            f'<td><input type="number" name="rate_{x["penalty_id"]}" class="pc-prate" data-days="{int(x["days"])}" value="{float(x["requested_rate"]):.2f}" '
+            f'min="0" step="0.01" oninput="pcPreview(this)" style="width:110px;font-size:12px;padding:5px 6px;"></td><td class="pc-line">—</td></tr>' for x in pc_pend)
+        pen_lines += "".join(
+            f'<tr><td>{ordinal_due(e["installment_no"])}</td><td>{fmt_date(e["due_date"])}</td>'
+            f'<td><b style="color:var(--red);">{d} days overdue</b> <span style="color:var(--muted);font-size:11px;">(unpaid)</span></td>'
+            f'<td><input type="number" name="orate_{e["emi_id"]}" class="pc-orate" data-days="{d}" value="{req_rate:.2f}" '
+            f'min="0" step="0.01" oninput="pcPreview(this)" style="width:110px;font-size:12px;padding:5px 6px;"></td><td class="pc-line">—</td></tr>' for e, d in pc_over)
+        pen_block = (f'<div style="margin:10px 0 4px;font-weight:700;color:#7c3aed;">💰 Penalty for the closing (days × per-day amount)'
+                     f'{(" — requested " + fmt_inr(req_rate) + " per day") if req_rate else ""}</div>'
+                     f'<div class="table-wrap"><table><tr><th>Installment</th><th>Due</th><th>Delay (fixed)</th><th>Penalty per day (₹)</th><th>Penalty</th></tr>{pen_lines}</table></div>'
+                     if pen_lines else '<div style="font-size:13px;color:var(--green);margin:8px 0;">No overdue EMI, so no late penalty for this closing.</div>')
+        if fig["penalty"] > 0:
+            pen_block += (f'<div style="font-size:12.5px;margin:4px 0;">Penalty already added to unpaid EMIs: <b>{fmt_inr(fig["penalty"])}</b> '
+                          f'(included in the settlement).</div>')
         pc_cards += f"""
         <div class="card pc-card" data-principal="{float(p['loan_amount'])}" data-months="{fig['months']}" data-paid="{fig['paid']}" data-pen="{fig['penalty']}">
           <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
@@ -4694,6 +4831,7 @@ def approval():
                 <div class="pc-note" style="font-size:13px;line-height:1.7;padding:8px 10px;background:var(--surface2);border-radius:8px;min-height:42px;"></div>
               </div>
             </div>
+            {pen_block}
             <div style="margin-top:10px;display:flex;gap:8px;">
               <button type="submit" class="btn btn-success btn-sm">✅ Approve Pre-closure</button>
             </div>
@@ -4858,13 +4996,19 @@ def approval():
     <script>
     function pcPreview(input){{
       const card = input.closest('.pc-card');
-      const P = parseFloat(card.dataset.principal), m = parseInt(card.dataset.months), paid = parseFloat(card.dataset.paid), pen = parseFloat(card.dataset.pen)||0;
-      const r = parseFloat(input.value)||0;
+      const P = parseFloat(card.dataset.principal), m = parseInt(card.dataset.months), paid = parseFloat(card.dataset.paid), pen0 = parseFloat(card.dataset.pen)||0;
+      const r = parseFloat(card.querySelector('.pc-rate').value)||0;
+      let newPen = 0;
+      card.querySelectorAll('.pc-prate,.pc-orate').forEach(function(x){{
+        const a = Math.round((parseInt(x.dataset.days)||0)*(parseFloat(x.value)||0)*100)/100;
+        x.closest('tr').querySelector('.pc-line').textContent = fmtINR(a); newPen += a;
+      }});
+      const pen = pen0 + newPen;
       const interest = Math.round(P*r/100*m/12*100)/100;
       const settle = Math.max(0, Math.round((P+interest-paid+pen)*100)/100);
       card.querySelector('.pc-note').innerHTML =
         'Interest for '+m+' month(s): <b>'+fmtINR(interest)+'</b> &nbsp;|&nbsp; Loan + interest: <b>'+fmtINR(P+interest)+'</b><br>'+
-        'Less already paid '+fmtINR(paid)+(pen>0?' &nbsp;|&nbsp; Plus penalty added to EMIs '+fmtINR(pen):'')+' → <b style="color:var(--green);">Settlement to collect: '+fmtINR(settle)+'</b>';
+        'Less already paid '+fmtINR(paid)+(pen>0?' &nbsp;|&nbsp; Plus penalty '+fmtINR(pen):'')+' → <b style="color:var(--green);">Settlement to collect: '+fmtINR(settle)+'</b>';
     }}
     window.addEventListener('DOMContentLoaded',function(){{ document.querySelectorAll('.pc-rate').forEach(pcPreview); }});
     function penPreview(input){{
@@ -5418,7 +5562,8 @@ def emis(loan_id):
     preclose_box = ""
     if pc and pc["status"] == "Pending":
         preclose_box = (f'<span class="badge badge-pending" style="font-size:13px;padding:8px 12px;">'
-                        f'⏳ Pre-closure sent for admin approval (requested by {html.escape(pc.get("requested_by") or "")})</span>')
+                        f'⏳ Pre-closure sent for admin approval (requested by {html.escape(pc.get("requested_by") or "")}'
+                        f'{(" · penalty " + fmt_inr(pc["requested_rate"]) + "/day requested") if pc.get("requested_rate") else ""})</span>')
     elif pc and pc["status"] == "Approved":
         settle = float(pc["settlement_amount"] or 0)
         if settle > 0:
@@ -5440,23 +5585,35 @@ def emis(loan_id):
                         f'<b>✅ Pre-closure approved</b> by {html.escape(pc.get("approved_by") or "")}<br>'
                         f'Interest rate reduced <b>{float(pc["original_rate"] or 0)*100:.2f}% → {float(pc["new_rate"] or 0)*100:.2f}%</b> '
                         f'(for {int(pc["months_elapsed"] or 0)} month(s); already paid ₹{float(pc["paid_before"] or 0):,.2f})<br>'
+                        f'{("💰 Includes a penalty of <b>" + fmt_inr(pc["penalty_amount"]) + "</b>" + ((" for " + str(int(pc["penalty_days"])) + " overdue day(s)") if pc.get("penalty_days") else "") + "<br>") if float(pc.get("penalty_amount") or 0) > 0 else ""}'
                         f'{pay_line}{close_form if can_pay else ""}</div>')
     elif pc and pc["status"] == "Completed" and loan.get("status") == "Closed":
         preclose_box = (f'<span class="badge badge-closed" style="font-size:13px;padding:8px 12px;">'
                         f'⏩ Pre-closed on {fmt_date(pc.get("paid_on"), "")} — settled ₹{float(pc["settlement_amount"] or 0):,.2f} '
+                        f'{("(incl. penalty " + fmt_inr(pc["penalty_amount"]) + ") ") if float(pc.get("penalty_amount") or 0) > 0 else ""}'
                         f'(bill {html.escape(pc.get("bill_number") or "—")})</span>')
     elif pc and pc["status"] == "Completed":
         preclose_box = (f'<span class="badge badge-partial" style="font-size:13px;padding:8px 12px;">'
-                        f'⏩ Pre-closure bill paid on {fmt_date(pc.get("paid_on"), "")} (₹{float(pc["settlement_amount"] or 0):,.2f}) — '
+                        f'⏩ Pre-closure bill paid on {fmt_date(pc.get("paid_on"), "")} (₹{float(pc["settlement_amount"] or 0):,.2f}'
+                        f'{(", incl. penalty " + fmt_inr(pc["penalty_amount"])) if float(pc.get("penalty_amount") or 0) > 0 else ""}) — '
                         f'key &amp; document return is in progress below</span>')
     elif loan.get("status") == "Approved" and can_pay and not get_open_closure(loan_id) and not sz_live:
         rejected_note = ""
         if pc and pc["status"] == "Rejected":
             rejected_note = (f'<div style="font-size:12px;color:var(--red);margin-bottom:6px;text-align:right;">'
                              f'Last pre-closure request was rejected: {html.escape(pc.get("decision_remarks") or "")}</div>')
-        preclose_box = (f'<div>{rejected_note}<form method="POST" action="/preclose/request/{loan_id}" '
-                        f'onsubmit="return confirm(\'Send a pre-closure request to the admin for approval?\')">'
-                        f'<button class="btn btn-amber">⏩ Pre-Close Loan</button></form></div>')
+        od_rows = preclosure_overdue_rows(loan_id)
+        od_note = ""
+        if od_rows:
+            od_note = (f'<div style="font-size:12.5px;margin-bottom:8px;line-height:1.6;"><b style="color:var(--red);">{len(od_rows)} overdue EMI(s)</b> '
+                       f'({sum(d for _, d in od_rows)} overdue days in total). Enter a per-day penalty to send a penalty (days × amount) '
+                       f'to the approver, or leave it blank for none.</div>'
+                       f'<div class="form-group" style="margin-bottom:8px;"><label>Penalty per day (₹) — optional</label>'
+                       f'<input type="number" name="penalty_rate" min="0" step="0.01" placeholder="e.g. 10"></div>')
+        preclose_box = (f'<div>{rejected_note}<details style="max-width:380px;"><summary class="btn btn-amber" style="list-style:none;cursor:pointer;display:inline-block;">⏩ Pre-Close Loan</summary>'
+                        f'<form method="POST" action="/preclose/request/{loan_id}" class="card" style="margin-top:8px;padding:12px;" '
+                        f'onsubmit="return confirm(\'Send a pre-closure request to the admin for approval?\')">{od_note}'
+                        f'<button class="btn btn-amber btn-sm">Send pre-closure request</button></form></details></div>')
     seizure_box = ""
     if sz_live and sz_live["status"] == "Pending":
         seizure_box = (f'<span class="badge badge-pending" style="font-size:13px;padding:8px 12px;">'
@@ -5864,7 +6021,7 @@ def billing_receipt_pdf(receipt_id):
 @role_required("superadmin","admin","manager","fieldpia")
 def preclose_request(loan_id):
     try:
-        request_preclosure(loan_id, session.get("username",""))
+        request_preclosure(loan_id, session.get("username",""), request.form.get("penalty_rate"))
         flash("Pre-closure request sent to the admin for approval.","success")
     except Exception as e:
         flash(str(e),"danger")
@@ -5875,8 +6032,12 @@ def preclose_request(loan_id):
 @role_required("superadmin","admin")
 def preclose_approve(preclose_id):
     try:
-        approve_preclosure(preclose_id, request.form.get("new_rate",""), session.get("username",""))
-        flash("Pre-closure approved. The staff can now record the closing bill.","success")
+        pr, orr = {}, {}
+        for k, v in request.form.items():
+            if k.startswith("rate_") and k[5:].isdigit(): pr[int(k[5:])] = v
+            elif k.startswith("orate_") and k[6:].isdigit(): orr[int(k[6:])] = v
+        approve_preclosure(preclose_id, request.form.get("new_rate",""), session.get("username",""), pr, orr)
+        flash("Pre-closure approved. The staff can now record the closing bill (penalty included).","success")
     except Exception as e:
         flash(str(e),"danger")
     return redirect(url_for("approval"))
@@ -6049,11 +6210,17 @@ def followup_add():
 @login_required
 def followup_resolve(followup_id):
     try:
+        c = get_cur(); c.execute("SELECT item FROM FollowUp WHERE followup_id=?", (followup_id,))
+        fr = c.fetchone()
+        recv_date = recv_by = None
+        if fr and fr["item"] in FU_ITEM_COLUMNS:       # key / RC / proof: ask when and by whom it was collected
+            recv_date, recv_by = parse_collected(request.form.get("recv_date"), request.form.get("recv_by"),
+                                                 HANDOVER_LABELS[fr["item"]], date.today().isoformat())
         if session.get("role","") in DIRECT_ROLES:
-            resolve_follow_up(followup_id)
+            resolve_follow_up(followup_id, recv_date, recv_by)
             flash("Follow-up marked as resolved.","success")
         else:
-            request_followup_ack(followup_id, session.get("username",""), request.form.get("note",""))
+            request_followup_ack(followup_id, session.get("username",""), request.form.get("note",""), recv_date, recv_by)
             flash("Sent for acknowledgement. The follow-up closes once an Associate Manager or admin acknowledges it.","success")
     except Exception as e:
         flash(str(e),"danger")
@@ -6116,6 +6283,7 @@ def acknowledgements():
               <span class="badge badge-partial" style="margin-left:6px;">{html.escape(f['cat'])}</span>
               <div style="font-size:12.5px;margin-top:4px;line-height:1.7;">
                 {html.escape(f.get('remarks') or '')}<br>
+                {('<b>Collected on ' + fmt_date(f.get('recv_date')) + ' by ' + html.escape(f.get('recv_by') or '') + '</b><br>') if f.get('recv_by') else ''}
                 <span style="color:var(--muted);">Follow-up date {fmt_date(f['follow_up_date'])} · marked done by <b>{html.escape(f.get('ack_requested_by') or '')}</b>
                 on {fmt_date((f.get('ack_requested_at') or '')[:10])}{(' · note: ' + html.escape(f['ack_note'])) if f.get('ack_note') else ''}</span>
               </div>
@@ -6419,6 +6587,20 @@ def seizure_reopen(seizure_id):
         flash(str(e), "danger")
     return _back_to_emis(loan_id, "")
 
+@app.route("/settings/followup_days", methods=["POST"])
+@login_required
+@role_required("superadmin")
+def settings_followup_days():
+    try:
+        vals = {k: int(request.form.get("days_" + k, "")) for k in ("key", "rc", "docs")}
+        if any(v < 1 or v > 365 for v in vals.values()): raise ValueError
+    except ValueError:
+        flash("Enter whole numbers between 1 and 365.", "danger")
+        return redirect(url_for("users"))
+    for k, v in vals.items(): set_setting(f"followup_days_{k}", v)
+    flash(f"Saved: follow-up after Key {vals['key']} day(s), RC {vals['rc']} day(s), Proof & Documents {vals['docs']} day(s).", "success")
+    return redirect(url_for("users"))
+
 @app.route("/settings/seizure", methods=["POST"])
 @login_required
 @role_required("superadmin")
@@ -6498,9 +6680,15 @@ def followups():
         else:
             resolve_label = "✔ Mark done"
             resolve_tip = "Goes to an Associate Manager / admin for acknowledgement before it closes"
+        recv_fields = ""
+        if r.get("item") in FU_ITEM_COLUMNS:
+            recv_fields = (f'<input type="date" name="recv_date" value="{today.isoformat()}" max="{today.isoformat()}" required title="When collected" '
+                           f'style="width:128px;font-size:12px;padding:4px 5px;">'
+                           f'<input name="recv_by" placeholder="Collected by *" required style="width:120px;font-size:12px;padding:4px 5px;">')
         resolve_btn = "" if not is_open else f"""
-          <form method="POST" action="/followup/resolve/{r['followup_id']}" style="display:inline;">
+          <form method="POST" action="/followup/resolve/{r['followup_id']}" style="display:inline-flex;gap:4px;flex-wrap:wrap;align-items:center;">
             <input type="hidden" name="next" value="{back_url}">
+            {recv_fields}
             <button class="btn btn-sm btn-success" title="{resolve_tip}">{resolve_label}</button>
           </form>"""
         reschedule_form = "" if not (is_open and r["category"] != "Loans") else f"""
@@ -6642,7 +6830,7 @@ def closed():
         pc = l.get("preclosure")
         if not pc: return "Regular"
         return (f'<span class="badge badge-partial">⏩ Pre-closed</span><br>'
-                f'<span style="font-size:11px;color:var(--muted);">Settled ₹{float(pc["settlement_amount"] or 0):,.2f} · '
+                f'<span style="font-size:11px;color:var(--muted);">Settled ₹{float(pc["settlement_amount"] or 0):,.2f}{(" (incl. penalty " + fmt_inr(pc["penalty_amount"]) + ")") if float(pc.get("penalty_amount") or 0) > 0 else ""} · '
                 f'rate {float(pc["original_rate"] or 0)*100:.2f}% → {float(pc["new_rate"] or 0)*100:.2f}% · bill {html.escape(str(pc["bill_number"] or ""))}</span>')
     def handover_cell(l):
         z = l.get("seizure")
@@ -7073,9 +7261,24 @@ def users():
       </form>
       <p style="font-size:12px;color:var(--muted);margin-top:6px;">Seizing is always optional: it only makes the button available. Currently: {seizure_threshold()} or more overdue EMIs.</p>
     </div>"""
+    followup_rule = ""
+    if is_super:
+        fields = "".join(
+            f'<div class="form-group"><label>{HANDOVER_LABELS[k]} — follow-up after (days)</label>'
+            f'<input type="number" name="days_{k}" value="{handover_days(k)}" min="1" max="365" required style="max-width:130px;"></div>'
+            for k in ("key", "rc", "docs"))
+        followup_rule = f"""<div class="card" style="margin-bottom:12px;">
+      <h2>📞 Follow-up timing</h2>
+      <form method="POST" action="/settings/followup_days" style="display:flex;gap:14px;align-items:end;flex-wrap:wrap;">
+        {fields}
+        <button class="btn btn-primary">Save</button>
+      </form>
+      <p style="font-size:12px;color:var(--muted);margin-top:6px;">When a new loan is entered with Key / RC / Proof &amp; Documents = No, the follow-up is set this many days after the loan date. Existing follow-ups keep their dates.</p>
+    </div>"""
     content = f"""
     <h1>⚙️ User Management</h1>
     {seizure_rule}
+    {followup_rule}
     <div class="form-grid">
       <div class="card">
         <h2>Add / Update User</h2>
