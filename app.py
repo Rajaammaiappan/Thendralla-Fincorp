@@ -186,7 +186,7 @@ def loan_vehicles(loan):
     keys = ("vehicle_type", "vehicle_number", "vehicle_name", "vehicle_model", "engine_number", "chassis_number",
             "vehicle_colour", "key_received", "key_received_date", "rc_received", "rc_received_date",
             "docs_received", "docs_received_date", "key_collected_by", "rc_collected_by", "docs_collected_by",
-            "other_owner", "tc_received", "tc_received_date", "tc_collected_by", "police_fine")
+            "other_owner", "tc_received", "tc_received_date", "tc_collected_by", "police_fine", "key_na_remark")
     main = {"vehicle_id": None, "seq": 1, **{k: loan.get(k) for k in keys}}
     c = get_cur(); c.execute("SELECT * FROM LoanVehicles WHERE loan_id=? ORDER BY seq, vehicle_id", (loan["id"],))
     return [main] + [dict(r) for r in c.fetchall()]
@@ -346,11 +346,14 @@ window.addExtraBlock=function(kind){
   var t=document.getElementById('tpl_'+kind), host=document.getElementById('xhost_'+kind);
   host.appendChild(t.content.firstElementChild.cloneNode(true));
   renumberExtra();
-  if(window.toggleReloan && document.querySelector('[name=is_reloan]')) toggleReloan(document.querySelector('[name=is_reloan]').value);
+  if(window.toggleReloan && document.querySelector('[name=is_reloan]')) toggleReloan(window.reloanValue ? reloanValue() : document.querySelector('[name=is_reloan]').value);
   host.lastElementChild.scrollIntoView({behavior:'smooth',block:'center'});
 };
 window.toggleHO=function(sel){
-  var g=sel.closest('.form-group'), d=g.querySelector('.ho-detail'); if(!d) return;
+  var g=sel.closest('.form-group'), na=g.querySelector('.ho-na');
+  if(na){ var ni=na.querySelector('input'); na.style.display=sel.value==='na'?'block':'none';
+    if(sel.value==='na') ni.setAttribute('required','required'); else ni.removeAttribute('required'); }
+  var d=g.querySelector('.ho-detail'); if(!d) return;
   var yes=sel.value==='yes', by=d.querySelector('input:not([type=date])'), dt=d.querySelector('input[type=date]');
   d.style.display=yes?'flex':'none';
   if(yes){ by.setAttribute('required','required');
@@ -415,13 +418,19 @@ def handover_detail_html(date_name, by_name, extra=""):
             f'<input type="date" name="{date_name}" max="{date.today().isoformat()}" title="When collected" style="flex:1;min-width:130px;">'
             f'<input name="{by_name}" placeholder="Collected by *" style="flex:1;min-width:130px;">{extra}</div>')
 
+def na_remark_html(name):
+    """'Why not required?' box, shown only when the answer is Not required (toggleHO)."""
+    return (f'<div class="ho-na" style="display:none;margin-top:6px;">'
+            f'<input name="{name}" placeholder="Why not required? (remark) *" style="width:100%;"></div>')
+
 def ho_group(question, short, extra="", not_required=False, attrs=' required onchange="toggleHO(this)"'):
     """One 'collected? Yes/No' question with its date / collected-by boxes (loan-level documents)."""
     return (f'<div class="form-group"><label>{question} * <span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days(short)} days)</span></label>'
             f'<select name="{short}_received"{attrs}><option value="">-- Select --</option>'
             f'<option value="yes">Yes</option><option value="no">No</option>'
             + ('<option value="na">Not required</option>' if not_required else '') + '</select>'
-            f'{handover_detail_html(short + "_date", short + "_by", extra)}</div>')
+            f'{handover_detail_html(short + "_date", short + "_by", extra)}'
+            + (na_remark_html(short + "_na_remark") if not_required else '') + '</div>')
 
 def vehicle_docs_html(owner_name, tc_name, tcd_name, tcb_name, fine_name, fine_value=0, with_owner=True):
     """Police fine (+ 'vehicle in another owner's name?' and the transfer certificate) for one vehicle."""
@@ -439,9 +448,10 @@ def vehicle_docs_html(owner_name, tc_name, tcd_name, tcb_name, fine_name, fine_v
                 f'{handover_detail_html(tcd_name, tcb_name)}</div></div>')
     return out
 
-def _yn_select(name, required=True):
+def _yn_select(name, required=True, not_required=False):
     return (f'<select name="{name}" onchange="toggleHO(this)"{" required" if required else ""}><option value="">-- Select --</option>'
-            f'<option value="yes">Yes</option><option value="no">No</option></select>')
+            f'<option value="yes">Yes</option><option value="no">No</option>'
+            + ('<option value="na">Not required</option>' if not_required else '') + '</select>')
 
 def extra_vehicle_block(v=None, n=2):
     """One add-on vehicle. New blocks ask the key / RC / proof questions; saved ones show their status instead."""
@@ -467,14 +477,16 @@ def extra_vehicle_block(v=None, n=2):
         inner += ('<input type="hidden" name="xv_owner[]" value=""><input type="hidden" name="xv_tc[]" value="">'
                   '<input type="hidden" name="xv_tc_date[]" value=""><input type="hidden" name="xv_tc_by[]" value="">'
                   '<input type="hidden" name="xv_key[]" value=""><input type="hidden" name="xv_rc[]" value="">'
-                  '<input type="hidden" name="xv_docs[]" value="">'
+                  '<input type="hidden" name="xv_docs[]" value=""><input type="hidden" name="xv_key_na[]" value="">'
                   + "".join(f'<input type="hidden" name="xv_{k}_{w}[]" value="">' for k in ("key", "rc", "docs") for w in ("date", "by")) +
                   ''
                   f'<div class="form-group full" style="font-size:12.5px;">{handover_status_html(v)}</div>')
     else:
         def ho(question, short):
+            na = short == "key"
             return (f'<div class="form-group"><label>{question} * <span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days(short)} days)</span></label>'
-                    f'{_yn_select("xv_" + short + "[]")}{handover_detail_html("xv_" + short + "_date[]", "xv_" + short + "_by[]")}</div>')
+                    f'{_yn_select("xv_" + short + "[]", not_required=na)}{handover_detail_html("xv_" + short + "_date[]", "xv_" + short + "_by[]")}'
+                    + (na_remark_html("xv_key_na[]") if na else '') + '</div>')
         inner += ho("Key Received?", "key") + ho("RC Received?", "rc") + ho("Proof &amp; Documents Collected?", "docs")
     return _xblock_shell("vehicle", n, existing, inner)
 
@@ -523,6 +535,9 @@ def handover_status_html(v):
         if v.get(flag) == "yes":
             who = f' by {html.escape(v[by])}' if v.get(by) else ""
             out.append(f'{icon} {label} <span style="color:var(--green);">✔ {fmt_date(v.get(dt), "received")}{who}</span>')
+        elif v.get(flag) == "na":
+            why = f' — {html.escape(v["key_na_remark"])}' if flag == "key_received" and v.get("key_na_remark") else ""
+            out.append(f'{icon} {label} <b style="color:var(--muted);">Not required{why}</b>')
         else:
             out.append(f'{icon} {label} <span style="color:var(--red);">✖ pending</span>')
     return " · ".join(out)
@@ -554,6 +569,10 @@ def parse_extra_vehicles(form, reloan):
                 if not r[k]: raise ValueError(f"{label}: {lab} is mandatory for a reloan.")
         if not r["id"]:
             for k, lab in (("key", "Key Received"), ("rc", "RC Received"), ("docs", "Proof & Documents Collected")):
+                if r[k] == "na" and k == "key":
+                    r["key_na"] = _form_list(form, "xv_key_na[]", i)
+                    if not r["key_na"]: raise ValueError(f"{label}: enter a remark for why the key is not required.")
+                    continue
                 if r[k] not in ("yes", "no"): raise ValueError(f"{label}: please answer '{lab}?' (Yes / No).")
                 if r[k] == "yes":
                     r[k + "_date"], r[k + "_by"] = parse_collected(_form_list(form, f"xv_{k}_date[]", i), _form_list(form, f"xv_{k}_by[]", i),
@@ -1100,6 +1119,9 @@ def init_db():
         "ALTER TABLE LoanEntry ADD COLUMN cheque_collected_by TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN cheque_leaves INTEGER",
         "ALTER TABLE LoanEntry ADD COLUMN cheque_numbers TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN key_na_remark TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN cheque_na_remark TEXT",
+        "ALTER TABLE LoanVehicles ADD COLUMN key_na_remark TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN aadhar_received TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN aadhar_received_date TEXT",
         "ALTER TABLE LoanEntry ADD COLUMN aadhar_collected_by TEXT",
@@ -1288,12 +1310,12 @@ def record_extra_documents(loan_id, base_date, docs_extra, collected, leaves, nu
 
 def documents_summary_html(loan):
     """Status of the extra documents (cheque leaf, address proof, transfer certificate) and the police fine."""
-    def mark(flag, dt, by, extra=""):
+    def mark(flag, dt, by, extra="", why=""):
         if flag == "yes":
             return (f'<span style="color:var(--green);">✔ {fmt_date(dt, "received")}'
                     f'{(" by " + html.escape(by)) if by else ""}{extra}</span>')
         if flag == "no": return '<span style="color:var(--red);">✖ pending</span>'
-        if flag == "na": return '<b style="color:var(--muted);">Not required</b>'
+        if flag == "na": return f'<b style="color:var(--muted);">Not required{(" — " + html.escape(why)) if why else ""}</b>'
         return '<span style="color:var(--muted);">—</span>'
     cx = ""
     if loan.get("cheque_received") == "yes":
@@ -1301,7 +1323,7 @@ def documents_summary_html(loan):
         if loan.get("cheque_leaves"): bits.append(f'{int(loan["cheque_leaves"])} leaf(s)')
         if loan.get("cheque_numbers"): bits.append(html.escape(loan["cheque_numbers"]))
         if bits: cx = " · " + " · ".join(bits)
-    out = [f'🧾 <b>Cheque leaf signed:</b> {mark(loan.get("cheque_received"), loan.get("cheque_received_date"), loan.get("cheque_collected_by"), cx)}',
+    out = [f'🧾 <b>Cheque leaf signed:</b> {mark(loan.get("cheque_received"), loan.get("cheque_received_date"), loan.get("cheque_collected_by"), cx, loan.get("cheque_na_remark"))}',
            f'🪪 <b>Aadhar (address proof):</b> {mark(loan.get("aadhar_received"), loan.get("aadhar_received_date"), loan.get("aadhar_collected_by"))}',
            f'💡 <b>EB bill (address proof):</b> {mark(loan.get("eb_received"), loan.get("eb_received_date"), loan.get("eb_collected_by"))}']
     vs = loan_vehicles(loan)
@@ -1389,6 +1411,8 @@ def save_extra_vehicles(loan_id, rows, base_date, username):
                      WHERE vehicle_id=?""",
                   (r.get("owner"), r.get("tc") or None, (r.get("tc_date") or stamp) if r.get("tc") == "yes" else None,
                    r.get("tc_by") if r.get("tc") == "yes" else None, r.get("fine") or 0, vid))
+        if r["key"] == "na":
+            c.execute("UPDATE LoanVehicles SET key_na_remark=? WHERE vehicle_id=?", (r.get("key_na"), vid))
         get_db().commit()
         schedule_extra_followups(loan_id, base_date, {"tc_received": r.get("tc")}, username, vid, vehicle_tag(r))
         c = get_cur()
@@ -2598,6 +2622,7 @@ def _location_link(loc):
 
 # ── Follow Up (customer-requested collection date) ──────────────────────────────
 FU_CATEGORIES = ["Loans", "Key Collection", "Proof & Documents", "Penalty Collection"]
+DOC_FU_CATEGORIES = ("Key Collection", "Proof & Documents")    # no money columns on these follow-ups
 # follow-up "item" -> (LoanEntry received column, LoanEntry received-date column)
 FU_ITEM_COLUMNS = {"key": ("key_received", "key_received_date"),
                    "rc":  ("rc_received",  "rc_received_date"),
@@ -4195,7 +4220,11 @@ def add_loan():
         for key, label in (("key_received","Key Received"),("rc_received","RC Received"),
                            ("docs_received","Proof & Documents Collected")):
             ans = f.get(key,"")
-            if ans not in ("yes","no"):
+            if key == "key_received" and ans == "na":
+                if not f.get("key_na_remark","").strip():
+                    flash("Key Received = Not required: please enter the remark (why it is not required).","danger")
+                    return redirect(url_for("add_loan"))
+            elif ans not in ("yes","no"):
                 flash(f"Please answer '{label}?' (Yes / No).","danger")
                 return redirect(url_for("add_loan"))
             handover[key] = ans
@@ -4214,6 +4243,8 @@ def add_loan():
             ans = f.get("cheque_received", "")
             if ans not in ("yes", "no", "na"): raise ValueError("Please answer 'Cheque leaf signed?' (Yes / No / Not required).")
             docs_extra["cheque"] = ans
+            if ans == "na" and not f.get("cheque_na_remark", "").strip():
+                raise ValueError("Cheque leaf signed = Not required: please enter the remark (why it is not required).")
             if ans == "yes":
                 collected["cheque"] = parse_collected(f.get("cheque_date"), f.get("cheque_by"), "Cheque leaf signed", loan_date_val.isoformat())
             # address proof: Aadhar or EB bill — at least one must be answered
@@ -4283,7 +4314,9 @@ def add_loan():
             record_extra_documents(new_loan_id, loan_date_val, docs_extra, collected, leaves, cheque_numbers, fine_main,
                                    session.get("username",""))
             c_ = get_cur()
-            c_.execute("UPDATE LoanEntry SET guarantor_permanent_address=? WHERE id=?", (g_perm or None, new_loan_id))
+            c_.execute("UPDATE LoanEntry SET guarantor_permanent_address=?, key_na_remark=?, cheque_na_remark=? WHERE id=?",
+                       (g_perm or None, f.get("key_na_remark","").strip() if handover["key_received"] == "na" else None,
+                        f.get("cheque_na_remark","").strip() if docs_extra["cheque"] == "na" else None, new_loan_id))
             get_db().commit()
             save_extra_vehicles(new_loan_id, extra_vehicles, loan_date_val, session.get("username",""))
             save_extra_guarantors(new_loan_id, extra_guarantors)
@@ -4314,6 +4347,16 @@ def add_loan():
     <h1>➕ New Loan Application</h1>
     <div class="card">
     <form method="POST" id="loanForm" enctype="multipart/form-data">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+        <label class="loan-kind"><input type="radio" name="is_reloan" value="no" required onchange="pickLoanKind(this.value)"> 🆕 New Loan</label>
+        <label class="loan-kind"><input type="radio" name="is_reloan" value="yes" required onchange="pickLoanKind(this.value)"> 🔄 Reloan</label>
+      </div>
+      <style>.loan-kind{{display:flex;align-items:center;gap:8px;padding:10px 18px;border:2px solid var(--border);border-radius:10px;
+        cursor:pointer;font-size:14px;font-weight:700;text-transform:none;margin:0;}}
+        .loan-kind:has(input:checked){{border-color:var(--accent);background:var(--surface2);color:var(--accent);}}
+        .loan-kind input{{width:auto;min-height:0;margin:0;}}</style>
+      <p id="loan_kind_hint" style="font-size:13px;color:var(--muted);">Choose <b>New Loan</b> or <b>Reloan</b> to open the form.</p>
+      <div id="loan_body" style="display:none;">
       <div class="form-grid">
 
         <div class="section-title">📄 Loan Details</div>
@@ -4368,12 +4411,6 @@ def add_loan():
         <div class="form-group" id="custom_emi_group" style="display:none;">
           <label>Custom EMI Amount (₹) <span style="font-size:10px;color:var(--muted);">(rounded — leftover becomes a final installment)</span></label>
           <input type="number" name="custom_emi_amount" id="custom_emi_amount" min="1" step="1" oninput="calcDue()" placeholder="e.g. 1250">
-        </div>
-        <div class="form-group">
-          <label>Is Reloan?</label>
-          <select name="is_reloan" onchange="toggleReloan(this.value)">
-            <option value="no">No</option><option value="yes">Yes</option>
-          </select>
         </div>
         <div class="form-group">
           <label>Field Visit Done? *</label>
@@ -4542,9 +4579,10 @@ def add_loan():
         <div class="form-group">
           <label>Key Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days('key')} days)</span></label>
           <select name="key_received" id="key_received" required onchange="toggleHO(this)">
-            <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option>
+            <option value="">-- Select --</option><option value="yes">Yes</option><option value="no">No</option><option value="na">Not required</option>
           </select>
           {handover_detail_html('key_date', 'key_by')}
+          {na_remark_html('key_na_remark')}
         </div>
         <div class="form-group">
           <label>RC Received? * <span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days('rc')} days)</span></label>
@@ -4608,6 +4646,7 @@ def add_loan():
         <button type="submit" class="btn btn-primary">Submit Application</button>
         <a href="/loans" class="btn" style="background:var(--surface2);color:var(--text);">Cancel</a>
       </div>
+    </div>
     </form>
     </div>
 
@@ -4816,7 +4855,13 @@ def add_loan():
       document.getElementById('vehicle_mandatory_note').textContent =
         mandatory ? '(mandatory for a reloan)' : '(optional unless Reloan = Yes)';
     }}
-    toggleReloan(document.querySelector('[name=is_reloan]').value);
+    function reloanValue(){{ const r=document.querySelector('[name=is_reloan]:checked'); return r ? r.value : 'no'; }}
+    function pickLoanKind(v){{
+      document.getElementById('loan_body').style.display='block';
+      document.getElementById('loan_kind_hint').style.display='none';
+      toggleReloan(v);
+    }}
+    toggleReloan(reloanValue());
     function checkReloan(){{
       const ref=document.getElementById('reloan_ref').value.trim();
       if(!ref){{alert('Enter previous loan number first.');return;}}
@@ -5002,6 +5047,8 @@ def approval():
         if stored_custom:
             custom_note = f'<div class="alert alert-info" style="margin:8px 0;font-size:12px;padding:8px 10px;">📝 Customer requested EMI of <b>₹{stored_custom:,.2f}</b> at application time. You can edit it below before approving.</div>'
 
+        lvs = loan_vehicles(l)
+        ho_lines = "<br>".join((("🚗 " + html.escape(vehicle_tag(v)) + " — ") if len(lvs) > 1 else "") + handover_status_html(v) for v in lvs)
         cards += f"""
         <div class="card" data-amt="{amt}" data-rate="{rate}" data-tenure="{t}" data-total="{total_due}" data-emi="{emi_amt}">
           <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
@@ -5025,6 +5072,7 @@ def approval():
           </div>
 
           {custom_note}
+          <div style="font-size:12.5px;line-height:1.9;">{ho_lines}</div>
           {documents_summary_html(l)}
 
           <form method="POST" class="approve-form" onsubmit="return true;">
@@ -6980,8 +7028,9 @@ def followups():
     today = date.today()
     q_url = urlquote(q); cat_url = urlquote(cat)
     back_url = f"/followup?q={q_url}&cat={cat_url}"
-    rows = ""
+    rows = doc_rows = ""
     for r in items:
+        is_doc = r["category"] in DOC_FU_CATEGORIES
         fu_date = parse_date(r["follow_up_date"])
         days_left = (fu_date - today).days
         row_cls = ""
@@ -7029,18 +7078,19 @@ def followups():
           </form>"""
         pay_btn = (f'<a class="btn btn-sm btn-danger" href="/billing/new/{r["loan_id"]}">🧾 Billing</a>'
                    if r["category"] == "Loans" and session.get("role","") in BILLING_ROLES else "")
-        rows += f"""<tr class="{row_cls}">
-          <td><b><a href="/emis/{r['loan_id']}" style="color:var(--accent);">{r['loan_number']}</a></b></td>
-          <td><span class="badge badge-partial">{html.escape(r['category'])}</span></td>
-          <td>{r['customer_name']}</td>
-          <td>{customer_numbers_html(r)}{('<br><span style="font-size:11px;color:var(--muted);">🛡️ Guarantor</span><br>' + guarantor_numbers_html(r)) if guarantor_numbers_html(r) != '—' else ''}</td>
-          <td>{vehicle_html(r)}</td>
+        money_cells = "" if is_doc else f"""
           <td>{('₹{:,.2f}'.format(r['emi_amount'])) if r.get('emi_amount') is not None else '—'}</td>
           <td>{fmt_date(r.get('oldest_due'))}</td>
           <td style="text-align:center;">{r['pending_dues']}</td>
           <td><b style="color:var(--red);">₹{r['overdue_amount']:,.2f}</b></td>
           <td><b>₹{r['outstanding']:,.2f}</b></td>
-          <td>{fmt_date(r.get('last_paid_date'))}</td>
+          <td>{fmt_date(r.get('last_paid_date'))}</td>"""
+        row_html = f"""<tr class="{row_cls}">
+          <td><b><a href="/emis/{r['loan_id']}" style="color:var(--accent);">{r['loan_number']}</a></b></td>
+          <td><span class="badge badge-partial">{html.escape(r['category'])}</span></td>
+          <td>{r['customer_name']}</td>
+          <td>{customer_numbers_html(r)}{('<br><span style="font-size:11px;color:var(--muted);">🛡️ Guarantor</span><br>' + guarantor_numbers_html(r)) if guarantor_numbers_html(r) != '—' else ''}</td>
+          <td>{vehicle_html(r)}</td>{money_cells}
           <td style="white-space:normal;max-width:180px;">{r.get('customer_address') or '—'}</td>
           <td style="white-space:normal;max-width:180px;">{r.get('customer_permanent_address') or '—'}</td>
           <td>{_location_link(r.get('customer_location'))}</td>
@@ -7051,6 +7101,8 @@ def followups():
           <td>{r.get('created_by') or ''}</td>
           <td style="white-space:nowrap;display:flex;gap:6px;flex-wrap:wrap;">{pay_btn}{resolve_btn}{reschedule_form}</td>
         </tr>"""
+        if is_doc: doc_rows += row_html
+        else: rows += row_html
     legend = """
     <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px;font-size:12px;">
       <span style="display:flex;align-items:center;gap:4px;">
@@ -7060,6 +7112,20 @@ def followups():
         <span style="width:14px;height:14px;background:#fef9c3;border-left:3px solid #d97706;display:inline-block;"></span> Due within 2 days
       </span>
     </div>"""
+    head = ('<tr><th>Loan #</th><th>Category</th><th>Customer</th><th>Mobile</th><th>Vehicle</th>{money}'
+            '<th>Current Address</th><th>Permanent Address</th><th>Location</th><th>Guarantor Location</th>'
+            '<th>Follow-up Date</th><th>Remarks</th><th>Status</th><th>By</th><th>Action</th></tr>')
+    money_head = ('<th>EMI Amt</th><th>Oldest Due Date</th><th>Pending Dues</th><th>Overdue Amt</th>'
+                  '<th>Outstanding</th><th>Last Paid</th>')
+    def fu_table(title, head_html, body, cols):
+        return ((f'<h3 style="margin:14px 0 8px;">{title}</h3>' if title else '')
+                + f'<div class="table-wrap"><table>{head_html}'
+                + (body or f'<tr><td colspan="{cols}" style="text-align:center;color:var(--muted);">No follow-ups recorded yet.</td></tr>')
+                + '</table></div>')
+    show_money = cat not in DOC_FU_CATEGORIES
+    show_docs = cat in ("",) + DOC_FU_CATEGORIES
+    money_table = fu_table("💰 Loans &amp; Penalty Collection" if show_docs else "", head.format(money=money_head), rows, 20) if show_money else ""
+    doc_table = fu_table("🔑 Key Collection &amp; 📄 Proof &amp; Documents" if show_money else "", head.format(money=""), doc_rows, 14) if show_docs else ""
     tabs = "".join(
         f'<a href="/followup?q={q_url}&cat={urlquote(name)}" class="btn btn-sm" '
         f'style="{"background:var(--accent);color:#fff;" if cat==name else "background:var(--surface2);color:var(--text);"}">{label}</a>'
@@ -7085,13 +7151,7 @@ def followups():
         of the loan still to be collected; <b>Oldest Due Date</b> = earliest unpaid EMI.
       </p>
       {legend}
-      <div class="table-wrap"><table>
-        <tr><th>Loan #</th><th>Category</th><th>Customer</th><th>Mobile</th>
-            <th>Vehicle</th><th>EMI Amt</th><th>Oldest Due Date</th><th>Pending Dues</th><th>Overdue Amt</th><th>Outstanding</th><th>Last Paid</th>
-            <th>Current Address</th><th>Permanent Address</th><th>Location</th><th>Guarantor Location</th>
-            <th>Follow-up Date</th><th>Remarks</th><th>Status</th><th>By</th><th>Action</th></tr>
-        {rows or '<tr><td colspan="20" style="text-align:center;color:var(--muted);">No follow-ups recorded yet.</td></tr>'}
-      </table></div>
+      {money_table}{doc_table}
     </div>"""
     return page("Follow Up", content, "followup")
 
