@@ -184,7 +184,8 @@ def loan_vehicles(loan):
     """Every vehicle on a loan: the main one (vehicle_id None) first, then the add-on vehicles."""
     keys = ("vehicle_type", "vehicle_number", "vehicle_name", "vehicle_model", "engine_number", "chassis_number",
             "vehicle_colour", "key_received", "key_received_date", "rc_received", "rc_received_date",
-            "docs_received", "docs_received_date", "key_collected_by", "rc_collected_by", "docs_collected_by")
+            "docs_received", "docs_received_date", "key_collected_by", "rc_collected_by", "docs_collected_by",
+            "other_owner", "tc_received", "tc_received_date", "tc_collected_by", "police_fine")
     main = {"vehicle_id": None, "seq": 1, **{k: loan.get(k) for k in keys}}
     c = get_cur(); c.execute("SELECT * FROM LoanVehicles WHERE loan_id=? ORDER BY seq, vehicle_id", (loan["id"],))
     return [main] + [dict(r) for r in c.fetchall()]
@@ -355,6 +356,26 @@ window.toggleHO=function(sel){
     if(!dt.value){ var ld=document.getElementById('loan_date'); dt.value=(ld&&ld.value)?ld.value:new Date().toISOString().slice(0,10); } }
   else { by.removeAttribute('required'); }
 };
+window.toggleOwner=function(sel){
+  var g=sel.closest('.form-group'), w=g.querySelector('.tc-wrap'); if(!w) return;
+  var tc=w.querySelector('select'), yes=sel.value==='yes';
+  w.style.display=yes?'block':'none';
+  if(yes){ tc.setAttribute('required','required'); }
+  else { tc.removeAttribute('required'); tc.value=''; window.toggleHO(tc); }
+};
+window.syncGAddr=function(cb){
+  var host=cb.closest('.gaddr'), cur=host.querySelector('.g-cur'), perm=host.querySelector('.g-perm');
+  if(cb.checked){ perm.value=cur.value; perm.readOnly=true; perm.style.background='var(--surface2)'; }
+  else { perm.readOnly=false; perm.style.background=''; }
+};
+document.addEventListener('input',function(e){
+  var t=e.target; if(!t||!t.classList) return;
+  if(t.classList.contains('g-cur')){ var cb=t.closest('.gaddr').querySelector('.g-same'); if(cb&&cb.checked) syncGAddr(cb); }
+  if(t.name==='guarantor_name'||t.name==='guarantor_mobile'){
+    var any=false; ['guarantor_name','guarantor_mobile'].forEach(function(n){var el=document.querySelector('[name='+n+']'); if(el&&el.value.trim()) any=true;});
+    document.querySelectorAll('#gMainAddr .g-cur, #gMainAddr .g-perm').forEach(function(el){ if(any) el.setAttribute('required','required'); else el.removeAttribute('required'); });
+  }
+});
 window.removeExtraBlock=function(btn){
   var b=btn.closest('.xblock');
   if(b.dataset.existing==='1'){
@@ -387,11 +408,34 @@ def _xblock_shell(kind, n, existing, inner, extra_note=""):
             f'<button type="button" class="btn btn-sm btn-danger" onclick="removeExtraBlock(this)">✖ Remove</button></div>'
             f'<div class="form-grid">{inner}</div></div>')
 
-def handover_detail_html(date_name, by_name):
+def handover_detail_html(date_name, by_name, extra=""):
     """'When collected' + 'Collected by' inputs, shown only when the answer is Yes (toggleHO)."""
     return (f'<div class="ho-detail" style="display:none;gap:6px;flex-wrap:wrap;margin-top:6px;">'
             f'<input type="date" name="{date_name}" max="{date.today().isoformat()}" title="When collected" style="flex:1;min-width:130px;">'
-            f'<input name="{by_name}" placeholder="Collected by *" style="flex:1;min-width:130px;"></div>')
+            f'<input name="{by_name}" placeholder="Collected by *" style="flex:1;min-width:130px;">{extra}</div>')
+
+def ho_group(question, short, extra=""):
+    """One 'collected? Yes/No' question with its date / collected-by boxes (loan-level documents)."""
+    return (f'<div class="form-group"><label>{question} * <span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days(short)} days)</span></label>'
+            f'<select name="{short}_received" required onchange="toggleHO(this)"><option value="">-- Select --</option>'
+            f'<option value="yes">Yes</option><option value="no">No</option></select>'
+            f'{handover_detail_html(short + "_date", short + "_by", extra)}</div>')
+
+def vehicle_docs_html(owner_name, tc_name, tcd_name, tcb_name, fine_name, fine_value=0, with_owner=True):
+    """Police fine (+ 'vehicle in another owner's name?' and the transfer certificate) for one vehicle."""
+    limit = police_fine_limit()
+    out = (f'<div class="form-group"><label>Police fine amount (₹) * <span style="font-size:10px;color:var(--muted);">(not more than {fmt_inr(limit)}; 0 = none)</span></label>'
+           f'<input type="number" name="{fine_name}" value="{fine_value or 0}" min="0" max="{limit:g}" step="0.01" required></div>')
+    if with_owner:
+        out += (f'<div class="form-group"><label>Vehicle in another owner\'s name? *</label>'
+                f'<select name="{owner_name}" required onchange="toggleOwner(this)"><option value="">-- Select --</option>'
+                f'<option value="yes">Yes</option><option value="no">No</option></select>'
+                f'<div class="tc-wrap" style="display:none;margin-top:8px;"><label>Transfer certificate collected? * '
+                f'<span style="font-size:10px;color:var(--muted);">(No = follow-up in {handover_days("tc")} days)</span></label>'
+                f'<select name="{tc_name}" onchange="toggleHO(this)"><option value="">-- Select --</option>'
+                f'<option value="yes">Yes</option><option value="no">No</option></select>'
+                f'{handover_detail_html(tcd_name, tcb_name)}</div></div>')
+    return out
 
 def _yn_select(name, required=True):
     return (f'<select name="{name}" onchange="toggleHO(this)"{" required" if required else ""}><option value="">-- Select --</option>'
@@ -416,8 +460,11 @@ def extra_vehicle_block(v=None, n=2):
              + fld("Engine Number", "xv_engine[]", "engine_number")
              + fld("Chassis Number", "xv_chassis[]", "chassis_number")
              + fld("Vehicle Colour", "xv_colour[]", "vehicle_colour"))
+    inner += vehicle_docs_html("xv_owner[]", "xv_tc[]", "xv_tc_date[]", "xv_tc_by[]", "xv_fine[]", v.get("police_fine") or 0, with_owner=not existing)
     if existing:
-        inner += ('<input type="hidden" name="xv_key[]" value=""><input type="hidden" name="xv_rc[]" value="">'
+        inner += ('<input type="hidden" name="xv_owner[]" value=""><input type="hidden" name="xv_tc[]" value="">'
+                  '<input type="hidden" name="xv_tc_date[]" value=""><input type="hidden" name="xv_tc_by[]" value="">'
+                  '<input type="hidden" name="xv_key[]" value=""><input type="hidden" name="xv_rc[]" value="">'
                   '<input type="hidden" name="xv_docs[]" value="">'
                   + "".join(f'<input type="hidden" name="xv_{k}_{w}[]" value="">' for k in ("key", "rc", "docs") for w in ("date", "by")) +
                   ''
@@ -438,7 +485,12 @@ def extra_guarantor_block(g_=None, n=2):
              f'<div class="form-group"><label>Guarantor Name *</label><input name="xg_name[]" value="{val("name")}"></div>'
              f'<div class="form-group"><label>Guarantor Mobile</label><input name="xg_mobile[]" value="{val("mobile")}" maxlength="10" '
              f'oninput="this.value=this.value.replace(/[^0-9]/g,\'\').slice(0,10)"></div>'
-             f'<div class="form-group full"><label>Guarantor Address</label><textarea name="xg_address[]" rows="2">{val("address")}</textarea></div>'
+             f'<div class="form-group full gaddr"><label>Current Address * <span style="font-size:10px;color:var(--muted);">(mandatory)</span></label>'
+             f'<textarea name="xg_address[]" class="g-cur" rows="2">{val("address")}</textarea>'
+             f'<label style="display:flex;align-items:center;gap:8px;font-weight:600;text-transform:none;font-size:13px;margin:6px 0 4px;cursor:pointer;">'
+             f'<input type="checkbox" class="g-same" style="width:auto;min-height:0;margin:0;" onchange="syncGAddr(this)"> Permanent address same as current address</label>'
+             f'<label>Permanent Address * <span style="font-size:10px;color:var(--muted);">(mandatory)</span></label>'
+             f'<textarea name="xg_perm[]" class="g-perm" rows="2">{val("permanent_address")}</textarea></div>'
              f'<div class="form-group full"><label>📍 GPS Location</label><div style="display:flex;gap:8px;flex-wrap:wrap;">'
              f'<input name="xg_location[]" value="{val("location")}" placeholder="e.g. 10.9876,78.1234 or area name" style="flex:1;min-width:160px;">'
              f'<button type="button" class="btn btn-sm btn-amber" onclick="xgGPS(this)">📡 Get GPS</button></div></div>')
@@ -492,6 +544,7 @@ def parse_extra_vehicles(form, reloan):
         if r["delete"] and r["id"]:
             out.append(r); continue
         label = f"Add-on vehicle {i + 2}"
+        r["fine"] = parse_fine(_form_list(form, "xv_fine[]", i), f"{label}: Police fine")
         if reloan:
             for k, lab in (("vehicle_type", "Vehicle Type"), ("vehicle_number", "Vehicle Number"), ("vehicle_name", "Vehicle Name"),
                            ("vehicle_model", "Vehicle Model"), ("engine_number", "Engine Number"),
@@ -503,6 +556,15 @@ def parse_extra_vehicles(form, reloan):
                 if r[k] == "yes":
                     r[k + "_date"], r[k + "_by"] = parse_collected(_form_list(form, f"xv_{k}_date[]", i), _form_list(form, f"xv_{k}_by[]", i),
                                                                    f"{label}: {lab}")
+        if not r["id"]:
+            r["owner"] = _form_list(form, "xv_owner[]", i); r["tc"] = ""; r["tc_date"] = ""; r["tc_by"] = ""
+            if r["owner"] not in ("yes", "no"): raise ValueError(f"{label}: please answer 'Vehicle in another owner's name?' (Yes / No).")
+            if r["owner"] == "yes":
+                r["tc"] = _form_list(form, "xv_tc[]", i)
+                if r["tc"] not in ("yes", "no"): raise ValueError(f"{label}: please answer 'Transfer certificate collected?' (Yes / No).")
+                if r["tc"] == "yes":
+                    r["tc_date"], r["tc_by"] = parse_collected(_form_list(form, "xv_tc_date[]", i), _form_list(form, "xv_tc_by[]", i),
+                                                               f"{label}: Transfer certificate")
         out.append(r)
     return out
 
@@ -511,13 +573,17 @@ def parse_extra_guarantors(form):
     for i in range(len(form.getlist("xg_name[]"))):
         r = dict(id=_form_list(form, "xg_id[]", i), delete=_form_list(form, "xg_del[]", i) == "1",
                  name=_form_list(form, "xg_name[]", i), mobile=re.sub(r"\D", "", _form_list(form, "xg_mobile[]", i)),
-                 address=_form_list(form, "xg_address[]", i), location=_form_list(form, "xg_location[]", i))
+                 address=_form_list(form, "xg_address[]", i), location=_form_list(form, "xg_location[]", i),
+                 permanent=_form_list(form, "xg_perm[]", i))
         if r["delete"] and r["id"]:
             out.append(r); continue
-        if not r["id"] and not (r["name"] or r["mobile"] or r["address"] or r["location"]):
+        if not r["id"] and not (r["name"] or r["mobile"] or r["address"] or r["permanent"] or r["location"]):
             continue        # an empty block that was never filled in
         if not r["name"]: raise ValueError(f"Add-on guarantor {i + 2}: please enter the guarantor's name.")
         if r["mobile"] and len(r["mobile"]) != 10: raise ValueError(f"Add-on guarantor {i + 2}: mobile number must be exactly 10 digits.")
+        if not r["id"]:     # new add-on guarantors need both addresses
+            if not r["address"]: raise ValueError(f"Add-on guarantor {i + 2}: Current Address is mandatory.")
+            if not r["permanent"]: raise ValueError(f"Add-on guarantor {i + 2}: Permanent Address is mandatory (or tick 'same as current').")
         out.append(r)
     return out
 
@@ -1025,6 +1091,30 @@ def init_db():
         "ALTER TABLE Receipts ADD COLUMN extra_label TEXT",
         "ALTER TABLE Receipts ADD COLUMN extra_amount REAL",
         "ALTER TABLE Receipts ADD COLUMN batch_id TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN guarantor_permanent_address TEXT",
+        "ALTER TABLE LoanGuarantors ADD COLUMN permanent_address TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN cheque_received TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN cheque_received_date TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN cheque_collected_by TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN cheque_leaves INTEGER",
+        "ALTER TABLE LoanEntry ADD COLUMN cheque_numbers TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN aadhar_received TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN aadhar_received_date TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN aadhar_collected_by TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN eb_received TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN eb_received_date TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN eb_collected_by TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN other_owner TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN tc_received TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN tc_received_date TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN tc_collected_by TEXT",
+        "ALTER TABLE LoanEntry ADD COLUMN police_fine REAL DEFAULT 0",
+        "ALTER TABLE LoanVehicles ADD COLUMN other_owner TEXT",
+        "ALTER TABLE LoanVehicles ADD COLUMN tc_received TEXT",
+        "ALTER TABLE LoanVehicles ADD COLUMN tc_received_date TEXT",
+        "ALTER TABLE LoanVehicles ADD COLUMN tc_collected_by TEXT",
+        "ALTER TABLE LoanVehicles ADD COLUMN police_fine REAL DEFAULT 0",
+        "ALTER TABLE FollowUp ADD COLUMN recv_extra TEXT",
         "ALTER TABLE EMI ADD COLUMN penalty_due REAL DEFAULT 0",
         "ALTER TABLE EMI ADD COLUMN penalty_paid REAL DEFAULT 0",
         "ALTER TABLE EMIPayments ADD COLUMN penalty_part REAL DEFAULT 0",
@@ -1143,8 +1233,89 @@ def record_handover_details(loan_id, loan_date_val, field_visit, field_visit_dat
 HANDOVER_PLAN = (("key_received",  "key",  "Key Collection",    3,  "Collect vehicle key from customer"),
                  ("rc_received",   "rc",   "Proof & Documents", 15, "Collect RC book from customer"),
                  ("docs_received", "docs", "Proof & Documents", 3,  "Collect proof & documents from customer"))
-HANDOVER_DEFAULT_DAYS = {"key": 3, "rc": 15, "docs": 3}
-HANDOVER_LABELS = {"key": "Key", "rc": "RC", "docs": "Proof & Documents"}
+HANDOVER_DEFAULT_DAYS = {"key": 3, "rc": 15, "docs": 3, "cheque": 3, "aadhar": 3, "eb": 3, "tc": 3}
+HANDOVER_LABELS = {"key": "Key", "rc": "RC", "docs": "Proof & Documents", "cheque": "Cheque leaf",
+                   "aadhar": "Aadhar (address proof)", "eb": "EB bill (address proof)", "tc": "Transfer certificate"}
+# extra proof & document items (cheque leaf, address proof, transfer certificate): answer field, item, follow-up text
+EXTRA_PLAN = (("cheque_received", "cheque", "Collect cheque leaf from customer"),
+              ("aadhar_received", "aadhar", "Collect Aadhar copy (address proof) from customer"),
+              ("eb_received",     "eb",     "Collect EB bill (address proof) from customer"),
+              ("tc_received",     "tc",     "Collect transfer certificate (vehicle is in another owner's name)"))
+POLICE_FINE_DEFAULT_MAX = 5000
+
+def police_fine_limit():
+    try: return max(0.0, float(get_setting("police_fine_max", POLICE_FINE_DEFAULT_MAX)))
+    except (TypeError, ValueError): return float(POLICE_FINE_DEFAULT_MAX)
+
+def parse_fine(raw, label="Police fine"):
+    raw = (raw or "").strip()
+    if not raw: return 0.0
+    try: v = round(float(raw), 2)
+    except ValueError: raise ValueError(f"{label}: enter a valid amount.")
+    if v < 0: raise ValueError(f"{label}: the amount cannot be negative.")
+    limit = police_fine_limit()
+    if v > limit + 0.001: raise ValueError(f"{label}: cannot be more than {fmt_inr(limit)} (entered {fmt_inr(v)}).")
+    return v
+
+def schedule_extra_followups(loan_id, base_date, answers, username, vehicle_id=None, vtag=""):
+    """A 'No' for cheque leaf / address proof / transfer certificate creates a Proof & Documents follow-up."""
+    for field, item, remark in EXTRA_PLAN:
+        if answers.get(field) == "no":
+            add_follow_up(loan_id, (base_date + timedelta(days=handover_days(item))).isoformat(),
+                          remark + (f" — {vtag}" if vtag else ""), username, "Proof & Documents", item, ref_id=vehicle_id)
+
+def record_extra_documents(loan_id, base_date, docs_extra, collected, leaves, numbers, fine, username):
+    """Saves cheque leaf, address proof, transfer certificate and police fine of the main vehicle / loan."""
+    iso = base_date.isoformat()
+    def got(k):
+        if docs_extra.get(k) != "yes": return None, None
+        d, by = collected.get(k, (None, None))
+        return (d or iso), (by or None)
+    cd, cb = got("cheque"); ad, ab = got("aadhar"); ed, eb_ = got("eb"); td, tb = got("tc")
+    c = get_cur()
+    c.execute("""UPDATE LoanEntry SET cheque_received=?, cheque_received_date=?, cheque_collected_by=?, cheque_leaves=?, cheque_numbers=?,
+                    aadhar_received=?, aadhar_received_date=?, aadhar_collected_by=?, eb_received=?, eb_received_date=?, eb_collected_by=?,
+                    other_owner=?, tc_received=?, tc_received_date=?, tc_collected_by=?, police_fine=? WHERE id=?""",
+              (docs_extra["cheque"], cd, cb, (leaves if docs_extra["cheque"] == "yes" else None), (numbers or None) if docs_extra["cheque"] == "yes" else None,
+               docs_extra["aadhar"], ad, ab, docs_extra["eb"], ed, eb_,
+               docs_extra["other_owner"], docs_extra.get("tc") or None, td, tb, fine, loan_id))
+    get_db().commit()
+    schedule_extra_followups(loan_id, base_date,
+                             {"cheque_received": docs_extra["cheque"], "aadhar_received": docs_extra["aadhar"],
+                              "eb_received": docs_extra["eb"], "tc_received": docs_extra.get("tc")}, username)
+
+def documents_summary_html(loan):
+    """Status of the extra documents (cheque leaf, address proof, transfer certificate) and the police fine."""
+    def mark(flag, dt, by, extra=""):
+        if flag == "yes":
+            return (f'<span style="color:var(--green);">✔ {fmt_date(dt, "received")}'
+                    f'{(" by " + html.escape(by)) if by else ""}{extra}</span>')
+        if flag == "no": return '<span style="color:var(--red);">✖ pending</span>'
+        return '<span style="color:var(--muted);">—</span>'
+    cx = ""
+    if loan.get("cheque_received") == "yes":
+        bits = []
+        if loan.get("cheque_leaves"): bits.append(f'{int(loan["cheque_leaves"])} leaf(s)')
+        if loan.get("cheque_numbers"): bits.append(html.escape(loan["cheque_numbers"]))
+        if bits: cx = " · " + " · ".join(bits)
+    out = [f'🧾 <b>Cheque leaf:</b> {mark(loan.get("cheque_received"), loan.get("cheque_received_date"), loan.get("cheque_collected_by"), cx)}',
+           f'🪪 <b>Aadhar (address proof):</b> {mark(loan.get("aadhar_received"), loan.get("aadhar_received_date"), loan.get("aadhar_collected_by"))}',
+           f'💡 <b>EB bill (address proof):</b> {mark(loan.get("eb_received"), loan.get("eb_received_date"), loan.get("eb_collected_by"))}']
+    vs = loan_vehicles(loan)
+    for v in vs:
+        fine = float(v.get("police_fine") or 0)
+        tag = f'<b>{html.escape(vehicle_tag(v))}</b> — ' if len(vs) > 1 else ""
+        fine_html = (f'<b style="color:#fff;background:var(--red);border-radius:6px;padding:1px 7px;">Police fine {fmt_inr(fine)}</b>' if fine > 0
+                     else '<span style="color:var(--muted);">No police fine</span>')
+        if v.get("other_owner") == "yes":
+            own = f'🔁 Other owner\'s name · Transfer certificate: {mark(v.get("tc_received"), v.get("tc_received_date"), v.get("tc_collected_by"))}'
+        elif v.get("other_owner") == "no":
+            own = "Vehicle in the customer's name"
+        else:
+            own = ""
+        out.append(f'🚗 {tag}{fine_html}{(" · " + own) if own else ""}')
+    return ('<div style="background:var(--surface2);border-radius:8px;padding:8px 12px;font-size:12.5px;line-height:1.9;margin:8px 0;">'
+            '<b style="color:var(--accent);">📎 Documents &amp; fines</b><br>' + "<br>".join(out) + '</div>')
 
 def handover_days(item):
     """Follow-up days for a 'No' answer (key / rc / docs); the Super Admin sets them on the Users page."""
@@ -1190,6 +1361,7 @@ def save_extra_vehicles(loan_id, rows, base_date, username):
                              engine_number=?, chassis_number=?, vehicle_colour=? WHERE vehicle_id=?""",
                           (r["vehicle_type"], r["vehicle_number"], r["vehicle_name"], r["vehicle_model"],
                            r["engine_number"], r["chassis_number"], r["vehicle_colour"], vid))
+                c.execute("UPDATE LoanVehicles SET police_fine=? WHERE vehicle_id=?", (r.get("fine") or 0, vid))
             continue
         c.execute("SELECT COALESCE(MAX(seq),1) as m FROM LoanVehicles WHERE loan_id=?", (loan_id,))
         seq = int(c.fetchone()["m"]) + 1
@@ -1210,6 +1382,13 @@ def save_extra_vehicles(loan_id, rows, base_date, username):
                                     {"key_received": r["key"], "rc_received": r["rc"], "docs_received": r["docs"]},
                                     username, vid, vehicle_tag(r))
         c = get_cur()
+        c.execute("""UPDATE LoanVehicles SET other_owner=?, tc_received=?, tc_received_date=?, tc_collected_by=?, police_fine=?
+                     WHERE vehicle_id=?""",
+                  (r.get("owner"), r.get("tc") or None, (r.get("tc_date") or stamp) if r.get("tc") == "yes" else None,
+                   r.get("tc_by") if r.get("tc") == "yes" else None, r.get("fine") or 0, vid))
+        get_db().commit()
+        schedule_extra_followups(loan_id, base_date, {"tc_received": r.get("tc")}, username, vid, vehicle_tag(r))
+        c = get_cur()
     get_db().commit()
 
 def save_extra_guarantors(loan_id, rows):
@@ -1222,13 +1401,13 @@ def save_extra_guarantors(loan_id, rows):
             if r["delete"]:
                 c.execute("DELETE FROM LoanGuarantors WHERE guarantor_id=?", (gid,))
             else:
-                c.execute("UPDATE LoanGuarantors SET name=?, mobile=?, address=?, location=? WHERE guarantor_id=?",
-                          (r["name"], r["mobile"], r["address"], r["location"], gid))
+                c.execute("UPDATE LoanGuarantors SET name=?, mobile=?, address=?, permanent_address=?, location=? WHERE guarantor_id=?",
+                          (r["name"], r["mobile"], r["address"], r["permanent"] or None, r["location"], gid))
             continue
         c.execute("SELECT COALESCE(MAX(seq),1) as m FROM LoanGuarantors WHERE loan_id=?", (loan_id,))
         seq = int(c.fetchone()["m"]) + 1
-        c.execute("INSERT INTO LoanGuarantors (loan_id,seq,name,mobile,address,location) VALUES (?,?,?,?,?,?)",
-                  (loan_id, seq, r["name"], r["mobile"], r["address"], r["location"]))
+        c.execute("INSERT INTO LoanGuarantors (loan_id,seq,name,mobile,address,permanent_address,location) VALUES (?,?,?,?,?,?,?)",
+                  (loan_id, seq, r["name"], r["mobile"], r["address"], r["permanent"] or None, r["location"]))
     get_db().commit()
 
 # ── Billing (printed-style receipts) ────────────────────────────────────────────
@@ -1806,8 +1985,9 @@ def get_penalties_by_emi(loan_id):
 
 # ── Loan closing: admin approval -> penalty collection -> key/document return -> acknowledgement ──
 CLOSURE_ITEM_INFO = {"key": ("🔑", "Key returned"), "rc": ("📄", "RC returned"),
-                     "docs": ("🗂️", "Proof & Documents returned"), "noc": ("✅", "NOC provided")}
-CLOSURE_ITEM_ORDER = ["key", "rc", "docs", "noc"]
+                     "docs": ("🗂️", "Proof & Documents returned"), "noc": ("✅", "NOC provided"),
+                     "cheque": ("🧾", "Cheque leaf returned"), "tc": ("📑", "Transfer certificate returned")}
+CLOSURE_ITEM_ORDER = ["key", "rc", "tc", "docs", "cheque", "noc"]
 CLOSURE_STAGE_TEXT = {"AwaitApproval": "Waiting for admin approval",
                       "Penalty": "Penalty to be collected (within a day)",
                       "Return": "Return of key & documents",
@@ -1822,10 +2002,12 @@ def closure_required_items(loan):
     items = []
     for v in vs:
         tag = vehicle_tag(v) if multi else ""
-        wanted = [k for k, flag in (("key", "key_received"), ("rc", "rc_received"), ("docs", "docs_received"))
+        wanted = [k for k, flag in (("key", "key_received"), ("rc", "rc_received"), ("tc", "tc_received"), ("docs", "docs_received"))
                   if v.get(flag) == "yes"] + ["noc"]
         for k in wanted:
             items.append({"item": k, "vehicle_id": v["vehicle_id"], "vtag": tag, "vseq": v.get("seq") or 1})
+    if loan.get("cheque_received") == "yes":     # the cheque leaf belongs to the loan, not to one vehicle
+        items.insert(0, {"item": "cheque", "vehicle_id": None, "vtag": "", "vseq": 0})
     return items
 
 def closure_item_title(i):
@@ -1855,6 +2037,7 @@ def closure_items(closure_id):
         info = {v["vehicle_id"]: (v.get("seq") or 1, vehicle_tag(v) if len(vs) > 1 else "") for v in vs}
         for r in rows:
             r["vseq"], r["vtag"] = info.get(r.get("vehicle_id"), (99, ""))
+            if r["item"] == "cheque": r["vseq"], r["vtag"] = 0, ""
     return sorted(rows, key=lambda r: (r.get("vseq", 1),
                                        CLOSURE_ITEM_ORDER.index(r["item"]) if r["item"] in CLOSURE_ITEM_ORDER else 99))
 
@@ -2413,7 +2596,11 @@ FU_CATEGORIES = ["Loans", "Key Collection", "Proof & Documents", "Penalty Collec
 # follow-up "item" -> (LoanEntry received column, LoanEntry received-date column)
 FU_ITEM_COLUMNS = {"key": ("key_received", "key_received_date"),
                    "rc":  ("rc_received",  "rc_received_date"),
-                   "docs":("docs_received","docs_received_date")}
+                   "docs":("docs_received","docs_received_date"),
+                   "cheque": ("cheque_received", "cheque_received_date"),
+                   "aadhar": ("aadhar_received", "aadhar_received_date"),
+                   "eb":     ("eb_received", "eb_received_date"),
+                   "tc":     ("tc_received", "tc_received_date")}
 
 def add_follow_up(loan_id, follow_up_date, remarks, created_by, category="Loans", item=None, ref_id=None):
     c = get_cur(); now = datetime.now(timezone.utc).isoformat()
@@ -2423,13 +2610,14 @@ def add_follow_up(loan_id, follow_up_date, remarks, created_by, category="Loans"
     get_db().commit()
     return c.lastrowid
 
-FU_ITEM_BY = {"key": "key_collected_by", "rc": "rc_collected_by", "docs": "docs_collected_by"}
+FU_ITEM_BY = {"key": "key_collected_by", "rc": "rc_collected_by", "docs": "docs_collected_by", "cheque": "cheque_collected_by",
+              "aadhar": "aadhar_collected_by", "eb": "eb_collected_by", "tc": "tc_collected_by"}
 
-def resolve_follow_up(followup_id, recv_date=None, recv_by=None):
+def resolve_follow_up(followup_id, recv_date=None, recv_by=None, recv_extra=None):
     """Closes the follow-up. For Key / RC / Proof follow-ups it also marks that item as received (with
     today's date) on the loan record; for a Penalty follow-up it marks the penalty as collected."""
     c = get_cur(); now = datetime.now(timezone.utc).isoformat()
-    c.execute("SELECT loan_id, item, ref_id, recv_date, recv_by FROM FollowUp WHERE followup_id=?", (followup_id,))
+    c.execute("SELECT loan_id, item, ref_id, recv_date, recv_by, recv_extra FROM FollowUp WHERE followup_id=?", (followup_id,))
     row = c.fetchone()
     c.execute("UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE followup_id=?", (now, followup_id))
     if row and row["item"] in FU_ITEM_COLUMNS:
@@ -2437,7 +2625,10 @@ def resolve_follow_up(followup_id, recv_date=None, recv_by=None):
         by_col = FU_ITEM_BY[row["item"]]
         rd = recv_date or row["recv_date"] or date.today().isoformat()
         rb = recv_by or row["recv_by"]
-        c.execute("UPDATE FollowUp SET recv_date=?, recv_by=? WHERE followup_id=?", (rd, rb, followup_id))
+        rx = recv_extra or row["recv_extra"]
+        c.execute("UPDATE FollowUp SET recv_date=?, recv_by=?, recv_extra=? WHERE followup_id=?", (rd, rb, rx, followup_id))
+        if row["item"] == "cheque" and rx:
+            c.execute("UPDATE LoanEntry SET cheque_numbers=? WHERE id=?", (rx, row["loan_id"]))
         if row["ref_id"]:       # an add-on vehicle's key / RC / proof
             c.execute(f"UPDATE LoanVehicles SET {col}='yes', {col_date}=?, {by_col}=? WHERE vehicle_id=?", (rd, rb, row["ref_id"]))
         else:
@@ -2449,14 +2640,14 @@ def resolve_follow_up(followup_id, recv_date=None, recv_by=None):
     if row and row["item"] == "penalty":
         closure_advance(row["loan_id"])     # last penalty collected -> key / document return unlocks
 
-def request_followup_ack(followup_id, username, note="", recv_date=None, recv_by=None):
+def request_followup_ack(followup_id, username, note="", recv_date=None, recv_by=None, recv_extra=None):
     """A follow-up is not closed directly: it goes to the acknowledger for a cross-check first."""
     c = get_cur(); c.execute("SELECT status FROM FollowUp WHERE followup_id=?", (followup_id,))
     row = c.fetchone()
     if not row or row["status"] != "Pending": raise ValueError("This follow-up is not open.")
     c.execute("""UPDATE FollowUp SET status='AwaitingAck', ack_requested_by=?, ack_requested_at=?, ack_note=?,
-                 recv_date=COALESCE(?,recv_date), recv_by=COALESCE(?,recv_by) WHERE followup_id=?""",
-              (username, datetime.now(timezone.utc).isoformat(), (note or "").strip(), recv_date, recv_by, followup_id))
+                 recv_date=COALESCE(?,recv_date), recv_by=COALESCE(?,recv_by), recv_extra=COALESCE(?,recv_extra) WHERE followup_id=?""",
+              (username, datetime.now(timezone.utc).isoformat(), (note or "").strip(), recv_date, recv_by, recv_extra, followup_id))
     get_db().commit()
 
 def acknowledge_followup(followup_id, username):
@@ -4012,6 +4203,40 @@ def add_loan():
         except ValueError as e:
             flash(str(e), "danger")
             return redirect(url_for("add_loan"))
+        # cheque leaf, address proof, transfer certificate, police fine, guarantor addresses
+        docs_extra, leaves, cheque_numbers, fine_main = {}, None, "", 0.0
+        try:
+            for short, lab in (("cheque", "Cheque leaf collected"), ("aadhar", "Aadhar (address proof) collected"),
+                               ("eb", "EB bill (address proof) collected")):
+                ans = f.get(short + "_received", "")
+                if ans not in ("yes", "no"): raise ValueError(f"Please answer '{lab}?' (Yes / No).")
+                docs_extra[short] = ans
+                if ans == "yes":
+                    collected[short] = parse_collected(f.get(short + "_date"), f.get(short + "_by"), lab, loan_date_val.isoformat())
+            if docs_extra["cheque"] == "yes":
+                lv = f.get("cheque_leaves", "").strip()
+                if lv:
+                    if not lv.isdigit(): raise ValueError("Cheque leaf: the number of leaves must be a whole number.")
+                    leaves = int(lv)
+                cheque_numbers = f.get("cheque_numbers", "").strip()
+            owner = f.get("other_owner", "")
+            if owner not in ("yes", "no"): raise ValueError("Please answer 'Vehicle in another owner's name?' (Yes / No).")
+            docs_extra["other_owner"] = owner; docs_extra["tc"] = ""
+            if owner == "yes":
+                ans = f.get("tc_received", "")
+                if ans not in ("yes", "no"): raise ValueError("Please answer 'Transfer certificate collected?' (Yes / No).")
+                docs_extra["tc"] = ans
+                if ans == "yes":
+                    collected["tc"] = parse_collected(f.get("tc_date"), f.get("tc_by"), "Transfer certificate", loan_date_val.isoformat())
+            fine_main = parse_fine(f.get("police_fine"), "Police fine")
+            g_cur = f.get("guarantor_address", "").strip()
+            g_perm = g_cur if f.get("guarantor_same_address") == "yes" else f.get("guarantor_permanent_address", "").strip()
+            if f.get("guarantor_name", "").strip() or f.get("guarantor_mobile", "").strip() or g_cur or g_perm:
+                if not g_cur: raise ValueError("Guarantor Current Address is mandatory.")
+                if not g_perm: raise ValueError("Guarantor Permanent Address is mandatory (or tick 'same as current address').")
+        except ValueError as e:
+            flash(str(e), "danger")
+            return redirect(url_for("add_loan"))
 
         # Resolve interest rate depending on calc_mode
         calc_mode = f.get("calc_mode","rate")
@@ -4049,6 +4274,11 @@ def add_loan():
             record_handover_details(new_loan_id, loan_date_val, field_visit, field_visit_date,
                                     field_visit_remark, handover, session.get("username",""),
                                     field_visited_by, collected)
+            record_extra_documents(new_loan_id, loan_date_val, docs_extra, collected, leaves, cheque_numbers, fine_main,
+                                   session.get("username",""))
+            c_ = get_cur()
+            c_.execute("UPDATE LoanEntry SET guarantor_permanent_address=? WHERE id=?", (g_perm or None, new_loan_id))
+            get_db().commit()
             save_extra_vehicles(new_loan_id, extra_vehicles, loan_date_val, session.get("username",""))
             save_extra_guarantors(new_loan_id, extra_guarantors)
             flash("Loan submitted for approval.","success")
@@ -4062,6 +4292,11 @@ def add_loan():
     try: next_ln = next_loan_number()
     except: next_ln = f"LN-{datetime.now().year}-01"
     xv_area, xg_area = extra_blocks_section()
+    main_vehicle_docs = vehicle_docs_html("other_owner", "tc_received", "tc_date", "tc_by", "police_fine", 0)
+    loan_docs_groups = (ho_group("Cheque leaf collected?", "cheque",
+                                 '<input type="number" name="cheque_leaves" min="0" placeholder="No. of leaves" style="flex:1;min-width:130px;">'
+                                 '<input name="cheque_numbers" placeholder="Cheque number(s)" style="flex:1;min-width:130px;">')
+                        + ho_group("Address proof — Aadhar collected?", "aadhar") + ho_group("Address proof — EB bill collected?", "eb"))
 
     content = f"""
     {_EXTRA_BLOCKS_JS}
@@ -4216,7 +4451,7 @@ def add_loan():
           <div id="risk_box" class="risk-box"></div>
         </div>
 
-        <div class="section-title">🛡️ Guarantor Details (optional)</div>
+        <div class="section-title">🛡️ Guarantor Details <span style="font-size:11px;text-transform:none;color:var(--muted);">(optional — but if a guarantor is entered, both addresses are required)</span></div>
         <div class="form-group">
           <label>Guarantor Name</label><input name="guarantor_name">
         </div>
@@ -4226,9 +4461,14 @@ def add_loan():
                  oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)">
         </div>
         {extra_numbers_block('guarantor')}
-        <div class="form-group full">
-          <label>Guarantor Address</label>
-          <textarea name="guarantor_address" rows="2"></textarea>
+        <div class="form-group full gaddr" id="gMainAddr">
+          <label>Guarantor Current Address * <span style="font-size:10px;color:var(--muted);">(mandatory when a guarantor is entered)</span></label>
+          <textarea name="guarantor_address" class="g-cur" rows="2"></textarea>
+          <label style="display:flex;align-items:center;gap:8px;font-weight:600;text-transform:none;font-size:13px;margin:6px 0 4px;cursor:pointer;">
+            <input type="checkbox" name="guarantor_same_address" value="yes" class="g-same" style="width:auto;min-height:0;margin:0;" onchange="syncGAddr(this)">
+            Permanent address same as current address</label>
+          <label>Guarantor Permanent Address * <span style="font-size:10px;color:var(--muted);">(mandatory when a guarantor is entered)</span></label>
+          <textarea name="guarantor_permanent_address" class="g-perm" rows="2"></textarea>
         </div>
         <div class="form-group full">
           <label>📍 Guarantor GPS Location <span style="font-size:10px;color:var(--muted);">(tap button or enter manually)</span></label>
@@ -4302,6 +4542,7 @@ def add_loan():
           </select>
           {handover_detail_html('rc_date', 'rc_by')}
         </div>
+        {main_vehicle_docs}
         <div class="form-group full" style="font-size:12px;color:var(--muted);">
           🚗 Giving two or three vehicles under this one loan number? Add each extra vehicle below &mdash; every vehicle has its own key / RC / proof status.
         </div>
@@ -4315,6 +4556,7 @@ def add_loan():
           </select>
           {handover_detail_html('docs_date', 'docs_by')}
         </div>
+        {loan_docs_groups}
         <div class="form-group full">
           <label>Attachment <span style="font-size:10px;color:var(--muted);">(Upload to Google Drive)</span></label>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
@@ -4772,6 +5014,7 @@ def approval():
           </div>
 
           {custom_note}
+          {documents_summary_html(l)}
 
           <form method="POST" class="approve-form" onsubmit="return true;">
             <input type="hidden" name="loan_id" value="{l['id']}">
@@ -5149,6 +5392,7 @@ def customer_edit(loan_id):
             customer_extra = parse_extra_numbers_form(f, "customer", "Customer")
             guarantor_extra = parse_extra_numbers_form(f, "guarantor", "Guarantor")
             xv_rows = parse_extra_vehicles(f, bool(loan.get("is_reloan")))
+            fine_main_edit = parse_fine(f.get("police_fine"), "Police fine")
             xg_rows = parse_extra_guarantors(f)
             c.execute("""UPDATE LoanEntry SET customer_extra_numbers=?, guarantor_extra_numbers=? WHERE id=?""",
                       (customer_extra or None, guarantor_extra or None, loan_id))
@@ -5190,6 +5434,9 @@ def customer_edit(loan_id):
             emi_amt = compute_emi_amount(new_amt, rate, tenure) if tenure>0 else 0
             c.execute("UPDATE Customers SET name=?,vehicle_type=?,loan_amount=?,emi_amount=? WHERE loan_id=?",
                       (f.get("customer_name","").strip(), f.get("vehicle_type","").strip(), new_amt, emi_amt, loan_id))
+            get_db().commit()
+            c.execute("UPDATE LoanEntry SET guarantor_permanent_address=?, police_fine=? WHERE id=?",
+                      (f.get("guarantor_permanent_address","").strip() or None, fine_main_edit, loan_id))
             get_db().commit()
             save_extra_vehicles(loan_id, xv_rows, date.today(), session.get("username",""))
             save_extra_guarantors(loan_id, xg_rows)
@@ -5295,7 +5542,12 @@ def customer_edit(loan_id):
           <label>Vehicle Colour</label>
           <input name="vehicle_colour" value="{loan.get('vehicle_colour','')}">
         </div>
+        <div class="form-group">
+          <label>Police fine amount (₹) <span style="font-size:10px;color:var(--muted);">(not more than {fmt_inr(police_fine_limit())})</span></label>
+          <input type="number" name="police_fine" value="{float(loan.get('police_fine') or 0):g}" min="0" max="{police_fine_limit():g}" step="0.01">
+        </div>
         <div class="form-group full" style="font-size:12.5px;">🚗 Vehicle 1 &mdash; {handover_status_html(loan)}</div>
+        <div class="form-group full">{documents_summary_html(loan)}</div>
         {xv_area}
 
         <div class="section-title">🛡️ Guarantor Details</div>
@@ -5309,9 +5561,13 @@ def customer_edit(loan_id):
                  oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)">
         </div>
         {extra_numbers_block('guarantor', loan.get('guarantor_extra_numbers'))}
-        <div class="form-group full">
-          <label>Guarantor Address</label>
-          <textarea name="guarantor_address" rows="2">{loan.get('guarantor_address','')}</textarea>
+        <div class="form-group full gaddr">
+          <label>Guarantor Current Address</label>
+          <textarea name="guarantor_address" class="g-cur" rows="2">{loan.get('guarantor_address','')}</textarea>
+          <label style="display:flex;align-items:center;gap:8px;font-weight:600;text-transform:none;font-size:13px;margin:6px 0 4px;cursor:pointer;">
+            <input type="checkbox" class="g-same" style="width:auto;min-height:0;margin:0;" onchange="syncGAddr(this)"> Permanent address same as current address</label>
+          <label>Guarantor Permanent Address</label>
+          <textarea name="guarantor_permanent_address" class="g-perm" rows="2">{html.escape(loan.get('guarantor_permanent_address') or '')}</textarea>
         </div>
         <div class="form-group full">
           <label>Guarantor GPS Location</label>
@@ -5573,11 +5829,14 @@ def emis(loan_id):
     g_nums = guarantor_numbers_html(loan, include_addon=False)
     if g_nums != "—":
         guarantor_header = (f"<div><b>Guarantor:</b> {html.escape(loan.get('guarantor_name') or '')} — "
-                            f"{g_nums.replace('<br>', ' &nbsp;·&nbsp; ')}</div>")
+                            f"{g_nums.replace('<br>', ' &nbsp;·&nbsp; ')}"
+                            f"{('<br><span style=font-size:12px;color:var(--muted);>Current: ' + html.escape(loan['guarantor_address']) + '</span>') if loan.get('guarantor_address') else ''}"
+                            f"{('<br><span style=font-size:12px;color:var(--muted);>Permanent: ' + html.escape(loan['guarantor_permanent_address']) + '</span>') if loan.get('guarantor_permanent_address') else ''}</div>")
     for gx in extra_guarantors_of(loan):
         guarantor_header += (f"<div><b>Guarantor {gx['seq']}:</b> {html.escape(gx.get('name') or '')} — "
                              f"{contact_numbers_html(gx.get('mobile'), (gx.get('name') or 'Guarantor') + ' (Guarantor ' + str(gx['seq']) + ')', None, 'Guarantor')}"
-                             f"{(' · ' + html.escape(gx['address'])) if gx.get('address') else ''}"
+                             f"{(' · Current: ' + html.escape(gx['address'])) if gx.get('address') else ''}"
+                             f"{(' · Permanent: ' + html.escape(gx['permanent_address'])) if gx.get('permanent_address') else ''}"
                              f"{(' · ' + _location_link(gx['location'])) if gx.get('location') else ''}</div>")
     xvs = extra_vehicles_of(loan)
     vehicle_extra_header = ""
@@ -5686,6 +5945,7 @@ def emis(loan_id):
         <div><b>Vehicle:</b> {html.escape(vehicle_label_more(loan))} — {loan.get('vehicle_number','')}</div>
         <div><b>Type:</b> {html.escape(loan.get('vehicle_type') or '—')}{(' · ' + html.escape(loan['vehicle_colour'])) if loan.get('vehicle_colour') else ''}</div>
         {vehicle_extra_header}
+        <div style="grid-column:1/-1;">{documents_summary_html(loan)}</div>
         <div><b>Loan Amount:</b> ₹{float(loan.get('loan_amount',0)):,.2f}</div>
         <div><b>Tenure:</b> {loan.get('tenure','')} months | <b>Status:</b> {loan.get('status','')}</div>
         <div style="grid-column:1/-1;background:#fef3c7;border-radius:6px;padding:10px;border-left:4px solid #d97706;">
@@ -6336,14 +6596,15 @@ def followup_resolve(followup_id):
         c = get_cur(); c.execute("SELECT item FROM FollowUp WHERE followup_id=?", (followup_id,))
         fr = c.fetchone()
         recv_date = recv_by = None
+        recv_extra = (request.form.get("recv_extra") or "").strip() or None
         if fr and fr["item"] in FU_ITEM_COLUMNS:       # key / RC / proof: ask when and by whom it was collected
             recv_date, recv_by = parse_collected(request.form.get("recv_date"), request.form.get("recv_by"),
                                                  HANDOVER_LABELS[fr["item"]], date.today().isoformat())
         if session.get("role","") in DIRECT_ROLES:
-            resolve_follow_up(followup_id, recv_date, recv_by)
+            resolve_follow_up(followup_id, recv_date, recv_by, recv_extra)
             flash("Follow-up marked as resolved.","success")
         else:
-            request_followup_ack(followup_id, session.get("username",""), request.form.get("note",""), recv_date, recv_by)
+            request_followup_ack(followup_id, session.get("username",""), request.form.get("note",""), recv_date, recv_by, recv_extra)
             flash("Sent for acknowledgement. The follow-up closes once an Account Manager or admin acknowledges it.","success")
     except Exception as e:
         flash(str(e),"danger")
@@ -6406,7 +6667,7 @@ def acknowledgements():
               <span class="badge badge-partial" style="margin-left:6px;">{html.escape(f['cat'])}</span>
               <div style="font-size:12.5px;margin-top:4px;line-height:1.7;">
                 {html.escape(f.get('remarks') or '')}<br>
-                {('<b>Collected on ' + fmt_date(f.get('recv_date')) + ' by ' + html.escape(f.get('recv_by') or '') + '</b><br>') if f.get('recv_by') else ''}
+                {('<b>Collected on ' + fmt_date(f.get('recv_date')) + ' by ' + html.escape(f.get('recv_by') or '') + (' · ' + html.escape(f['recv_extra']) if f.get('recv_extra') else '') + '</b><br>') if f.get('recv_by') else ''}
                 <span style="color:var(--muted);">Follow-up date {fmt_date(f['follow_up_date'])} · marked done by <b>{html.escape(f.get('ack_requested_by') or '')}</b>
                 on {fmt_date((f.get('ack_requested_at') or '')[:10])}{(' · note: ' + html.escape(f['ack_note'])) if f.get('ack_note') else ''}</span>
               </div>
@@ -6715,13 +6976,27 @@ def seizure_reopen(seizure_id):
 @role_required("superadmin")
 def settings_followup_days():
     try:
-        vals = {k: int(request.form.get("days_" + k, "")) for k in ("key", "rc", "docs")}
+        vals = {k: int(request.form.get("days_" + k) or handover_days(k)) for k in HANDOVER_LABELS}
         if any(v < 1 or v > 365 for v in vals.values()): raise ValueError
     except ValueError:
         flash("Enter whole numbers between 1 and 365.", "danger")
         return redirect(url_for("users"))
     for k, v in vals.items(): set_setting(f"followup_days_{k}", v)
-    flash(f"Saved: follow-up after Key {vals['key']} day(s), RC {vals['rc']} day(s), Proof & Documents {vals['docs']} day(s).", "success")
+    flash("Saved: follow-up days — " + ", ".join(f"{HANDOVER_LABELS[k]} {v}" for k, v in vals.items()) + ".", "success")
+    return redirect(url_for("users"))
+
+@app.route("/settings/police_fine", methods=["POST"])
+@login_required
+@role_required("superadmin")
+def settings_police_fine():
+    try:
+        v = float(request.form.get("max_fine", ""))
+        if v < 0: raise ValueError
+    except ValueError:
+        flash("Enter a valid amount (0 or more).", "danger")
+        return redirect(url_for("users"))
+    set_setting("police_fine_max", int(v) if v == int(v) else v)
+    flash(f"Saved: the police fine limit is now {fmt_inr(v)}.", "success")
     return redirect(url_for("users"))
 
 @app.route("/settings/seizure", methods=["POST"])
@@ -6807,7 +7082,8 @@ def followups():
         if r.get("item") in FU_ITEM_COLUMNS:
             recv_fields = (f'<input type="date" name="recv_date" value="{today.isoformat()}" max="{today.isoformat()}" required title="When collected" '
                            f'style="width:128px;font-size:12px;padding:4px 5px;">'
-                           f'<input name="recv_by" placeholder="Collected by *" required style="width:120px;font-size:12px;padding:4px 5px;">')
+                           f'<input name="recv_by" placeholder="Collected by *" required style="width:120px;font-size:12px;padding:4px 5px;">'
+                           + ('<input name="recv_extra" placeholder="Cheque no(s)" style="width:110px;font-size:12px;padding:4px 5px;">' if r.get("item") == "cheque" else ""))
         resolve_btn = "" if not is_open else f"""
           <form method="POST" action="/followup/resolve/{r['followup_id']}" style="display:inline-flex;gap:4px;flex-wrap:wrap;align-items:center;">
             <input type="hidden" name="next" value="{back_url}">
@@ -7389,7 +7665,7 @@ def users():
         fields = "".join(
             f'<div class="form-group"><label>{HANDOVER_LABELS[k]} — follow-up after (days)</label>'
             f'<input type="number" name="days_{k}" value="{handover_days(k)}" min="1" max="365" required style="max-width:130px;"></div>'
-            for k in ("key", "rc", "docs"))
+            for k in HANDOVER_LABELS)
         followup_rule = f"""<div class="card" style="margin-bottom:12px;">
       <h2>📞 Follow-up timing</h2>
       <form method="POST" action="/settings/followup_days" style="display:flex;gap:14px;align-items:end;flex-wrap:wrap;">
@@ -7398,10 +7674,22 @@ def users():
       </form>
       <p style="font-size:12px;color:var(--muted);margin-top:6px;">When a new loan is entered with Key / RC / Proof &amp; Documents = No, the follow-up is set this many days after the loan date. Existing follow-ups keep their dates.</p>
     </div>"""
+    fine_rule = ""
+    if is_super:
+        fine_rule = f"""<div class="card" style="margin-bottom:12px;">
+      <h2>🚓 Police fine limit</h2>
+      <form method="POST" action="/settings/police_fine" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;">
+        <div class="form-group"><label>A new loan cannot be registered with a police fine above (₹)</label>
+          <input type="number" name="max_fine" value="{police_fine_limit():g}" min="0" step="1" required style="max-width:160px;"></div>
+        <button class="btn btn-primary">Save</button>
+      </form>
+      <p style="font-size:12px;color:var(--muted);margin-top:6px;">Currently {fmt_inr(police_fine_limit())}. The amount entered for each vehicle is shown to the approver.</p>
+    </div>"""
     content = f"""
     <h1>⚙️ User Management</h1>
     {seizure_rule}
     {followup_rule}
+    {fine_rule}
     <div class="form-grid">
       <div class="card">
         <h2>Add / Update User</h2>
