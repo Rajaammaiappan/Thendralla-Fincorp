@@ -2849,6 +2849,13 @@ def fine_check_card_html(loan, can_pay):
                 f'onsubmit="return confirm(\'Save the police fine check?\')">{fine_inputs_html(loan)}'
                 f'<div class="form-group"><label>Note (optional)</label><input name="note" placeholder="e.g. checked on the e-challan site"></div>'
                 f'<div class="form-group full"><button class="btn btn-primary btn-sm" style="width:fit-content;">🚓 Save police fine check</button></div></form>')
+        # The form asks only when a check is due (open task, never checked, or the next check date reached);
+        # otherwise it stays folded until the next follow-up, with an option to update early.
+        check_due = due or not last or add_months(parse_date(last), months) <= date.today()
+        if not check_due:
+            form = (f'<details style="margin-top:8px;"><summary style="cursor:pointer;font-size:12px;color:var(--accent);font-weight:600;">'
+                    f'✏️ Checked on {fmt_date(last)} — the next check opens on '
+                    f'{fmt_date(add_months(parse_date(last), months).isoformat())}. Update early (e.g. a new challan found)</summary>{form}</details>')
     return (f'<div class="card" id="finecheck" style="margin-bottom:12px;border-left:5px solid #0e7490;">'
             f'<b>🚓 Police fine check</b> <span style="font-size:12px;color:var(--muted);">— every {months} months{sched}</span>'
             f'<div style="font-size:12px;color:var(--muted);margin-top:2px;">The fine is live data: enter it any time. The latest entry is taken as '
