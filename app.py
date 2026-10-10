@@ -2741,6 +2741,9 @@ def record_fine_check(loan_id, amounts, note, username, source="check"):
     cid = c.lastrowid
     c.execute("""UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE loan_id=? AND item='finecheck'
                  AND status IN ('Pending','AwaitingAck')""", (now, loan_id))
+    if total <= 0:      # the customer has cleared the fine: the approver's "clear the fine" task is done
+        c.execute("""UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE loan_id=? AND item='fineclear'
+                     AND status IN ('Pending','AwaitingAck')""", (now, loan_id))
     get_db().commit()
     return {"check_id": cid, "total": total, "outstanding": outstanding, "level": level, "reasons": reasons, "status": status}
 
@@ -2786,7 +2789,7 @@ def decide_fine_risk(check_id, action, remarks, username):
         get_db().commit()
         approve_seizure(sid, username)
     elif action == "clear":
-        add_follow_up(lid, (date.today() + timedelta(days=7)).isoformat(),
+        add_follow_up(lid, date.today().isoformat(),
                       f"Ask the customer to clear the police fine of {fmt_inr(ck['total_fine'])} (decided by {username})"
                       + (f": {remarks}" if remarks else ""), username, "Police Fine Check", "fineclear")
     c = get_cur()
@@ -7794,6 +7797,10 @@ def followups():
         if is_open and r.get("item") == "finecheck":
             resolve_btn = (f'<a class="btn btn-sm btn-primary" href="/emis/{r["loan_id"]}#finecheck" '
                            f'title="Enter the police fine of each vehicle on the loan page">🚓 Enter fine amount</a>')
+        if is_open and r.get("item") == "fineclear":
+            resolve_btn = (f'<a class="btn btn-sm btn-primary" href="/emis/{r["loan_id"]}#finecheck" '
+                           f'title="When the customer has paid the fine, enter the new fine (0) and this task closes by itself">'
+                           f'🚓 Fine cleared? Enter new fine</a>' + resolve_btn)
         reschedule_form = "" if not (is_open and r["category"] != "Loans") else f"""
           <form method="POST" action="/followup/reschedule/{r['followup_id']}" style="display:flex;gap:4px;align-items:center;">
             <input type="hidden" name="next" value="{back_url}">
