@@ -2189,10 +2189,10 @@ def approve_penalty(penalty_id, rate, username):
                      WHERE penalty_id=?""", (username, now, penalty_id))
         get_db().commit(); closure_advance(pen["loan_id"]); return 0.0
     c.execute("""SELECT emi_id FROM EMI WHERE loan_id=? AND status NOT IN ('Paid','PreClosed','Seized')
-                 ORDER BY installment_no LIMIT 1""", (pen["loan_id"],))
+                 ORDER BY installment_no DESC LIMIT 1""", (pen["loan_id"],))
     tgt = c.fetchone()
     if tgt:
-        # EMIs are still left: the penalty is added to the next unpaid EMI and collected with it (no follow-up)
+        # EMIs are still left: the penalty is added to the LAST EMI, so all penalties are paid at the end (no follow-up)
         c.execute("UPDATE EMI SET penalty_due=COALESCE(penalty_due,0)+? WHERE emi_id=?", (final, tgt["emi_id"]))
         c.execute("""UPDATE Penalties SET status='Approved', final_rate=?, final_amount=?, decided_by=?, decided_at=?,
                      merged_emi_id=? WHERE penalty_id=?""", (rate, final, username, now, tgt["emi_id"], penalty_id))
@@ -4412,8 +4412,7 @@ def fine_risk_panel_html():
             f'<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px;">'
             f'<b style="font-size:15px;">🚓 Police fine risk — {len(rows)} loan(s) ({n_high} high)</b>'
             f'<a class="btn btn-sm btn-amber" href="/report?risk=fine&view=fine_risk">Open in report</a></div>'
-            f'<div style="font-size:12px;color:var(--muted);margin-bottom:4px;">A big police fine compared with what is still pending (or an old vehicle) '
-            f'means the customer may give the vehicle back instead of paying.</div>{items}</div>')
+            f'{items}</div>')
 
 @app.route("/dashboard")
 @login_required
@@ -5787,7 +5786,7 @@ def approval():
               </div>
             </div>
             <div style="margin-top:10px;display:flex;gap:8px;">
-              <div style="font-size:12px;color:var(--muted);margin-right:8px;align-self:center;">If EMIs are still left, the penalty is added to the next unpaid EMI and collected with it; otherwise a collection follow-up is created.</div>
+              <div style="font-size:12px;color:var(--muted);margin-right:8px;align-self:center;">If EMIs are still left, the penalty is added to the last EMI, so all penalties are collected at the end with it; otherwise a collection follow-up is created.</div>
               <button type="submit" class="btn btn-success btn-sm">✅ Approve Penalty</button>
             </div>
           </form>
@@ -7421,7 +7420,7 @@ def penalty_approve(penalty_id):
             flash("Penalty waived (per-day amount was 0).", "success")
         elif merged:
             c.execute("SELECT installment_no FROM EMI WHERE emi_id=?", (merged,))
-            flash(f"Penalty approved: {fmt_inr(final)}. It was added to installment {c.fetchone()['installment_no']}'s amount and is collected with that EMI.", "success")
+            flash(f"Penalty approved: {fmt_inr(final)}. It was added to the last EMI (installment {c.fetchone()['installment_no']}) and is collected at the end with it.", "success")
         else:
             flash("Penalty approved: " + fmt_inr(final) + ". No EMI is left, so a penalty-collection follow-up was added.", "success")
     except Exception as e:
