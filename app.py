@@ -1746,6 +1746,10 @@ def approve_preclosure(preclose_id, collect_months, username, pending_rates=None
                  settlement_amount=?, penalty_amount=?, penalty_days=?, approved_by=?, approved_at=? WHERE preclose_id=?""",
               (further, waived, fig["months"], fig["paid"], fig["settlement"], fig["penalty"], total_days, username, now, preclose_id))
     get_db().commit()
+    # tell the collecting agent: collect the settlement in one bill and close the loan
+    add_follow_up(lid, date.today().isoformat(),
+                  f"Pre-closure approved by {username}: collect the settlement {fmt_inr(fig['settlement'])} in one bill "
+                  f"and close the loan (the loan page shows the latest amount).", username, "Pre-closure Collection", "preclose", ref_id=preclose_id)
 
 def reject_preclosure(preclose_id, reason, username):
     c = get_cur()
@@ -1908,7 +1912,7 @@ def complete_preclosure(preclose_id, bill_number, paid_on, username):
     c.execute("UPDATE Penalties SET status='Collected', collected_at=? WHERE loan_id=? AND status='Approved' AND merged_emi_id IS NOT NULL",
               (now, lid))      # penalties added to EMIs were collected in the settlement
     c.execute("""UPDATE FollowUp SET status='Resolved', resolved_at=?
-                 WHERE loan_id=? AND status='Pending' AND COALESCE(category,'Loans')='Loans'""", (now, lid))
+                 WHERE loan_id=? AND status IN ('Pending','AwaitingAck') AND (COALESCE(category,'Loans')='Loans' OR item='preclose')""", (now, lid))
     c.execute("""UPDATE PreClosure SET status='Completed', bill_number=?, paid_on=?, closed_by=?, closed_at=?
                  WHERE preclose_id=?""", (bill_number, pd.isoformat(), username, now, preclose_id))
     get_db().commit()
@@ -3086,7 +3090,7 @@ def _location_link(loc):
     return f'<a href="{url}" target="_blank" rel="noopener">📍 {html.escape(loc)}</a>'
 
 # ── Follow Up (customer-requested collection date) ──────────────────────────────
-FU_CATEGORIES = ["Loans", "Key Collection", "Proof & Documents", "Penalty Collection", "Vehicle Seizure", "Police Fine Check"]
+FU_CATEGORIES = ["Loans", "Pre-closure Collection", "Key Collection", "Proof & Documents", "Penalty Collection", "Vehicle Seizure", "Police Fine Check"]
 DOC_FU_CATEGORIES = ("Key Collection", "Proof & Documents", "Vehicle Seizure", "Police Fine Check")    # no money columns on these follow-ups
 # follow-up "item" -> (LoanEntry received column, LoanEntry received-date column)
 FU_ITEM_COLUMNS = {"key": ("key_received", "key_received_date"),
@@ -6520,7 +6524,7 @@ def emis(loan_id):
                           f'<button class="btn btn-success btn-sm">🔒 Close Loan</button></form>')
         pay_line = (f'Pay <b style="font-size:16px;">₹{settle:,.2f}</b> in <b>one bill</b> to close the loan.' if settle > 0
                     else 'No further payment is due.')
-        preclose_box = (f'<div style="background:#d1fae5;border:1px solid #6ee7b7;border-radius:10px;padding:10px 14px;max-width:440px;font-size:13px;">'
+        preclose_box = (f'<div id="preclose" style="background:#d1fae5;border:1px solid #6ee7b7;border-radius:10px;padding:10px 14px;max-width:440px;font-size:13px;">'
                         f'<b>✅ Pre-closure approved</b> by {html.escape(pc.get("approved_by") or "")}<br>'
                         + (f'Interest to collect further <b>{fmt_inr(pc["further_interest"])}</b> '
                            f'({float(pc.get("waived_months") or 0):g} month(s) waived; already paid ₹{float(pc["paid_before"] or 0):,.2f})<br>'
@@ -7796,6 +7800,10 @@ def followups():
         if is_open and r.get("item") == "finecheck":
             resolve_btn = (f'<a class="btn btn-sm btn-primary" href="/emis/{r["loan_id"]}#finecheck" '
                            f'title="Enter the police fine of each vehicle on the loan page">🚓 Enter fine amount</a>')
+        if is_open and r.get("item") == "preclose":
+            resolve_btn = (f'<a class="btn btn-sm btn-success" href="/emis/{r["loan_id"]}#preclose" '
+                           f'title="Collect the settlement, enter the closing bill number and close the loan; this task then closes by itself">'
+                           f'💰 Collect &amp; close loan</a>')
         if is_open and r.get("item") == "fineclear":
             resolve_btn = (f'<a class="btn btn-sm btn-primary" href="/emis/{r["loan_id"]}#finecheck" '
                            f'title="When the customer has paid the fine, enter the new fine (0) and this task closes by itself">'
@@ -7860,7 +7868,7 @@ def followups():
     tabs = "".join(
         f'<a href="/followup?q={q_url}&cat={urlquote(name)}" class="btn btn-sm" '
         f'style="{"background:var(--accent);color:#fff;" if cat==name else "background:var(--surface2);color:var(--text);"}">{label}</a>'
-        for name, label in (("", "All"), ("Loans", "💰 Loans"), ("Key Collection", "🔑 Key Collection"),
+        for name, label in (("", "All"), ("Loans", "💰 Loans"), ("Pre-closure Collection", "⏩ Pre-closure Collection"), ("Key Collection", "🔑 Key Collection"),
                             ("Proof & Documents", "📄 Proof & Documents"), ("Penalty Collection", "⚖️ Penalty Collection"),
                             ("Vehicle Seizure", "🚫 Vehicle Seizure"), ("Police Fine Check", "🚓 Police Fine Check")))
     content = f"""
