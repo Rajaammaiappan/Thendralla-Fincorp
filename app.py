@@ -1028,6 +1028,23 @@ def init_db():
         closed_at TEXT,
         FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
     );
+    CREATE TABLE IF NOT EXISTS PenaltyReductions (
+        reduction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        loan_id INTEGER,
+        iteration_no INTEGER,
+        outstanding_at_request REAL,
+        requested_amount REAL,
+        reason TEXT,
+        requested_by TEXT,
+        requested_at TEXT,
+        status TEXT,
+        approved_amount REAL,
+        reduced_by REAL,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_remarks TEXT,
+        FOREIGN KEY(loan_id) REFERENCES LoanEntry(id)
+    );
     CREATE TABLE IF NOT EXISTS RejectedLoans (
         reject_id INTEGER PRIMARY KEY AUTOINCREMENT,
         loan_id INTEGER UNIQUE, reason TEXT, created_at TEXT,
@@ -1145,6 +1162,7 @@ def init_db():
         "ALTER TABLE EMI ADD COLUMN penalty_paid REAL DEFAULT 0",
         "ALTER TABLE EMIPayments ADD COLUMN penalty_part REAL DEFAULT 0",
         "ALTER TABLE Penalties ADD COLUMN merged_emi_id INTEGER",
+        "ALTER TABLE Penalties ADD COLUMN reduced_amount REAL DEFAULT 0",
     ]:
         try: cur.execute(m)
         except: pass
@@ -1181,6 +1199,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_pp_emi ON PendingPayments(emi_id)",
         "CREATE INDEX IF NOT EXISTS idx_penalties_status ON Penalties(status)",
         "CREATE INDEX IF NOT EXISTS idx_penalties_emi ON Penalties(emi_id)",
+        "CREATE INDEX IF NOT EXISTS idx_penred_loan ON PenaltyReductions(loan_id)",
         "CREATE INDEX IF NOT EXISTS idx_receipts_no ON Receipts(receipt_no)",
         "CREATE INDEX IF NOT EXISTS idx_receipts_loan_id ON Receipts(loan_id)",
         "CREATE INDEX IF NOT EXISTS idx_preclosure_loan_id ON PreClosure(loan_id)",
@@ -1612,7 +1631,8 @@ def preclosure_figures(loan, further_interest=None, as_of=None):
     return {"months": months, "interest": interest, "paid": round(paid, 2), "settlement": settlement, "penalty": penalty,
             "emi": emi, "principal": principal, "total_interest": total_interest, "principal_paid": principal_paid,
             "interest_paid": interest_paid, "rem_principal": rem_principal, "rem_interest": rem_interest,
-            "monthly_interest": monthly_interest}
+            "monthly_interest": monthly_interest,
+            "rem_months": round(rem_interest / monthly_interest, 2) if monthly_interest > 0 else 0.0}
 
 def get_preclosure(loan_id):
     """Latest pre-closure record of a loan (or None)."""
@@ -1653,7 +1673,7 @@ def preclosure_overdue_rows(loan_id):
         if days > 0: out.append((e, days))
     return out
 
-def approve_preclosure(preclose_id, further_interest, waived_months, username, pending_rates=None, overdue_rates=None):
+def approve_preclosure(preclose_id, collect_months, username, pending_rates=None, overdue_rates=None):
     pending_rates, overdue_rates = pending_rates or {}, overdue_rates or {}
     c = get_cur()
     c.execute("SELECT * FROM PreClosure WHERE preclose_id=?", (preclose_id,))
@@ -1661,15 +1681,16 @@ def approve_preclosure(preclose_id, further_interest, waived_months, username, p
     if not pc or pc["status"] != "Pending": raise ValueError("This pre-closure request is not pending.")
     c.execute("SELECT * FROM LoanEntry WHERE id=?", (pc["loan_id"],))
     loan = dict(c.fetchone())
-    try: further = round(float(further_interest), 2)
-    except (TypeError, ValueError): raise ValueError("Enter the interest amount to be collected further.")
-    if further < 0: raise ValueError("Interest to be collected cannot be negative.")
-    try: waived = int(str(waived_months or "0").strip() or 0)
-    except ValueError: raise ValueError("Enter a valid number of months to waive.")
-    if waived < 0: raise ValueError("Months to waive cannot be negative.")
+    try: months = round(float(collect_months), 2)
+    except (TypeError, ValueError): raise ValueError("Enter the number of months of interest to be collected further.")
+    if months < 0: raise ValueError("Months of interest cannot be negative.")
     base = preclosure_figures(loan)
-    if further > base["rem_interest"] + 0.005:
-        raise ValueError(f"Interest to be collected cannot be more than the interest still pending ({fmt_inr(base['rem_interest'])}).")
+    mi = base["monthly_interest"]
+    total_months = round(base["rem_interest"] / mi, 2) if mi > 0 else 0.0
+    if months > total_months + 0.005:
+        raise ValueError(f"Only {total_months:g} month(s) of interest are pending ({fmt_inr(base['rem_interest'])}).")
+    further = round(min(base["rem_interest"], months * mi), 2)      # the interest the customer finally pays
+    waived = round(max(0.0, total_months - months), 2)               # months of interest given up
     # validate every penalty rate before anything is changed
     lid = pc["loan_id"]
     c.execute("SELECT * FROM Penalties WHERE loan_id=? AND status='Pending' ORDER BY penalty_id", (lid,))
@@ -1713,6 +1734,140 @@ def reject_preclosure(preclose_id, reason, username):
                  WHERE preclose_id=?""",
               (username, datetime.now(timezone.utc).isoformat(), (reason or "").strip() or "No reason given", preclose_id))
     get_db().commit()
+
+# ── Penalty reduction (customer asks to pay less penalty; the approver decides) ──
+def loan_penalty_outstanding(loan_id):
+    """[(emi, penalty still to collect)] for the unpaid EMIs of a loan, oldest first."""
+    c = get_cur()
+    c.execute("""SELECT * FROM EMI WHERE loan_id=? AND status NOT IN ('Paid','PreClosed','Seized') ORDER BY installment_no""", (loan_id,))
+    out = []
+    for r in c.fetchall():
+        e = dict(r); p = emi_penalty_out(e)
+        if p > 0: out.append((e, p))
+    return out
+
+def get_pending_reduction(loan_id):
+    c = get_cur()
+    c.execute("SELECT * FROM PenaltyReductions WHERE loan_id=? AND status='Pending' ORDER BY reduction_id DESC LIMIT 1", (loan_id,))
+    r = c.fetchone()
+    return dict(r) if r else None
+
+def request_penalty_reduction(loan_id, requested_amount, reason, username):
+    c = get_cur(); c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
+    loan = c.fetchone()
+    if not loan: raise ValueError("Loan not found.")
+    if loan["status"] != "Approved": raise ValueError("Only active loans can have a penalty reduction.")
+    if get_pending_reduction(loan_id): raise ValueError("A penalty reduction request is already waiting for approval.")
+    outstanding = round(sum(p for _, p in loan_penalty_outstanding(loan_id)), 2)
+    if outstanding <= 0: raise ValueError("There is no penalty outstanding on this loan.")
+    try: req = round(float(requested_amount), 2)
+    except (TypeError, ValueError): raise ValueError("Enter the penalty amount the customer is ready to pay.")
+    if req < 0: raise ValueError("The amount cannot be negative.")
+    if req >= outstanding: raise ValueError(f"The amount must be less than the outstanding penalty ({fmt_inr(outstanding)}).")
+    reason = (reason or "").strip()
+    if not reason: raise ValueError("Enter the customer's reason for asking the reduction.")
+    c.execute("SELECT COUNT(*) as n FROM PenaltyReductions WHERE loan_id=?", (loan_id,))
+    n = int(c.fetchone()["n"]) + 1
+    c.execute("""INSERT INTO PenaltyReductions (loan_id,iteration_no,outstanding_at_request,requested_amount,reason,requested_by,requested_at,status)
+                 VALUES (?,?,?,?,?,?,?,?)""",
+              (loan_id, n, outstanding, req, reason, username, datetime.now(timezone.utc).isoformat(), "Pending"))
+    get_db().commit()
+
+def approve_penalty_reduction(reduction_id, approved_amount, remarks, username):
+    """The approver sets the penalty the customer finally has to pay (anything from 0 up to the outstanding amount)."""
+    c = get_cur(); c.execute("SELECT * FROM PenaltyReductions WHERE reduction_id=?", (reduction_id,))
+    rd = c.fetchone()
+    if not rd or rd["status"] != "Pending": raise ValueError("This request is not pending.")
+    lid = rd["loan_id"]
+    rows = loan_penalty_outstanding(lid)
+    outstanding = round(sum(p for _, p in rows), 2)
+    try: final = round(float(approved_amount), 2)
+    except (TypeError, ValueError): raise ValueError("Enter the penalty amount to be collected.")
+    if final < 0: raise ValueError("The amount cannot be negative.")
+    if final > outstanding + 0.005:
+        raise ValueError(f"The amount cannot be more than the outstanding penalty ({fmt_inr(outstanding)}).")
+    cut_total = round(outstanding - final, 2)
+    left = cut_total
+    for e, out in sorted(rows, key=lambda x: -x[0]["installment_no"]):      # newest EMI's penalty is reduced first
+        if left <= 0.004: break
+        cut = round(min(out, left), 2); left = round(left - cut, 2)
+        c.execute("UPDATE EMI SET penalty_due=ROUND(COALESCE(penalty_due,0)-?,2) WHERE emi_id=?", (cut, e["emi_id"]))
+        c.execute("""SELECT * FROM Penalties WHERE merged_emi_id=? AND status='Approved' ORDER BY penalty_id DESC""", (e["emi_id"],))
+        rest = cut
+        for pn in [dict(x) for x in c.fetchall()]:
+            if rest <= 0.004: break
+            take = round(min(float(pn["final_amount"] or 0), rest), 2); rest = round(rest - take, 2)
+            new_amt = round(float(pn["final_amount"] or 0) - take, 2)
+            c.execute("UPDATE Penalties SET final_amount=?, reduced_amount=ROUND(COALESCE(reduced_amount,0)+?,2), status=? WHERE penalty_id=?",
+                      (new_amt, take, "Waived" if new_amt <= 0.005 else "Approved", pn["penalty_id"]))
+    if cut_total > 0:       # an approved pre-closure settlement included this penalty
+        c.execute("""UPDATE PreClosure SET settlement_amount=MAX(0,ROUND(COALESCE(settlement_amount,0)-?,2)),
+                     penalty_amount=MAX(0,ROUND(COALESCE(penalty_amount,0)-?,2)) WHERE loan_id=? AND status='Approved'""",
+                  (cut_total, cut_total, lid))
+    c.execute("""UPDATE PenaltyReductions SET status='Approved', approved_amount=?, reduced_by=?, decided_by=?, decided_at=?, decision_remarks=?
+                 WHERE reduction_id=?""", (final, cut_total, username, datetime.now(timezone.utc).isoformat(), (remarks or "").strip() or None, reduction_id))
+    get_db().commit()
+    for e, _ in rows: _settle_merged_penalties(e["emi_id"])
+    return cut_total
+
+def reject_penalty_reduction(reduction_id, reason, username):
+    c = get_cur(); c.execute("SELECT status FROM PenaltyReductions WHERE reduction_id=?", (reduction_id,))
+    rd = c.fetchone()
+    if not rd or rd["status"] != "Pending": raise ValueError("This request is not pending.")
+    c.execute("""UPDATE PenaltyReductions SET status='Rejected', decided_by=?, decided_at=?, decision_remarks=? WHERE reduction_id=?""",
+              (username, datetime.now(timezone.utc).isoformat(), (reason or "").strip() or "No reason given", reduction_id))
+    get_db().commit()
+
+def penalty_history(loan_id):
+    """Every penalty round of a loan and every reduction request, with counts."""
+    c = get_cur()
+    c.execute("""SELECT pn.*, e.due_date FROM Penalties pn JOIN EMI e ON e.emi_id=pn.emi_id
+                 WHERE pn.loan_id=? AND pn.status!='Rejected' ORDER BY pn.penalty_id""", (loan_id,))
+    pens = [dict(r) for r in c.fetchall()]
+    c.execute("SELECT * FROM PenaltyReductions WHERE loan_id=? ORDER BY reduction_id", (loan_id,))
+    reds = [dict(r) for r in c.fetchall()]
+    amt = lambda p: float(p["final_amount"] if p["final_amount"] is not None else p["requested_amount"] or 0)
+    return {"pens": pens, "reds": reds,
+            "raised": round(sum(amt(p) + float(p.get("reduced_amount") or 0) for p in pens), 2),
+            "reduced": round(sum(float(p.get("reduced_amount") or 0) for p in pens), 2),
+            "n_pen": len(pens), "n_red": len(reds),
+            "n_red_ok": sum(1 for r in reds if r["status"] == "Approved"), "n_red_no": sum(1 for r in reds if r["status"] == "Rejected")}
+
+def penalty_history_html(loan_id, with_other_loans=False):
+    h = penalty_history(loan_id)
+    other = ""
+    if with_other_loans:
+        c = get_cur(); c.execute("SELECT customer_mobile FROM LoanEntry WHERE id=?", (loan_id,))
+        mob = (c.fetchone() or {"customer_mobile": ""})["customer_mobile"]
+        if mob:
+            c.execute("""SELECT le.loan_number, COUNT(p.penalty_id) as n,
+                                COALESCE(SUM(COALESCE(p.final_amount,p.requested_amount)+COALESCE(p.reduced_amount,0)),0) as amt,
+                                COALESCE(SUM(p.reduced_amount),0) as red
+                         FROM LoanEntry le JOIN Penalties p ON p.loan_id=le.id
+                         WHERE le.customer_mobile=? AND le.id!=? AND p.status!='Rejected' GROUP BY le.id""", (mob, loan_id))
+            rows = [dict(r) for r in c.fetchall()]
+            if rows:
+                other = ('<div style="font-size:12.5px;margin-top:6px;"><b>Same customer, other loans:</b> '
+                         + " · ".join(f'{html.escape(r["loan_number"])} — {r["n"]} penalty(ies), {fmt_inr(r["amt"])} raised, {fmt_inr(r["red"])} reduced' for r in rows)
+                         + '</div>')
+    if not h["pens"] and not h["reds"] and not other: return ""
+    prow = "".join(
+        f'<tr><td>{ordinal_due(p["installment_no"])}</td><td>{fmt_date(p["due_date"])}</td><td>{int(p["days"] or 0)}</td>'
+        f'<td>{fmt_inr(p["final_rate"] if p["final_rate"] is not None else p["requested_rate"])}</td>'
+        f'<td>{fmt_inr(float(p["final_amount"] if p["final_amount"] is not None else p["requested_amount"] or 0) + float(p.get("reduced_amount") or 0))}</td>'
+        f'<td>{fmt_inr(p.get("reduced_amount") or 0)}</td><td>{fmt_inr(p["final_amount"] if p["final_amount"] is not None else p["requested_amount"])}</td>'
+        f'<td>{html.escape(p["status"])}</td></tr>' for p in h["pens"])
+    rrow = "".join(
+        f'<tr><td>#{r["iteration_no"]}</td><td>{fmt_date((r.get("requested_at") or "")[:10])}</td><td>{fmt_inr(r["outstanding_at_request"])}</td>'
+        f'<td>{fmt_inr(r["requested_amount"])}</td><td>{fmt_inr(r["approved_amount"]) if r["status"] == "Approved" else "—"}</td>'
+        f'<td>{html.escape(r["status"])}</td><td style="white-space:normal;">{html.escape(r.get("reason") or "")}'
+        f'{(" → " + html.escape(r["decision_remarks"])) if r.get("decision_remarks") else ""}</td></tr>' for r in h["reds"])
+    return f"""<div class="card" id="penhist" style="margin-bottom:12px;">
+      <b>💰 Penalty history</b> — <b>{h['n_pen']}</b> penalty round(s) · {fmt_inr(h['raised'])} raised · {fmt_inr(h['reduced'])} reduced ·
+      <b>{h['n_red']}</b> reduction request(s) ({h['n_red_ok']} approved, {h['n_red_no']} rejected)
+      {('<div class="table-wrap" style="margin-top:8px;"><table><tr><th>Installment</th><th>Due</th><th>Days</th><th>Per day</th><th>Raised</th><th>Reduced</th><th>Payable</th><th>Status</th></tr>' + prow + '</table></div>') if prow else ''}
+      {('<div class="table-wrap" style="margin-top:8px;"><table><tr><th>Request</th><th>Date</th><th>Outstanding then</th><th>Customer offered</th><th>Approved</th><th>Status</th><th>Reason / decision</th></tr>' + rrow + '</table></div>') if rrow else ''}
+      {other}</div>"""
 
 def complete_preclosure(preclose_id, bill_number, paid_on, username):
     """Records the single closing bill and closes the loan: unpaid EMIs become 'PreClosed'."""
@@ -2229,8 +2384,9 @@ def set_setting(key, value):
 # ── Vehicle seizure: request -> admin approval -> key / RC received -> Account Manager acknowledgement ──
 SEIZURE_DEFAULT_MIN = 3        # the "Vehicle Seized" option appears from this many overdue EMIs (Super Admin can change it)
 SEIZURE_ITEM_INFO = {"key": ("🔑", "Key received"), "rc": ("📄", "RC received")}
-SEIZURE_LIVE = ("Pending", "Return", "AckPending", "Seized")
-SEIZURE_STAGE_TEXT = {"Pending": "Waiting for admin approval",
+SEIZURE_LIVE = ("Pending", "Approved", "Return", "AckPending", "Seized")
+SEIZURE_STAGE_TEXT = {"Pending": "Seizing plan waiting for admin approval",
+                      "Approved": "Plan approved - the vehicle is to be seized and the details entered",
                       "Return": "Key and RC to be received and recorded",
                       "AckPending": "Waiting for Account Manager acknowledgement",
                       "Seized": "Seizure completed"}
@@ -2292,7 +2448,9 @@ def seizure_blockers(loan, check_count=True):
         if have < need: return f"A seizure needs at least {need} overdue EMIs; this loan has {have}."
     return ""
 
-def request_seizure(loan_id, reason, seized_date, place, writeoff_reason, username):
+def request_seizure(loan_id, reason, username):
+    """Step 1: a seizing PLAN (reason only). Nothing changes on the loan until the approver approves it
+    and the user then actually seizes the vehicle (see execute_seizure)."""
     c = get_cur(); c.execute("SELECT * FROM LoanEntry WHERE id=?", (loan_id,))
     loan = c.fetchone()
     if not loan: raise ValueError("Loan not found.")
@@ -2300,27 +2458,43 @@ def request_seizure(loan_id, reason, seized_date, place, writeoff_reason, userna
     if get_open_seizure(loan_id): raise ValueError("A seizure is already open for this loan.")
     err = seizure_blockers(loan)
     if err: raise ValueError(err)
-    reason, place, writeoff_reason = (reason or "").strip(), (place or "").strip(), (writeoff_reason or "").strip()
+    reason = (reason or "").strip()
     if not reason: raise ValueError("Enter the reason for the seizure.")
+    c.execute("""INSERT INTO Seizures (loan_id,status,reason,overdue_count,requested_by,requested_at)
+                 VALUES (?,?,?,?,?,?)""",
+              (loan_id, "Pending", reason, len(overdue_emis(loan_id)), username, datetime.now(timezone.utc).isoformat()))
+    get_db().commit()
+    return c.lastrowid
+
+def approve_seizure(seizure_id, username):
+    """Admin approves the seizing PLAN. The user is told through an immediate follow-up task; the EMIs are
+    only closed / written off when the user has seized the vehicle and enters the details (execute_seizure)."""
+    c = get_cur(); c.execute("SELECT * FROM Seizures WHERE seizure_id=?", (seizure_id,))
+    sz = c.fetchone()
+    if not sz or sz["status"] != "Pending": raise ValueError("This seizure request is not waiting for approval.")
+    c.execute("SELECT * FROM LoanEntry WHERE id=?", (sz["loan_id"],))
+    err = seizure_blockers(dict(c.fetchone()), check_count=False)
+    if err: raise ValueError(err)
+    c.execute("UPDATE Seizures SET status='Approved', approved_by=?, approved_at=? WHERE seizure_id=?",
+              (username, datetime.now(timezone.utc).isoformat(), seizure_id))
+    get_db().commit()
+    add_follow_up(sz["loan_id"], date.today().isoformat(),
+                  f"Seize the vehicle (plan approved by {username}) and enter the seizure details. Reason: {sz['reason']}",
+                  username, "Vehicle Seizure", "seizure", ref_id=seizure_id)
+
+def execute_seizure(seizure_id, seized_date, place, writeoff_reason, username):
+    """The user has seized the vehicle: every unpaid EMI is closed as 'Seized', the outstanding amount is
+    written off, pending penalties are waived and the key / RC receipt rows (per vehicle) are opened."""
+    c = get_cur(); c.execute("SELECT * FROM Seizures WHERE seizure_id=?", (seizure_id,))
+    sz = c.fetchone()
+    if not sz or sz["status"] != "Approved": raise ValueError("This seizing plan has not been approved.")
+    sz = dict(sz); lid = sz["loan_id"]
+    place, writeoff_reason = (place or "").strip(), (writeoff_reason or "").strip()
     if not place: raise ValueError("Enter where the vehicle is kept.")
     if not writeoff_reason: raise ValueError("Enter the reason for writing off the outstanding amount.")
     try: d = datetime.strptime((seized_date or "").strip(), "%Y-%m-%d").date()
     except ValueError: raise ValueError("Enter a valid seized date.")
     if d > date.today(): raise ValueError("Seized date cannot be in the future.")
-    c.execute("""INSERT INTO Seizures (loan_id,status,reason,seized_date,place,writeoff_reason,overdue_count,requested_by,requested_at)
-                 VALUES (?,?,?,?,?,?,?,?,?)""",
-              (loan_id, "Pending", reason, d.isoformat(), place, writeoff_reason, len(overdue_emis(loan_id)), username,
-               datetime.now(timezone.utc).isoformat()))
-    get_db().commit()
-    return c.lastrowid
-
-def approve_seizure(seizure_id, writeoff_reason, username):
-    """Admin approval: every unpaid EMI is closed as 'Seized', the outstanding amount is written off,
-    pending penalties are waived and the key / RC receipt rows (per vehicle) are opened."""
-    c = get_cur(); c.execute("SELECT * FROM Seizures WHERE seizure_id=?", (seizure_id,))
-    sz = c.fetchone()
-    if not sz or sz["status"] != "Pending": raise ValueError("This seizure request is not waiting for approval.")
-    sz = dict(sz); lid = sz["loan_id"]
     c.execute("SELECT * FROM LoanEntry WHERE id=?", (lid,))
     loan = dict(c.fetchone())
     err = seizure_blockers(loan, check_count=False)
@@ -2345,9 +2519,8 @@ def approve_seizure(seizure_id, writeoff_reason, username):
     c.execute("""UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE loan_id=? AND status IN ('Pending','AwaitingAck')""", (now, lid))
     c.execute("UPDATE LoanEntry SET status='Seized' WHERE id=?", (lid,))
     c.execute("UPDATE Customers SET status='Seized' WHERE loan_id=?", (lid,))
-    wr = (writeoff_reason or "").strip() or sz["writeoff_reason"]
-    c.execute("""UPDATE Seizures SET status='Return', written_off=?, writeoff_reason=?, snapshot=?, approved_by=?, approved_at=?
-                 WHERE seizure_id=?""", (written_off, wr, json.dumps(snap), username, now, seizure_id))
+    c.execute("""UPDATE Seizures SET status='Return', written_off=?, writeoff_reason=?, snapshot=?, seized_date=?, place=?
+                 WHERE seizure_id=?""", (written_off, writeoff_reason, json.dumps(snap), d.isoformat(), place, seizure_id))
     for v in loan_vehicles(loan):
         for item in ("key", "rc"):
             c.execute("INSERT INTO SeizureItems (seizure_id,loan_id,vehicle_id,item,status) VALUES (?,?,?,?,?)",
@@ -2358,9 +2531,12 @@ def approve_seizure(seizure_id, writeoff_reason, username):
 def reject_seizure(seizure_id, reason, username):
     c = get_cur(); c.execute("SELECT status FROM Seizures WHERE seizure_id=?", (seizure_id,))
     sz = c.fetchone()
-    if not sz or sz["status"] != "Pending": raise ValueError("This seizure request is not waiting for approval.")
+    if not sz or sz["status"] not in ("Pending", "Approved"): raise ValueError("This seizure request cannot be rejected now.")
+    c.execute("SELECT loan_id FROM Seizures WHERE seizure_id=?", (seizure_id,)); lid = c.fetchone()["loan_id"]
     c.execute("UPDATE Seizures SET status='Rejected', approved_by=?, approved_at=?, decision_remarks=? WHERE seizure_id=?",
               (username, datetime.now(timezone.utc).isoformat(), (reason or "").strip() or "No reason given", seizure_id))
+    c.execute("""UPDATE FollowUp SET status='Resolved', resolved_at=? WHERE loan_id=? AND item='seizure' AND status IN ('Pending','AwaitingAck')""",
+              (datetime.now(timezone.utc).isoformat(), lid))
     get_db().commit()
 
 def record_seizure_item(item_id, received_on, received_by, note, username):
@@ -2657,8 +2833,8 @@ def _location_link(loc):
     return f'<a href="{url}" target="_blank" rel="noopener">📍 {html.escape(loc)}</a>'
 
 # ── Follow Up (customer-requested collection date) ──────────────────────────────
-FU_CATEGORIES = ["Loans", "Key Collection", "Proof & Documents", "Penalty Collection"]
-DOC_FU_CATEGORIES = ("Key Collection", "Proof & Documents")    # no money columns on these follow-ups
+FU_CATEGORIES = ["Loans", "Key Collection", "Proof & Documents", "Penalty Collection", "Vehicle Seizure"]
+DOC_FU_CATEGORIES = ("Key Collection", "Proof & Documents", "Vehicle Seizure")    # no money columns on these follow-ups
 # follow-up "item" -> (LoanEntry received column, LoanEntry received-date column)
 FU_ITEM_COLUMNS = {"key": ("key_received", "key_received_date"),
                    "rc":  ("rc_received",  "rc_received_date"),
@@ -3887,6 +4063,10 @@ def waiting_items_html():
         n_cl = c.fetchone()["n"]
         if n_cl:
             bits.append(f'<a href="/approval" style="color:inherit;"><b>{n_cl}</b> loan closing(s) awaiting your approval →</a>')
+        c.execute("SELECT COUNT(*) as n FROM PenaltyReductions WHERE status='Pending'")
+        n_red = c.fetchone()["n"]
+        if n_red:
+            bits.append(f'<a href="/approval" style="color:inherit;"><b>{n_red}</b> penalty reduction request(s) awaiting your approval →</a>')
         c.execute("SELECT COUNT(*) as n FROM Seizures WHERE status='Pending'")
         n_sz = c.fetchone()["n"]
         if n_sz:
@@ -5171,7 +5351,7 @@ def approval():
             pen_block += (f'<div style="font-size:12.5px;margin:4px 0;">Penalty already added to unpaid EMIs: <b>{fmt_inr(fig["penalty"])}</b> '
                           f'(included in the settlement).</div>')
         pc_cards += f"""
-        <div class="card pc-card" data-rem-principal="{fig['rem_principal']}" data-rem-interest="{fig['rem_interest']}" data-monthly-interest="{fig['monthly_interest']}" data-pen="{fig['penalty']}">
+        <div class="card pc-card" data-rem-principal="{fig['rem_principal']}" data-rem-interest="{fig['rem_interest']}" data-monthly-interest="{fig['monthly_interest']}" data-rem-months="{fig['rem_months']}" data-pen="{fig['penalty']}">
           <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
             <div>
               <b style="font-size:15px;color:var(--accent);">{html.escape(p['loan_number'])}</b> — {html.escape(p['customer_name'] or '')}
@@ -5195,12 +5375,12 @@ def approval():
           <form method="POST" action="/preclose/approve/{p['preclose_id']}">
             <div class="form-grid" style="align-items:end;">
               <div class="form-group">
-                <label>Interest to be collected further (₹) <span style="font-size:10px;color:var(--muted);">(pending interest: {fmt_inr(fig['rem_interest'])})</span></label>
-                <input type="number" name="further_interest" class="pc-int" value="{fig['rem_interest']:.2f}" min="0" max="{fig['rem_interest']:.2f}" step="0.01" required oninput="pcPreview(this)">
+                <label>Months of interest to collect further <span style="font-size:10px;color:var(--muted);">(pending: {fig['rem_months']:g} month(s) = {fmt_inr(fig['rem_interest'])} at {fmt_inr(fig['monthly_interest'])} per month)</span></label>
+                <input type="number" name="collect_months" class="pc-months" value="{fig['rem_months']:g}" min="0" max="{fig['rem_months']:g}" step="0.01" required oninput="pcPreview(this)">
               </div>
               <div class="form-group">
-                <label>Months to waive <span style="font-size:10px;color:var(--muted);">(auto-fills the interest above: {fmt_inr(fig['monthly_interest'])} per month)</span></label>
-                <input type="number" name="waived_months" class="pc-waive" value="0" min="0" step="1" oninput="pcWaive(this)">
+                <label>Months waived <span style="font-size:10px;color:var(--muted);">(automatic)</span></label>
+                <input class="pc-waive" value="0" readonly>
               </div>
               <div class="form-group">
                 <div class="pc-note" style="font-size:13px;line-height:1.7;padding:8px 10px;background:var(--surface2);border-radius:8px;min-height:42px;"></div>
@@ -5214,6 +5394,43 @@ def approval():
           <form method="POST" action="/preclose/reject/{p['preclose_id']}" onsubmit="return getReason(this)" style="margin-top:6px;">
             <input type="hidden" name="reason" class="reason_inp">
             <button type="submit" class="btn btn-danger btn-sm">❌ Reject</button>
+          </form>
+        </div>"""
+    c = get_cur()
+    c.execute("""SELECT r.*, le.loan_number, le.customer_name, le.customer_mobile FROM PenaltyReductions r
+                 JOIN LoanEntry le ON le.id=r.loan_id WHERE r.status='Pending' ORDER BY r.reduction_id""")
+    red_rows = [dict(r) for r in c.fetchall()]
+    red_cards = ""
+    for r in red_rows:
+        now_out = round(sum(pp for _, pp in loan_penalty_outstanding(r["loan_id"])), 2)
+        red_cards += f"""
+        <div class="card" style="border-left:5px solid #7c3aed;">
+          <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
+            <div>
+              <b style="font-size:15px;color:var(--accent);">{html.escape(r['loan_number'])}</b> — {html.escape(r['customer_name'] or '')}
+              <span class="badge badge-partial" style="margin-left:6px;">Reduction request #{r['iteration_no']}</span>
+              <div style="font-size:12px;color:var(--muted);margin-top:2px;">📱 {html.escape(r.get('customer_mobile') or '')} &nbsp;|&nbsp;
+                requested by <b>{html.escape(r.get('requested_by') or '')}</b> on {fmt_date((r.get('requested_at') or '')[:10])}</div>
+            </div>
+            <a class="btn btn-sm btn-primary" href="/emis/{r['loan_id']}">View EMIs</a>
+          </div>
+          <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px;">
+            <div class="kpi" style="padding:8px 10px;"><div class="val" style="font-size:15px;color:var(--red);">{fmt_inr(now_out)}</div><div class="lbl">Penalty outstanding now</div></div>
+            <div class="kpi" style="padding:8px 10px;"><div class="val" style="font-size:15px;">{fmt_inr(r['requested_amount'])}</div><div class="lbl">Customer offers to pay</div></div>
+            <div class="kpi" style="padding:8px 10px;"><div class="val" style="font-size:15px;">{fmt_inr(max(0, now_out - float(r['requested_amount'] or 0)))}</div><div class="lbl">Reduction asked</div></div>
+          </div>
+          <div style="font-size:13px;margin-bottom:8px;"><b>Customer's reason:</b> {html.escape(r.get('reason') or '')}</div>
+          {penalty_history_html(r['loan_id'], True)}
+          <form method="POST" action="/penalty/reduction/approve/{r['reduction_id']}">
+            <div class="form-grid" style="align-items:end;">
+              <div class="form-group"><label>Penalty to be collected (₹) <span style="font-size:10px;color:var(--muted);">(0 to {now_out:,.2f}; 0 waives it all)</span></label>
+                <input type="number" name="approved_amount" value="{float(r['requested_amount'] or 0):.2f}" min="0" max="{now_out:.2f}" step="0.01" required></div>
+              <div class="form-group"><label>Remarks (optional)</label><input name="remarks"></div>
+            </div>
+            <div style="margin-top:10px;"><button type="submit" class="btn btn-success btn-sm">✅ Approve with this amount</button></div>
+          </form>
+          <form method="POST" action="/penalty/reduction/reject/{r['reduction_id']}" onsubmit="return getReason(this)" style="margin-top:6px;">
+            <input type="hidden" name="reason" class="reason_inp"><button type="submit" class="btn btn-danger btn-sm">❌ Reject</button>
           </form>
         </div>"""
     c = get_cur()
@@ -5335,14 +5552,13 @@ def approval():
           </div>
           <div class="table-wrap" style="margin:8px 0;"><table><tr><th>Overdue EMI</th><th>Due</th><th>Overdue by</th><th>Outstanding</th></tr>{od_lines}</table></div>
           <div style="background:#fee2e2;border-radius:8px;padding:8px 12px;font-size:13.5px;margin-bottom:8px;">
-            If approved: <b>{fmt_inr(total_wo)}</b> is written off (all unpaid EMIs close as Seized)
-            {(f'and <b>{n_pen}</b> pending penalty(ies) are waived') if n_pen else ''}. Key and RC then have to be recorded and an Account Manager acknowledges.
+            This is a <b>seizing plan</b>. Approving it creates a follow-up task for the user. Only when the user has seized the vehicle
+            and entered the details, all unpaid EMIs close as Seized and the outstanding <b>{fmt_inr(total_wo)}</b> is written off
+            {(f'(and <b>{n_pen}</b> pending penalty(ies) are waived)') if n_pen else ''}.
           </div>
           <form method="POST" action="/seizure/approve/{z['seizure_id']}"
-                onsubmit="return confirm('Approve the seizure? The outstanding amount will be written off.')">
-            <div class="form-group" style="margin-bottom:8px;"><label>Reason for writing off (edit if needed)</label>
-              <textarea name="writeoff_reason" rows="2" required>{html.escape(z.get('writeoff_reason') or '')}</textarea></div>
-            <button type="submit" class="btn btn-success btn-sm">✅ Approve seizure</button>
+                onsubmit="return confirm('Approve the vehicle seizing plan?')">
+            <button type="submit" class="btn btn-success btn-sm">✅ Approve seizing plan</button>
           </form>
           <form method="POST" action="/seizure/reject/{z['seizure_id']}" onsubmit="return getReason(this)" style="margin-top:6px;">
             <input type="hidden" name="reason" class="reason_inp">
@@ -5351,11 +5567,13 @@ def approval():
         </div>"""
     parts = ""
     if sz_rows:
-        parts += f'<h2 style="margin:6px 0 10px;">🚫 Vehicle Seizure Requests ({len(sz_rows)})</h2>{sz_cards}'
+        parts += f'<h2 style="margin:6px 0 10px;">🚫 Vehicle Seizing Plans ({len(sz_rows)})</h2>{sz_cards}'
     if cl_rows:
         parts += f'<h2 style="margin:18px 0 10px;">🔒 Loan Closing Requests ({len(cl_rows)})</h2>{cl_cards}'
     if pen_rows:
         parts += f'<h2 style="margin:18px 0 10px;">💰 Late Payment Penalties ({len(pen_rows)})</h2>{pen_cards}'
+    if red_rows:
+        parts += f'<h2 style="margin:18px 0 10px;">💸 Penalty Reduction Requests ({len(red_rows)})</h2>{red_cards}'
     if pc_rows:
         parts += f'<h2 style="margin:18px 0 10px;">⏩ Pre-closure Requests ({len(pc_rows)})</h2>{pc_cards}'
     pc_section = (parts + '<h2 style="margin:18px 0 10px;">🆕 New Loan Applications</h2>') if parts else ""
@@ -5372,7 +5590,10 @@ def approval():
     function pcPreview(input){{
       const card = input.closest('.pc-card');
       const P = parseFloat(card.dataset.remPrincipal), pen0 = parseFloat(card.dataset.pen)||0;
-      const interest = parseFloat(card.querySelector('.pc-int').value)||0;
+      const rem = parseFloat(card.dataset.remInterest)||0, mi = parseFloat(card.dataset.monthlyInterest)||0, tm = parseFloat(card.dataset.remMonths)||0;
+      const months = Math.max(0, parseFloat(card.querySelector('.pc-months').value)||0);
+      const interest = Math.round(Math.min(rem, months*mi)*100)/100;
+      card.querySelector('.pc-waive').value = Math.round(Math.max(0, tm-months)*100)/100;
       let newPen = 0;
       card.querySelectorAll('.pc-prate,.pc-orate').forEach(function(x){{
         const a = Math.round((parseInt(x.dataset.days)||0)*(parseFloat(x.value)||0)*100)/100;
@@ -5384,19 +5605,12 @@ def approval():
         'Principal to collect: <b>'+fmtINR(P)+'</b> &nbsp;|&nbsp; Interest to collect: <b>'+fmtINR(interest)+'</b>'+(pen>0?' &nbsp;|&nbsp; Penalty: <b>'+fmtINR(pen)+'</b>':'')+'<br>'+
         '→ <b style="color:var(--green);">Settlement to collect: '+fmtINR(settle)+'</b>';
     }}
-    function pcWaive(input){{
-      const card = input.closest('.pc-card');
-      const rem = parseFloat(card.dataset.remInterest)||0, mi = parseFloat(card.dataset.monthlyInterest)||0;
-      const w = Math.max(0, parseInt(input.value)||0);
-      card.querySelector('.pc-int').value = Math.max(0, Math.round((rem - w*mi)*100)/100).toFixed(2);
-      pcPreview(card.querySelector('.pc-int'));
-    }}
     function pcApplyAll(input){{
       const card = input.closest('.pc-card');
       card.querySelectorAll('.pc-prate,.pc-orate').forEach(function(x){{ x.value = input.value; }});
       pcPreview(input);
     }}
-    window.addEventListener('DOMContentLoaded',function(){{ document.querySelectorAll('.pc-int').forEach(pcPreview); }});
+    window.addEventListener('DOMContentLoaded',function(){{ document.querySelectorAll('.pc-months').forEach(pcPreview); }});
     function penPreview(input){{
       const card = input.closest('.pen-card');
       const days = parseInt(card.dataset.days), r = parseFloat(input.value)||0;
@@ -5772,14 +5986,14 @@ def seizure_card_html(loan, sz, can_pay, can_reopen, today):
     """The 'Vehicle seized' card on the EMI page: details, key / RC receipt rows (per vehicle),
     send-for-acknowledgement button and the admin-only reopen option."""
     lid, st, sid = loan["id"], sz["status"], sz["seizure_id"]
-    items = seizure_items(sid) if st != "Pending" else []
-    color = {"Pending": "#fef3c7", "Return": "#e0f2fe", "AckPending": "#ede9fe", "Seized": "#fee2e2"}[st]
+    items = seizure_items(sid) if st not in ("Pending", "Approved") else []
+    color = {"Pending": "#fef3c7", "Approved": "#dcfce7", "Return": "#e0f2fe", "AckPending": "#ede9fe", "Seized": "#fee2e2"}[st]
     info = (f'<div style="line-height:1.8;font-size:13px;">'
-            f'<b>Seized on:</b> {fmt_date(sz.get("seized_date"))} &nbsp;|&nbsp; <b>Kept at:</b> {html.escape(sz.get("place") or "—")}<br>'
-            f'<b>Reason:</b> {html.escape(sz.get("reason") or "—")}<br>'
+            + (f'<b>Seized on:</b> {fmt_date(sz.get("seized_date"))} &nbsp;|&nbsp; <b>Kept at:</b> {html.escape(sz.get("place") or "—")}<br>' if sz.get("seized_date") else '')
+            + f'<b>Reason:</b> {html.escape(sz.get("reason") or "—")}<br>'
             f'<span style="color:var(--muted);">Requested by {html.escape(sz.get("requested_by") or "")} on {fmt_date((sz.get("requested_at") or "")[:10])}'
             f'{(" · approved by " + html.escape(sz["approved_by"]) + " on " + fmt_date((sz.get("approved_at") or "")[:10])) if sz.get("approved_by") else ""}</span>')
-    if st != "Pending":
+    if st not in ("Pending", "Approved"):
         info += (f'<br><b>Written off:</b> <b style="color:var(--red);">{fmt_inr(sz.get("written_off") or 0)}</b> — '
                  f'{html.escape(sz.get("writeoff_reason") or "")}')
     if st == "Seized":
@@ -5787,7 +6001,8 @@ def seizure_card_html(loan, sz, can_pay, can_reopen, today):
                  f' · seizure details checked ✔ · legal issues checked ✔'
                  f'{(" — " + html.escape(sz["legal_note"])) if sz.get("legal_note") else ""}</span>')
     info += '</div>'
-    msg = {"Pending": "⏳ Waiting for admin approval.",
+    msg = {"Pending": "⏳ Seizing plan waiting for admin approval. Do not seize the vehicle yet.",
+           "Approved": "✅ Plan approved. Seize the vehicle, then enter the details below.",
            "Return": "📝 Record the key and RC received for each vehicle, then send it for acknowledgement.",
            "AckPending": "⏳ Waiting for the Account Manager to check the seizure details and legal issues.",
            "Seized": "🚫 Vehicle seized — the remaining EMIs are closed and the outstanding amount is written off."}[st]
@@ -5819,6 +6034,19 @@ def seizure_card_html(loan, sz, can_pay, can_reopen, today):
                 f'<input type="hidden" name="loan_id" value="{lid}">'
                 f'<button class="btn btn-primary btn-sm" {"" if all_done else "disabled"}>📤 Send for acknowledgement</button>'
                 f'<span style="font-size:12px;color:var(--muted);">{"All items recorded." if all_done else "Record every item above first."}</span></form>')
+    execute = ""
+    if st == "Approved" and can_pay:
+        execute = (f'<form method="POST" action="/seizure/execute/{sid}" class="form-grid" style="margin-top:10px;" '
+                   f'onsubmit="return confirm(\'Confirm the vehicle is seized? Every unpaid EMI will be closed and the outstanding amount written off.\')">'
+                   f'<input type="hidden" name="loan_id" value="{lid}">'
+                   f'<div class="form-group"><label>Seized date *</label><input type="date" name="seized_date" value="{today.isoformat()}" max="{today.isoformat()}" required></div>'
+                   f'<div class="form-group"><label>Where the vehicle is kept *</label><input name="place" required></div>'
+                   f'<div class="form-group full"><label>Reason for writing off the outstanding amount *</label><textarea name="writeoff_reason" rows="2" required></textarea></div>'
+                   f'<div class="form-group full"><button class="btn btn-danger btn-sm" style="width:fit-content;">🚫 Vehicle seized — save details</button></div></form>')
+    if st == "Approved" and can_reopen:
+        execute += (f'<form method="POST" action="/seizure/reject/{sid}" style="margin-top:8px;" '
+                    f'onsubmit="var r=prompt(\'Reason for cancelling the seizing plan:\');if(!r)return false;this.reason.value=r;return true;">'
+                    f'<input type="hidden" name="reason"><button class="btn btn-amber btn-sm">Cancel plan</button></form>')
     reopen = ""
     if can_reopen and st in ("Return", "AckPending", "Seized"):
         reopen = (f'<form method="POST" action="/seizure/reopen/{sid}" style="margin-top:10px;" '
@@ -5828,7 +6056,7 @@ def seizure_card_html(loan, sz, can_pay, can_reopen, today):
                   f'<button class="btn btn-amber btn-sm">♻️ Reopen loan (customer paid)</button></form>')
     return (f'<div class="card" id="seizure" style="margin-bottom:12px;border-left:5px solid var(--red);">'
             f'<div style="background:{color};border-radius:8px;padding:8px 12px;margin-bottom:8px;"><b>🚫 Vehicle seizure</b> — {msg}{note}</div>'
-            f'{info}{items_html}{send}{reopen}</div>')
+            f'{info}{items_html}{execute}{send}{reopen}</div>')
 
 # ── EMIs ────────────────────────────────────────────────────────────────────────
 @app.route("/emis/<int:loan_id>")
@@ -5971,7 +6199,7 @@ def emis(loan_id):
         preclose_box = (f'<div style="background:#d1fae5;border:1px solid #6ee7b7;border-radius:10px;padding:10px 14px;max-width:440px;font-size:13px;">'
                         f'<b>✅ Pre-closure approved</b> by {html.escape(pc.get("approved_by") or "")}<br>'
                         + (f'Interest to collect further <b>{fmt_inr(pc["further_interest"])}</b> '
-                           f'({int(pc.get("waived_months") or 0)} month(s) waived; already paid ₹{float(pc["paid_before"] or 0):,.2f})<br>'
+                           f'({float(pc.get("waived_months") or 0):g} month(s) waived; already paid ₹{float(pc["paid_before"] or 0):,.2f})<br>'
                            if pc.get("further_interest") is not None else
                            f'Interest rate reduced <b>{float(pc["original_rate"] or 0)*100:.2f}% → {float(pc["new_rate"] or 0)*100:.2f}%</b> '
                            f'(for {int(pc["months_elapsed"] or 0)} month(s); already paid ₹{float(pc["paid_before"] or 0):,.2f})<br>') +
@@ -6007,32 +6235,45 @@ def emis(loan_id):
     seizure_box = ""
     if sz_live and sz_live["status"] == "Pending":
         seizure_box = (f'<span class="badge badge-pending" style="font-size:13px;padding:8px 12px;">'
-                       f'⏳ Vehicle seizure sent for admin approval (requested by {html.escape(sz_live.get("requested_by") or "")})</span>')
+                       f'⏳ Vehicle seizing plan sent for admin approval (requested by {html.escape(sz_live.get("requested_by") or "")})</span>')
     elif loan.get("status") == "Approved" and can_pay and not sz_live and not pc_open and not get_open_closure(loan_id):
         n_over, need = len(overdue_emis(loan_id)), seizure_threshold()
         if n_over >= need:
             sz_note = ""
             if sz and sz["status"] == "Rejected":
-                sz_note = (f'<div style="font-size:12px;color:var(--red);margin-bottom:6px;">Last seizure request was rejected: '
+                sz_note = (f'<div style="font-size:12px;color:var(--red);margin-bottom:6px;">Last seizing plan was rejected: '
                            f'{html.escape(sz.get("decision_remarks") or "")}</div>')
             seizure_box = f"""<details style="max-width:470px;">
-              <summary class="btn btn-danger" style="list-style:none;cursor:pointer;display:inline-block;">🚫 Vehicle Seized</summary>
+              <summary class="btn btn-danger" style="list-style:none;cursor:pointer;display:inline-block;">🚫 Vehicle Seizing Plan</summary>
               <form method="POST" action="/seizure/request/{loan_id}" class="card" style="margin-top:8px;padding:12px;"
-                    onsubmit="return confirm('Send the vehicle seizure request to the admin for approval?')">
+                    onsubmit="return confirm('Send the vehicle seizing plan to the admin for approval?')">
                 {sz_note}<div style="font-size:12.5px;margin-bottom:8px;line-height:1.6;">This loan has <b>{n_over} overdue EMIs</b>.
-                After the admin approves, every unpaid EMI is closed as <b>Seized</b> and the outstanding
-                <b>{fmt_inr(total_remaining)}</b> is written off.</div>
-                <div class="form-group" style="margin-bottom:8px;"><label>Reason for seizure *</label><textarea name="reason" rows="2" required></textarea></div>
-                <div class="form-group" style="margin-bottom:8px;"><label>Seized date *</label>
-                  <input type="date" name="seized_date" value="{today.isoformat()}" max="{today.isoformat()}" required></div>
-                <div class="form-group" style="margin-bottom:8px;"><label>Where the vehicle is kept *</label><input name="place" required></div>
-                <div class="form-group" style="margin-bottom:10px;"><label>Reason for writing off the outstanding amount *</label>
-                  <textarea name="writeoff_reason" rows="2" required></textarea></div>
-                <button class="btn btn-danger btn-sm">Send for approval</button>
+                Send the plan to the admin. Only after it is approved a follow-up task is created and you can seize the vehicle
+                and enter the seizure details (date, place, write-off reason).</div>
+                <div class="form-group" style="margin-bottom:10px;"><label>Reason for seizure *</label><textarea name="reason" rows="2" required></textarea></div>
+                <button class="btn btn-danger btn-sm">Send plan for approval</button>
               </form></details>"""
+    pen_total = round(sum(emi_penalty_out(e) for e in emi_list if e["status"] not in ("Paid", "PreClosed", "Seized")), 2)
+    pend_red = get_pending_reduction(loan_id)
+    reduce_box = ""
+    if pend_red:
+        reduce_box = (f'<span class="badge badge-pending" style="font-size:13px;padding:8px 12px;">⏳ Penalty reduction request #{pend_red["iteration_no"]} '
+                      f'(customer offers {fmt_inr(pend_red["requested_amount"])}) is waiting for approval</span>')
+    elif loan.get("status") == "Approved" and can_pay and pen_total > 0 and not sz_live:
+        reduce_box = f"""<details style="max-width:400px;">
+          <summary class="btn btn-amber" style="list-style:none;cursor:pointer;display:inline-block;">💸 Customer asks to reduce penalty</summary>
+          <form method="POST" action="/penalty/reduction/request/{loan_id}" class="card" style="margin-top:8px;padding:12px;"
+                onsubmit="return confirm('Send this penalty reduction request to the approver?')">
+            <div style="font-size:12.5px;margin-bottom:8px;">Penalty outstanding: <b>{fmt_inr(pen_total)}</b>. The approver sees this loan's penalty history and decides the final amount.</div>
+            <div class="form-group" style="margin-bottom:8px;"><label>Penalty the customer is ready to pay (₹) *</label>
+              <input type="number" name="requested_amount" min="0" max="{max(0, pen_total - 0.01):.2f}" step="0.01" required></div>
+            <div class="form-group" style="margin-bottom:10px;"><label>Customer's reason *</label><textarea name="reason" rows="2" required></textarea></div>
+            <button class="btn btn-amber btn-sm">Send for approval</button>
+          </form></details>"""
     preclose_row = (f'<div style="display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;align-items:flex-start;margin-bottom:10px;">'
-                    f'{seizure_box}{preclose_box}</div>') if (preclose_box or seizure_box) else ""
+                    f'{reduce_box}{seizure_box}{preclose_box}</div>') if (preclose_box or seizure_box or reduce_box) else ""
     seizure_card = seizure_card_html(loan, sz_live, can_pay, role in DIRECT_ROLES, today) if sz_live else ""
+    seizure_card += penalty_history_html(loan_id)
     closing_section = closing_section_html(loan, can_pay, penalty_by_emi, today) if loan.get("status") in ("Approved", "Closed") else ""
     content = f"""
     <h1>💳 EMI Schedule — {loan.get('loan_number','')}</h1>
@@ -6456,8 +6697,7 @@ def preclose_approve(preclose_id):
         for k, v in request.form.items():
             if k.startswith("rate_") and k[5:].isdigit(): pr[int(k[5:])] = v
             elif k.startswith("orate_") and k[6:].isdigit(): orr[int(k[6:])] = v
-        approve_preclosure(preclose_id, request.form.get("further_interest",""), request.form.get("waived_months","0"),
-                           session.get("username",""), pr, orr)
+        approve_preclosure(preclose_id, request.form.get("collect_months",""), session.get("username",""), pr, orr)
         flash("Pre-closure approved. The staff can now record the closing bill (penalty included).","success")
     except Exception as e:
         flash(str(e),"danger")
@@ -6927,9 +7167,8 @@ def _back_to_emis(loan_id, anchor="seizure"):
 def seizure_request(loan_id):
     f = request.form
     try:
-        request_seizure(loan_id, f.get("reason",""), f.get("seized_date",""), f.get("place",""),
-                        f.get("writeoff_reason",""), session.get("username",""))
-        flash("Seizure request sent to the admin for approval.", "success")
+        request_seizure(loan_id, f.get("reason",""), session.get("username",""))
+        flash("Vehicle seizing plan sent to the admin for approval. Do not seize the vehicle until it is approved.", "success")
     except Exception as e:
         flash(str(e), "danger")
     return _back_to_emis(loan_id)
@@ -6939,9 +7178,8 @@ def seizure_request(loan_id):
 @role_required("superadmin","admin")
 def seizure_approve(seizure_id):
     try:
-        wo = approve_seizure(seizure_id, request.form.get("writeoff_reason",""), session.get("username",""))
-        flash(f"Seizure approved. {fmt_inr(wo)} was written off and the pending EMIs are closed. "
-              "The key and RC now have to be recorded.", "success")
+        approve_seizure(seizure_id, session.get("username",""))
+        flash("Seizing plan approved. A follow-up task was created: the user can now seize the vehicle and enter the details.", "success")
     except Exception as e:
         flash(str(e), "danger")
     return redirect(url_for("approval"))
@@ -6956,6 +7194,18 @@ def seizure_reject(seizure_id):
     except Exception as e:
         flash(str(e), "danger")
     return redirect(url_for("approval"))
+
+@app.route("/seizure/execute/<int:seizure_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def seizure_execute(seizure_id):
+    f = request.form
+    try:
+        execute_seizure(seizure_id, f.get("seized_date",""), f.get("place",""), f.get("writeoff_reason",""), session.get("username",""))
+        flash("Seizure recorded. The pending EMIs are closed and the outstanding amount is written off. Now record the key and RC.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return _back_to_emis(f.get("loan_id", 0))
 
 @app.route("/seizure/item/<int:item_id>", methods=["POST"])
 @login_required
@@ -7050,6 +7300,40 @@ def settings_seizure():
         flash("Enter a whole number between 1 and 60.", "danger")
     return redirect(url_for("users"))
 
+@app.route("/penalty/reduction/request/<int:loan_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin","manager","fieldpia")
+def penalty_reduction_request(loan_id):
+    f = request.form
+    try:
+        request_penalty_reduction(loan_id, f.get("requested_amount",""), f.get("reason",""), session.get("username",""))
+        flash("Penalty reduction request sent to the approver. Collect the penalty only after it is decided.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("emis", loan_id=loan_id))
+
+@app.route("/penalty/reduction/approve/<int:reduction_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin")
+def penalty_reduction_approve(reduction_id):
+    try:
+        cut = approve_penalty_reduction(reduction_id, request.form.get("approved_amount",""), request.form.get("remarks",""), session.get("username",""))
+        flash(f"Penalty reduction approved. The penalty was reduced by {fmt_inr(cut)}.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("approval"))
+
+@app.route("/penalty/reduction/reject/<int:reduction_id>", methods=["POST"])
+@login_required
+@role_required("superadmin","admin")
+def penalty_reduction_reject(reduction_id):
+    try:
+        reject_penalty_reduction(reduction_id, request.form.get("reason",""), session.get("username",""))
+        flash("Penalty reduction request rejected.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("approval"))
+
 @app.route("/penalty/reject/<int:penalty_id>", methods=["POST"])
 @login_required
 @role_required("superadmin","admin")
@@ -7129,6 +7413,9 @@ def followups():
             {recv_fields}
             <button class="btn btn-sm btn-success" title="{resolve_tip}">{resolve_label}</button>
           </form>"""
+        if is_open and r.get("item") == "seizure":
+            resolve_btn = (f'<a class="btn btn-sm btn-danger" href="/emis/{r["loan_id"]}#seizure" '
+                           f'title="Seize the vehicle and enter the details on the loan page">🚫 Seize vehicle &amp; enter details</a>')
         reschedule_form = "" if not (is_open and r["category"] != "Loans") else f"""
           <form method="POST" action="/followup/reschedule/{r['followup_id']}" style="display:flex;gap:4px;align-items:center;">
             <input type="hidden" name="next" value="{back_url}">
@@ -7185,12 +7472,13 @@ def followups():
     show_money = cat not in DOC_FU_CATEGORIES
     show_docs = cat in ("",) + DOC_FU_CATEGORIES
     money_table = fu_table("💰 Loans &amp; Penalty Collection" if show_docs else "", head.format(money=money_head), rows, 20) if show_money else ""
-    doc_table = fu_table("🔑 Key Collection &amp; 📄 Proof &amp; Documents" if show_money else "", head.format(money=""), doc_rows, 14) if show_docs else ""
+    doc_table = fu_table("🔑 Key Collection, 📄 Proof &amp; Documents &amp; 🚫 Vehicle Seizure" if show_money else "", head.format(money=""), doc_rows, 14) if show_docs else ""
     tabs = "".join(
         f'<a href="/followup?q={q_url}&cat={urlquote(name)}" class="btn btn-sm" '
         f'style="{"background:var(--accent);color:#fff;" if cat==name else "background:var(--surface2);color:var(--text);"}">{label}</a>'
         for name, label in (("", "All"), ("Loans", "💰 Loans"), ("Key Collection", "🔑 Key Collection"),
-                            ("Proof & Documents", "📄 Proof & Documents"), ("Penalty Collection", "⚖️ Penalty Collection")))
+                            ("Proof & Documents", "📄 Proof & Documents"), ("Penalty Collection", "⚖️ Penalty Collection"),
+                            ("Vehicle Seizure", "🚫 Vehicle Seizure")))
     content = f"""
     <h1>📞 Follow Up</h1>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">{tabs}</div>
@@ -7281,48 +7569,40 @@ def closed():
         if not pc: return "Regular"
         return (f'<span class="badge badge-partial">⏩ Pre-closed</span><br>'
                 f'<span style="font-size:11px;color:var(--muted);">Settled ₹{float(pc["settlement_amount"] or 0):,.2f}{(" (incl. penalty " + fmt_inr(pc["penalty_amount"]) + ")") if float(pc.get("penalty_amount") or 0) > 0 else ""} · '
-                + (f'interest {fmt_inr(pc["further_interest"])} · {int(pc.get("waived_months") or 0)} month(s) waived'
+                + (f'interest {fmt_inr(pc["further_interest"])} · {float(pc.get("waived_months") or 0):g} month(s) waived'
                    if pc.get("further_interest") is not None else
                    f'rate {float(pc["original_rate"] or 0)*100:.2f}% → {float(pc["new_rate"] or 0)*100:.2f}%')
                 + f' · bill {html.escape(str(pc["bill_number"] or ""))}</span>')
     def handover_cell(l):
+        """Everything in one column: per item the date, who handed it over / received it, and who recorded it."""
         z = l.get("seizure")
         if z:
-            its = l["seizure_items"]
-            chips = " ".join(f'{SEIZURE_ITEM_INFO[i["item"]][0]}{"✔" if i["status"] == "Received" else "✖"}' for i in its)
-            det = "".join(
-                f'<tr><td>{seizure_item_title(i)}</td><td>{fmt_date(i["received_on"])}</td>'
-                f'<td>{html.escape(i.get("received_by") or "")}</td><td>{html.escape(i.get("recorded_by") or "")}</td>'
-                f'<td>{html.escape(i.get("note") or "")}</td></tr>' for i in its)
-            body = (f'<div style="font-size:13px;line-height:1.8;margin-bottom:8px;"><b>Seized on:</b> {fmt_date(z.get("seized_date"))} · '
-                    f'<b>Kept at:</b> {html.escape(z.get("place") or "—")}<br><b>Reason:</b> {html.escape(z.get("reason") or "—")}<br>'
-                    f'<b>Written off:</b> {fmt_inr(z.get("written_off") or 0)} — {html.escape(z.get("writeoff_reason") or "")}</div>'
-                    f'<div class="table-wrap"><table><tr><th>Item</th><th>Received on</th><th>Received by</th><th>Recorded by</th><th>Note</th></tr>{det}</table></div>'
-                    f'<div style="font-size:12px;color:var(--muted);margin-top:8px;">Approved by {html.escape(z.get("approved_by") or "—")} · '
-                    f'acknowledged by <b>{html.escape(z.get("acked_by") or "—")}</b> on {fmt_date((z.get("acked_at") or "")[:10])} · '
-                    f'seizure details checked ✔ · legal issues checked ✔{(" — " + html.escape(z["legal_note"])) if z.get("legal_note") else ""}</div>')
-            title = html.escape(f"{l['loan_number']} — vehicle seizure", quote=True)
-            return (f'<span style="white-space:nowrap;">{chips}</span> '
-                    f'<button type="button" class="btn btn-sm btn-primary" onclick="showHandover(\'ho{l["loan_id"]}\',\'{title}\')">View</button>'
-                    f'<div id="ho{l["loan_id"]}" hidden>{body}</div>')
+            lines = "".join(
+                f'<div style="padding:2px 0;">{seizure_item_title(i)} — '
+                + (f'<span style="color:var(--green);">✔ {fmt_date(i["received_on"])}</span> · received by <b>{html.escape(i.get("received_by") or "")}</b>'
+                   f' <span style="color:var(--muted);font-size:11.5px;">(recorded by {html.escape(i.get("recorded_by") or "")})</span>'
+                   f'{(" · " + html.escape(i["note"])) if i.get("note") else ""}'
+                   if i["status"] == "Received" else '<span style="color:var(--red);">✖ not received</span>')
+                + '</div>' for i in l["seizure_items"])
+            return (f'<div style="font-size:12.5px;line-height:1.6;min-width:300px;">'
+                    f'<b>Seized on:</b> {fmt_date(z.get("seized_date"))} · <b>Kept at:</b> {html.escape(z.get("place") or "—")}<br>'
+                    f'{lines}'
+                    f'<span style="color:var(--muted);font-size:11.5px;">Acknowledged by <b>{html.escape(z.get("acked_by") or "—")}</b> '
+                    f'on {fmt_date((z.get("acked_at") or "")[:10])}</span></div>')
         k = l.get("closure")
         if not k: return '<span style="color:var(--muted);">—</span>'
-        its = l["closure_items"]
-        chips = " ".join(f'{CLOSURE_ITEM_INFO[i["item"]][0]}{"✔" if i["status"] == "Returned" else "✖"}' for i in its)
-        det = "".join(
-            f'<tr><td>{closure_item_title(i)}</td><td>{fmt_date(i["returned_on"])}</td>'
-            f'<td>{html.escape(i.get("handed_by") or "")}</td><td>{html.escape(i.get("recorded_by") or "")}</td>'
-            f'<td>{html.escape(i.get("note") or "")}</td></tr>' for i in its)
-        body = (f'<div class="table-wrap"><table><tr><th>Item</th><th>Returned on</th><th>Handed over by</th><th>Recorded by</th><th>Note</th></tr>{det}</table></div>'
-                f'<div style="font-size:12px;color:var(--muted);margin-top:8px;">{"Pre-closure" if k["kind"] == "PreClosure" else "Regular closing"} · '
-                f'approved by {html.escape(k.get("approved_by") or "—")} · hand-over acknowledged by <b>{html.escape(k.get("acked_by") or "—")}</b> '
-                f'on {fmt_date((k.get("acked_at") or "")[:10])}</div>')
-        title = html.escape(f"{l['loan_number']} — key & documents handed over", quote=True)
-        return (f'<span style="white-space:nowrap;">{chips}</span> '
-                f'<button type="button" class="btn btn-sm btn-primary" onclick="showHandover(\'ho{l["loan_id"]}\',\'{title}\')">View</button>'
-                f'<div id="ho{l["loan_id"]}" hidden>{body}</div>')
+        lines = "".join(
+            f'<div style="padding:2px 0;">{closure_item_title(i)} — '
+            + (f'<span style="color:var(--green);">✔ {fmt_date(i["returned_on"])}</span> · returned by <b>{html.escape(i.get("handed_by") or "")}</b>'
+               f' <span style="color:var(--muted);font-size:11.5px;">(recorded by {html.escape(i.get("recorded_by") or "")})</span>'
+               f'{(" · " + html.escape(i["note"])) if i.get("note") else ""}'
+               if i["status"] == "Returned" else '<span style="color:var(--red);">✖ not returned</span>')
+            + '</div>' for i in l["closure_items"])
+        return (f'<div style="font-size:12.5px;line-height:1.6;min-width:300px;">{lines}'
+                f'<span style="color:var(--muted);font-size:11.5px;">Acknowledged by <b>{html.escape(k.get("acked_by") or "—")}</b> '
+                f'on {fmt_date((k.get("acked_at") or "")[:10])}</span></div>')
     rows = "".join(f"""<tr>
-        <td><b>{l['loan_number']}</b></td><td>{l['customer_name']}</td>
+        <td><b><a href="/emis/{l['loan_id']}" style="color:var(--accent);">{l['loan_number']}</a></b></td><td>{l['customer_name']}</td>
         <td>{vehicle_html(l)}</td><td>₹{l['loan_amount']:,.2f}</td>
         <td>{fmt_date(l['closure_date'])}</td><td>{closure_label(l)}</td><td>{handover_cell(l)}</td></tr>""" for l in ll)
     content = f"""
@@ -7332,23 +7612,9 @@ def closed():
       <button class="btn btn-primary btn-sm">Search</button>
     </form>
     <div class="card"><div class="table-wrap"><table>
-      <tr><th>Loan #</th><th>Customer</th><th>Vehicle</th><th>Amount</th><th>Closed On</th><th>Closure</th><th>Key &amp; documents</th></tr>
+      <tr><th>Loan #</th><th>Customer</th><th>Vehicle</th><th>Amount</th><th>Closed On</th><th>Closure</th><th>Key &amp; documents (returned by · date · recorded by)</th></tr>
       {rows or '<tr><td colspan="7" style="text-align:center;color:var(--muted);">No closed loans</td></tr>'}
-    </table></div></div>
-    <div class="fu-modal-overlay" id="hoModal" onclick="if(event.target===this)this.classList.remove('open')">
-      <div class="fu-modal" style="max-width:640px;">
-        <h3 id="hoTitle">Key &amp; documents handed over</h3>
-        <div id="hoBody" style="font-size:13px;margin-top:8px;"></div>
-        <div style="margin-top:12px;text-align:right;"><button type="button" class="btn btn-primary btn-sm" onclick="document.getElementById('hoModal').classList.remove('open')">Close</button></div>
-      </div>
-    </div>
-    <script>
-    function showHandover(id, title){{
-      document.getElementById('hoTitle').textContent = title;
-      document.getElementById('hoBody').innerHTML = document.getElementById(id).innerHTML;
-      document.getElementById('hoModal').classList.add('open');
-    }}
-    </script>"""
+    </table></div></div>"""
     return page("Closed Loans", content, "closed")
 
 @app.route("/rejected")
@@ -7626,10 +7892,514 @@ def calculator():
     """
     return page("Calculator", content, "calculator")
 
-# ── Report ─────────────────────────────────────────────────────────────────────
+# ── Report (Power-BI style: slicers, visuals, filtered downloads) ─────────────
+REPORT_ROLES = ("superadmin", "admin", "manager", "viewer", "assocmgr")
+REPORT_RISKS = [("first_emi", "First EMI unpaid"), ("overdue3", "3+ EMIs overdue"), ("overdue", "Any overdue"),
+                ("partial", "Part-paid EMI"), ("clean", "No overdue")]
+REPORT_BUCKETS = [("0-30", 0, 30), ("31-60", 31, 60), ("61-90", 61, 90), ("90+", 91, 10 ** 6)]
+REPORT_FU_STATES = ["Missed", "Due today", "Pending", "Awaiting ack", "Resolved", "Rescheduled"]
+REPORT_VIEWS = [("first_emi", "⚠️ First EMI pending"), ("overdue", "🔴 Overdue dues"), ("upcoming", "🟡 Upcoming dues"),
+                ("followups", "📞 Follow-ups"), ("collections", "💳 Collections"), ("penalties", "💰 Penalties"),
+                ("loans", "📋 All loans")]
+UNPAID_DONE = ("Paid", "PreClosed", "Seized")
+
+def _iso(v):
+    try: return datetime.strptime(str(v or "")[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError: return ""
+
+def report_filters(args):
+    gl = lambda k: [x for x in args.getlist(k) if x]
+    f = {"date_from": _iso(args.get("date_from")), "date_to": _iso(args.get("date_to")),
+         "status": gl("status"), "vtype": gl("vtype"),
+         "risk": [x for x in gl("risk") if x in dict(REPORT_RISKS)],
+         "bucket": [x for x in gl("bucket") if x in {b[0] for b in REPORT_BUCKETS}],
+         "fu_cat": gl("fu_cat"), "fu_state": gl("fu_state"),
+         "q": (args.get("q") or "").strip().lower()}
+    try: f["min_out"] = max(0.0, float(args.get("min_out") or 0))
+    except ValueError: f["min_out"] = 0.0
+    return f
+
+def report_filter_summary(f):
+    out = []
+    if f["date_from"] or f["date_to"]:
+        out.append(f"Dates {fmt_date(f['date_from'], 'start')} to {fmt_date(f['date_to'], 'end')}")
+    for k, lab in (("status", "Status"), ("vtype", "Vehicle"), ("fu_cat", "Follow-up category"), ("fu_state", "Follow-up state")):
+        if f[k]: out.append(f"{lab}: {', '.join(f[k])}")
+    if f["risk"]: out.append("Risk: " + ", ".join(dict(REPORT_RISKS)[x] for x in f["risk"]))
+    if f["bucket"]: out.append("Overdue age: " + ", ".join(f["bucket"]) + " days")
+    if f["min_out"]: out.append(f"Outstanding ≥ {fmt_inr(f['min_out'])}")
+    if f["q"]: out.append(f"Search: {f['q']}")
+    return out or ["No filters (all data)"]
+
+def _bucket_of(days):
+    return next((b for b, lo, hi in REPORT_BUCKETS if lo <= days <= hi), "90+")
+
+def report_compute(f):
+    """Everything on the Report page for the given slicers: KPIs, chart series and tables (the downloads use the same)."""
+    today = date.today(); tod = today.isoformat()
+    res = batch_query([
+        ("""SELECT id,loan_number,customer_name,customer_mobile,guarantor_name,guarantor_mobile,vehicle_type,vehicle_name,
+                   vehicle_model,vehicle_number,loan_amount,interest_rate,tenure,status,loan_date,start_date FROM LoanEntry""", ()),
+        ("""SELECT emi_id,loan_id,installment_no,due_date,emi_amount,status,amount_paid,remaining_amount,paid_at,
+                   penalty_due,penalty_paid FROM EMI""", ()),
+        ("SELECT followup_id,loan_id,follow_up_date,remarks,status,created_by,COALESCE(category,'Loans') as category FROM FollowUp", ()),
+        ("SELECT loan_id,installment_no,days,status,requested_amount,final_amount,reduced_amount,requested_at FROM Penalties", ()),
+        ("SELECT loan_id,emi_id,amount,bill_number,paid_at,paid_by,penalty_part FROM EMIPayments", ()),
+        ("SELECT loan_id,settlement_amount,paid_on,bill_number,closed_by FROM PreClosure WHERE status='Completed'", ()),
+    ])
+    loans_raw, emis_raw, fus_raw, pens_raw, pays_raw, pcs_raw = [[dict(r) for r in x] for x in res]
+    lo, hi = f["date_from"], f["date_to"]
+    def rng(d):
+        d = (d or "")[:10]
+        if not lo and not hi: return True
+        return bool(d) and (not lo or d >= lo) and (not hi or d <= hi)
+    num = lambda v: float(v or 0)
+
+    by_loan = {}
+    for e in emis_raw: by_loan.setdefault(e["loan_id"], []).append(e)
+    L = []
+    for l in loans_raw:
+        if f["status"] and l["status"] not in f["status"]: continue
+        if f["vtype"] and (l["vehicle_type"] or "") not in f["vtype"]: continue
+        if f["q"]:
+            hay = " ".join(str(l.get(k) or "") for k in ("loan_number", "customer_name", "customer_mobile", "vehicle_number",
+                                                         "vehicle_name", "guarantor_name", "guarantor_mobile")).lower()
+            if f["q"] not in hay: continue
+        es = sorted(by_loan.get(l["id"], []), key=lambda e: e["installment_no"])
+        m = dict(outstanding=0.0, overdue_amt=0.0, n_od=0, oldest=None, paid=0.0, partial=False)
+        first = None
+        for e in es:
+            m["paid"] += num(e["amount_paid"])
+            if e["installment_no"] == 1: first = e
+            if e["status"] in UNPAID_DONE: continue
+            rem = num(e["remaining_amount"] if e["remaining_amount"] is not None else e["emi_amount"])
+            pen = max(0.0, num(e["penalty_due"]) - num(e["penalty_paid"]))
+            m["outstanding"] += rem + pen
+            if e["status"] == "Partial": m["partial"] = True
+            due = (e["due_date"] or "")[:10]
+            if due < tod:
+                m["n_od"] += 1; m["overdue_amt"] += rem + pen
+                if m["oldest"] is None or due < m["oldest"]: m["oldest"] = due
+        m["first_unpaid"] = bool(first and first["status"] not in UNPAID_DONE and (first["due_date"] or "")[:10] < tod)
+        m["days_od"] = (today - parse_date(m["oldest"])).days if m["oldest"] else 0
+        tags = {t for t, ok in (("first_emi", m["first_unpaid"]), ("overdue3", m["n_od"] >= 3), ("overdue", m["n_od"] >= 1),
+                                ("partial", m["partial"]), ("clean", m["n_od"] == 0)) if ok}
+        if f["risk"] and not (tags & set(f["risk"])): continue
+        if f["min_out"] and m["outstanding"] < f["min_out"]: continue
+        m["risk"] = "High" if (m["first_unpaid"] or m["n_od"] >= 3 or m["days_od"] > 90) else ("Medium" if m["n_od"] else "Low")
+        L.append({**l, **m, "emis": es, "first": first})
+    ids = {x["id"] for x in L}
+    lmap = {x["id"]: x for x in L}
+    veh = lambda x: vehicle_label(x) + (f" · {x['vehicle_number']}" if x.get("vehicle_number") else "")
+    next_fu = {}
+    for fu in fus_raw:
+        if fu["status"] == "Pending" and fu["loan_id"] in ids:
+            d = (fu["follow_up_date"] or "")[:10]
+            if d and (fu["loan_id"] not in next_fu or d < next_fu[fu["loan_id"]]): next_fu[fu["loan_id"]] = d
+
+    tables = {}
+    # 1. first EMI pending (risky customers: the very first instalment is unpaid)
+    rows = []
+    for x in L:
+        fe = x["first"]
+        if not fe or fe["status"] in UNPAID_DONE or not rng(fe["due_date"]): continue
+        due = (fe["due_date"] or "")[:10]
+        rem = num(fe["remaining_amount"] if fe["remaining_amount"] is not None else fe["emi_amount"])
+        days = max(0, (today - parse_date(due)).days)
+        rows.append([x["loan_number"], x["customer_name"], x["customer_mobile"], x.get("guarantor_mobile"), veh(x),
+                     num(x["loan_amount"]), due, num(fe["emi_amount"]), rem, days, x["n_od"],
+                     "High" if days > 0 else "Upcoming", next_fu.get(x["id"])])
+    rows.sort(key=lambda r: r[6])
+    tables["first_emi"] = {"cols": [["Loan #", "text"], ["Customer", "text"], ["Mobile", "text"], ["Guarantor mobile", "text"],
+                                    ["Vehicle", "text"], ["Loan amount", "inr"], ["1st EMI due", "date"], ["EMI", "inr"],
+                                    ["Pending", "inr"], ["Days late", "int"], ["EMIs overdue", "int"], ["Risk", "risk"],
+                                    ["Next follow-up", "date"]], "rows": rows}
+    # 2. overdue dues per loan (EMIs whose due date falls in the range)
+    rows, ageing = [], {b[0]: [0.0, 0] for b in REPORT_BUCKETS}
+    for x in L:
+        od = [e for e in x["emis"] if e["status"] not in UNPAID_DONE and (e["due_date"] or "")[:10] < tod and rng(e["due_date"])]
+        if not od: continue
+        amt = sum(num(e["remaining_amount"] if e["remaining_amount"] is not None else e["emi_amount"])
+                  + max(0.0, num(e["penalty_due"]) - num(e["penalty_paid"])) for e in od)
+        oldest = min((e["due_date"] or "")[:10] for e in od)
+        days = (today - parse_date(oldest)).days
+        b = _bucket_of(days); ageing[b][0] += amt; ageing[b][1] += 1
+        if f["bucket"] and b not in f["bucket"]: continue
+        rows.append([x["loan_number"], x["customer_name"], x["customer_mobile"], veh(x), len(od), oldest, days, b,
+                     round(amt, 2), round(x["outstanding"], 2), x["risk"], next_fu.get(x["id"])])
+    rows.sort(key=lambda r: -r[6])
+    tables["overdue"] = {"cols": [["Loan #", "text"], ["Customer", "text"], ["Mobile", "text"], ["Vehicle", "text"],
+                                  ["EMIs overdue", "int"], ["Oldest due", "date"], ["Days overdue", "int"], ["Age", "text"],
+                                  ["Overdue amount", "inr"], ["Outstanding", "inr"], ["Risk", "risk"], ["Next follow-up", "date"]],
+                         "rows": rows}
+    # 3. upcoming dues (next 30 days unless a date range is set)
+    limit = hi or (today + timedelta(days=30)).isoformat()
+    rows = []
+    for x in L:
+        up = [e for e in x["emis"] if e["status"] not in UNPAID_DONE and tod <= (e["due_date"] or "")[:10] <= limit and rng(e["due_date"])]
+        if not up: continue
+        nd = min((e["due_date"] or "")[:10] for e in up)
+        amt = sum(num(e["remaining_amount"] if e["remaining_amount"] is not None else e["emi_amount"])
+                  + max(0.0, num(e["penalty_due"]) - num(e["penalty_paid"])) for e in up)
+        rows.append([x["loan_number"], x["customer_name"], x["customer_mobile"], veh(x), len(up), nd,
+                     (parse_date(nd) - today).days, round(amt, 2), x["n_od"], x["risk"]])
+    rows.sort(key=lambda r: r[5])
+    tables["upcoming"] = {"cols": [["Loan #", "text"], ["Customer", "text"], ["Mobile", "text"], ["Vehicle", "text"],
+                                   ["EMIs due", "int"], ["Next due", "date"], ["Days left", "int"], ["Amount due", "inr"],
+                                   ["EMIs already overdue", "int"], ["Risk", "risk"]], "rows": rows}
+    # 4. follow-ups
+    rows, fu_chart = [], {}
+    for fu in fus_raw:
+        x = lmap.get(fu["loan_id"])
+        if not x or not rng(fu["follow_up_date"]): continue
+        if f["fu_cat"] and fu["category"] not in f["fu_cat"]: continue
+        d = (fu["follow_up_date"] or "")[:10]
+        st = fu["status"]
+        if st == "Pending": state = "Missed" if d < tod else ("Due today" if d == tod else "Pending")
+        else: state = {"AwaitingAck": "Awaiting ack"}.get(st, st)
+        if f["fu_state"] and state not in f["fu_state"]: continue
+        fu_chart.setdefault(fu["category"], {}).setdefault(state, 0)
+        fu_chart[fu["category"]][state] += 1
+        rows.append([x["loan_number"], x["customer_name"], x["customer_mobile"], fu["category"], d, state,
+                     (parse_date(d) - today).days, fu["remarks"], fu["created_by"]])
+    order = {s: i for i, s in enumerate(REPORT_FU_STATES)}
+    rows.sort(key=lambda r: (order.get(r[5], 9), r[4]))
+    tables["followups"] = {"cols": [["Loan #", "text"], ["Customer", "text"], ["Mobile", "text"], ["Category", "text"],
+                                    ["Follow-up date", "date"], ["State", "state"], ["Days (− late / + left)", "int"],
+                                    ["Remarks", "text"], ["By", "text"]], "rows": rows}
+    # 5. collections (EMI payments + pre-closure settlements)
+    inst = {e["emi_id"]: e["installment_no"] for e in emis_raw}
+    rows = []
+    for p in pays_raw:
+        x = lmap.get(p["loan_id"])
+        if not x or not rng(p["paid_at"]): continue
+        rows.append([(p["paid_at"] or "")[:10], x["loan_number"], x["customer_name"], f"Installment {inst.get(p['emi_id'], '?')}",
+                     num(p["amount"]), num(p["penalty_part"]), p["bill_number"], p["paid_by"]])
+    for p in pcs_raw:
+        x = lmap.get(p["loan_id"])
+        if not x or not rng(p["paid_on"]): continue
+        rows.append([(p["paid_on"] or "")[:10], x["loan_number"], x["customer_name"], "Pre-closure settlement",
+                     num(p["settlement_amount"]), 0.0, p["bill_number"], p["closed_by"]])
+    rows.sort(key=lambda r: r[0], reverse=True)
+    tables["collections"] = {"cols": [["Paid on", "date"], ["Loan #", "text"], ["Customer", "text"], ["For", "text"],
+                                      ["Amount", "inr"], ["Of which penalty", "inr"], ["Bill no", "text"], ["Entered by", "text"]],
+                             "rows": rows}
+    # 6. penalties
+    rows, pen_chart = [], {}
+    for p in pens_raw:
+        x = lmap.get(p["loan_id"])
+        if not x or p["status"] == "Rejected" or not rng(p["requested_at"]): continue
+        payable = num(p["final_amount"] if p["final_amount"] is not None else p["requested_amount"])
+        red = num(p["reduced_amount"])
+        pen_chart[p["status"]] = pen_chart.get(p["status"], 0.0) + payable
+        rows.append([x["loan_number"], x["customer_name"], p["installment_no"], p["days"], payable + red, red, payable,
+                     p["status"], (p["requested_at"] or "")[:10]])
+    tables["penalties"] = {"cols": [["Loan #", "text"], ["Customer", "text"], ["Installment", "int"], ["Days late", "int"],
+                                    ["Raised", "inr"], ["Reduced", "inr"], ["Payable", "inr"], ["Status", "state"],
+                                    ["Raised on", "date"]], "rows": rows}
+    # 7. all loans (date range = loan date)
+    rows = [[x["loan_number"], x["customer_name"], x["customer_mobile"], veh(x), x["vehicle_type"], num(x["loan_amount"]),
+             round(num(x["interest_rate"]) * 100, 2), x["tenure"], x["status"], x["loan_date"], round(x["paid"], 2),
+             round(x["outstanding"], 2), round(x["overdue_amt"], 2), x["n_od"], x["risk"]]
+            for x in L if rng(x["loan_date"])]
+    tables["loans"] = {"cols": [["Loan #", "text"], ["Customer", "text"], ["Mobile", "text"], ["Vehicle", "text"], ["Type", "text"],
+                                ["Loan amount", "inr"], ["Rate %", "num"], ["Tenure (m)", "int"], ["Status", "state"],
+                                ["Loan date", "date"], ["Paid", "inr"], ["Outstanding", "inr"], ["Overdue", "inr"],
+                                ["EMIs overdue", "int"], ["Risk", "risk"]], "rows": rows}
+    for k, lab in REPORT_VIEWS: tables[k]["title"] = lab
+
+    # chart series
+    if lo or hi:
+        m_lo, m_hi = (lo or "0000-00")[:7], (hi or "9999-99")[:7]
+    else:
+        m_lo, m_hi = add_months(today.replace(day=1), -12).isoformat()[:7], add_months(today.replace(day=1), 6).isoformat()[:7]
+    mon = {}
+    def bump(key, d, v):
+        ym = (d or "")[:7]
+        if not ym or not (m_lo <= ym <= m_hi): return
+        mon.setdefault(ym, {"expected": 0.0, "collected": 0.0, "profit": 0.0, "profit_got": 0.0, "disb": 0.0, "disb_n": 0})
+        mon[ym][key] += v
+    for x in L:
+        n_inst = len(x["emis"]) or 1
+        for e in x["emis"]:
+            if e["status"] in ("PreClosed", "Seized"): continue
+            amt = num(e["emi_amount"]); intr = amt - num(x["loan_amount"]) / n_inst
+            bump("expected", e["due_date"], amt); bump("profit", e["due_date"], intr)
+            got = 1.0 if e["status"] == "Paid" else (min(1.0, num(e["amount_paid"]) / amt) if amt else 0.0)
+            bump("profit_got", e["due_date"], intr * got)
+        bump("disb", x["loan_date"], num(x["loan_amount"])); bump("disb_n", x["loan_date"], 1)
+    for r in tables["collections"]["rows"]: bump("collected", r[0], r[4])
+    months = sorted(mon)
+    from collections import Counter
+    cnt = lambda key: sorted(((k or "—"), v) for k, v in Counter(x[key] for x in L).items())
+    top = sorted(L, key=lambda x: -x["outstanding"])[:10]
+    charts = {
+        "status": cnt("status"), "vtype": cnt("vehicle_type"),
+        "ageing": [[b, round(ageing[b][0], 2), ageing[b][1]] for b, _, _ in REPORT_BUCKETS],
+        "months": months,
+        "expected": [round(mon[m]["expected"], 2) for m in months], "collected": [round(mon[m]["collected"], 2) for m in months],
+        "profit": [round(mon[m]["profit"], 2) for m in months], "profit_got": [round(mon[m]["profit_got"], 2) for m in months],
+        "disb": [round(mon[m]["disb"], 2) for m in months], "disb_n": [mon[m]["disb_n"] for m in months],
+        "fu_cats": sorted(fu_chart), "fu": {s: [fu_chart[c].get(s, 0) for c in sorted(fu_chart)] for s in REPORT_FU_STATES},
+        "pen": sorted(pen_chart.items()),
+        "top": [[x["loan_number"] + " · " + (x["customer_name"] or ""), round(x["outstanding"], 2)] for x in top if x["outstanding"] > 0],
+    }
+    fu_rows = tables["followups"]["rows"]
+    kpis = [
+        ["Loans", len(L), "", "loans"],
+        ["Outstanding", round(sum(x["outstanding"] for x in L), 2), "inr", "loans"],
+        ["Overdue amount", round(sum(r[8] for r in tables["overdue"]["rows"]), 2), "inr-red", "overdue"],
+        ["Loans overdue", len(tables["overdue"]["rows"]), "red", "overdue"],
+        ["First EMI unpaid (late)", sum(1 for r in tables["first_emi"]["rows"] if r[9] > 0), "red", "first_emi"],
+        ["Due (upcoming)", round(sum(r[7] for r in tables["upcoming"]["rows"]), 2), "inr-amber", "upcoming"],
+        ["Collected", round(sum(r[4] for r in tables["collections"]["rows"]), 2), "inr-green", "collections"],
+        ["Disbursed", round(sum(num(x["loan_amount"]) for x in L if rng(x["loan_date"])), 2), "inr", "loans"],
+        ["Follow-ups missed", sum(1 for r in fu_rows if r[5] == "Missed"), "red", "followups"],
+        ["Follow-ups open", sum(1 for r in fu_rows if r[5] in ("Pending", "Due today", "Missed")), "amber", "followups"],
+        ["Penalty payable", round(sum(r[6] for r in tables["penalties"]["rows"] if r[7] in ("Pending", "Approved")), 2), "inr-red", "penalties"],
+    ]
+    return {"kpis": kpis, "charts": charts, "tables": tables, "summary": report_filter_summary(f),
+            "views": REPORT_VIEWS, "today": tod}
+
+def _rp_cell(v, t):
+    if v is None or v == "": return ""
+    if t == "date": return fmt_date(v)
+    if t == "inr": return round(float(v), 2)
+    return v
+
+def _rp_csv(tbl, summary):
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["Filters: " + " | ".join(summary)])
+    w.writerow([c[0] for c in tbl["cols"]])
+    for r in tbl["rows"]: w.writerow([_rp_cell(v, c[1]) for v, c in zip(r, tbl["cols"])])
+    return buf.getvalue()
+
+def _rp_xlsx(data, views):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    wb = Workbook(); ws = wb.active; ws.title = "Summary"
+    ws.append(["Thendralla Fincorp — Report", datetime.now().strftime("%d/%m/%Y %H:%M")])
+    ws.append(["Filters", " | ".join(data["summary"])]); ws.append([])
+    for k in data["kpis"]: ws.append([k[0], k[1]])
+    head = PatternFill("solid", fgColor="1A4FAD")
+    for v in views:
+        t = data["tables"][v]
+        sh = wb.create_sheet(re.sub(r"[^A-Za-z0-9 ]", "", dict(REPORT_VIEWS)[v]).strip()[:30] or v)
+        sh.append([c[0] for c in t["cols"]])
+        for cell in sh[1]: cell.font = Font(bold=True, color="FFFFFF"); cell.fill = head
+        for r in t["rows"]: sh.append([_rp_cell(x, c[1]) for x, c in zip(r, t["cols"])])
+        for i, c in enumerate(t["cols"], 1):
+            sh.column_dimensions[sh.cell(1, i).column_letter].width = max(12, min(40, len(c[0]) + 6))
+        sh.freeze_panes = "A2"
+    out = io.BytesIO(); wb.save(out); out.seek(0)
+    return out
+
+def _rp_pdf(tbl, summary):
+    buf = io.BytesIO()
+    styles = getSampleStyleSheet()
+    cell = ParagraphStyle("c", parent=styles["Normal"], fontSize=6.8, leading=8)
+    story = [Paragraph(f"Thendralla Fincorp — {re.sub(r'[^A-Za-z0-9 &()+-]', '', tbl['title']).strip()}", styles["Title"]),
+             Paragraph(f"Generated {datetime.now().strftime('%d/%m/%Y %H:%M')} · {len(tbl['rows'])} row(s)", styles["Normal"]),
+             Paragraph("Filters: " + html.escape(" | ".join(summary).replace("₹", "Rs ")), styles["Normal"]), Spacer(1, 0.3 * cm)]
+    data = [[Paragraph(f"<b>{html.escape(c[0])}</b>", cell) for c in tbl["cols"]]]
+    for r in tbl["rows"][:3000]:
+        data.append([Paragraph(html.escape(str(_rp_cell(v, c[1])) if c[1] != "inr" or v in (None, "") else f"{float(v):,.2f}"), cell)
+                     for v, c in zip(r, tbl["cols"])])
+    if len(data) == 1: data.append([Paragraph("No rows for these filters.", cell)] + [""] * (len(tbl["cols"]) - 1))
+    t = Table(data, repeatRows=1)
+    t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a4fad")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                           ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#e8f0fb")]),
+                           ("GRID", (0, 0), (-1, -1), 0.3, colors.grey), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    story.append(t)
+    SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=1 * cm, rightMargin=1 * cm,
+                      topMargin=1.2 * cm, bottomMargin=1.2 * cm).build(story)
+    buf.seek(0)
+    return buf
+
+REPORT_CSS = """<style>
+.rp-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px;}
+.rp-row .form-group{min-width:140px;}
+.rp-row input{padding:8px 10px;font-size:13px;}
+.rp-group{margin:6px 0;}
+.rp-lbl{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:4px;}
+.rp-chips{display:flex;gap:6px;flex-wrap:wrap;}
+.rp-chip,.rp-preset{border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:999px;
+  padding:5px 12px;font-size:12px;cursor:pointer;font-weight:600;}
+.rp-chip.on,.rp-preset.on{background:var(--accent);border-color:var(--accent);color:#fff;}
+.rp-summary{font-size:12px;color:var(--muted);margin-top:6px;}
+.rp-kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:14px;}
+.rp-kpi{background:var(--surface);border-radius:10px;padding:12px 14px;border-left:4px solid var(--accent);
+  box-shadow:0 1px 4px rgba(0,0,0,.06);cursor:pointer;}
+.rp-kpi:hover{box-shadow:0 2px 10px rgba(26,79,173,.18);}
+.rp-kpi .v{font-size:20px;font-weight:800;color:var(--accent);}
+.rp-kpi .l{font-size:11.5px;color:var(--muted);margin-top:2px;}
+.rp-charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px;margin-bottom:14px;}
+.rp-chart{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px;}
+.rp-chart h3{font-size:13px;color:var(--text);margin-bottom:2px;display:flex;justify-content:space-between;gap:8px;align-items:center;}
+.rp-chart .hint{font-size:11px;color:var(--muted);margin-bottom:6px;}
+.rp-chart .cv{position:relative;height:240px;}
+.rp-chart .nodata{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px;}
+.rp-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;}
+.rp-tab{border:none;background:var(--surface2);color:var(--text);border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:700;cursor:pointer;}
+.rp-tab.on{background:var(--accent);color:#fff;}
+.rp-tab .n{opacity:.8;font-weight:600;margin-left:4px;}
+#rpTable th{cursor:pointer;user-select:none;}
+#rpTable td{white-space:nowrap;}
+#rpTable td.wrap{white-space:normal;min-width:200px;}
+.rp-loading{opacity:.55;pointer-events:none;}
+@media(max-width:768px){.rp-charts{grid-template-columns:1fr;}}
+</style>"""
+
+REPORT_JS = r"""<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+(function(){
+var MULTI=['status','vtype','risk','bucket','fu_cat','fu_state'], SINGLE=['date_from','date_to','q','min_out'];
+var F={}; MULTI.forEach(function(k){F[k]=[];}); SINGLE.forEach(function(k){F[k]='';});
+var init=new URLSearchParams(location.search);
+MULTI.forEach(function(k){F[k]=init.getAll(k);}); SINGLE.forEach(function(k){F[k]=init.get(k)||'';});
+var VIEW=init.get('view')||'first_emi', DATA=null, CH={}, SORT={col:null,dir:1}, timer=null;
+var PAL=['#1a4fad','#059669','#d97706','#dc2626','#6366f1','#0ea5e9','#7c3aed','#db2777','#64748b','#14b8a6'];
+function $(id){return document.getElementById(id);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function inr(v){return '₹'+Number(v||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function inrK(v){v=Number(v||0);if(Math.abs(v)>=1e7)return '₹'+(v/1e7).toFixed(2)+' Cr';if(Math.abs(v)>=1e5)return '₹'+(v/1e5).toFixed(2)+' L';return '₹'+Math.round(v).toLocaleString('en-IN');}
+function dmy(s){if(!s)return '';var p=String(s).slice(0,10).split('-');return p.length===3?p[2]+'/'+p[1]+'/'+p[0]:s;}
+function iso(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+function qs(extra){var p=new URLSearchParams();SINGLE.forEach(function(k){if(F[k])p.set(k,F[k]);});
+  MULTI.forEach(function(k){F[k].forEach(function(v){p.append(k,v);});});
+  if(extra)Object.keys(extra).forEach(function(k){p.set(k,extra[k]);});return p.toString();}
+function syncUI(){
+  SINGLE.forEach(function(k){var el=$('rp_'+k);if(el&&el.value!==F[k])el.value=F[k];});
+  document.querySelectorAll('.rp-chip').forEach(function(b){b.classList.toggle('on',F[b.dataset.k].indexOf(b.dataset.v)>=0);});
+  document.querySelectorAll('.rp-preset').forEach(function(b){b.classList.remove('on');});
+}
+function load(){
+  syncUI();
+  history.replaceState(null,'','/report'+(qs({view:VIEW})?'?'+qs({view:VIEW}):''));
+  $('rpBody').classList.add('rp-loading');
+  fetch('/api/report?'+qs()).then(function(r){return r.json();}).then(function(d){DATA=d;render();})
+    .catch(function(){$('rpSummary').textContent='Could not load the report. Please refresh.';})
+    .finally(function(){$('rpBody').classList.remove('rp-loading');});
+}
+function later(){clearTimeout(timer);timer=setTimeout(load,350);}
+window.rpToggle=function(k,v){var i=F[k].indexOf(v);if(i>=0)F[k].splice(i,1);else F[k].push(v);load();};
+document.querySelectorAll('.rp-chip').forEach(function(b){b.addEventListener('click',function(){rpToggle(b.dataset.k,b.dataset.v);});});
+SINGLE.forEach(function(k){var el=$('rp_'+k);if(el)el.addEventListener('input',function(){F[k]=el.value.trim();later();});});
+document.querySelectorAll('.rp-preset').forEach(function(b){b.addEventListener('click',function(){
+  var t=new Date(),y=t.getFullYear(),m=t.getMonth(),a='',z='';
+  switch(b.dataset.p){
+    case 'today':a=z=iso(t);break;
+    case 'this_month':a=iso(new Date(y,m,1));z=iso(new Date(y,m+1,0));break;
+    case 'last_month':a=iso(new Date(y,m-1,1));z=iso(new Date(y,m,0));break;
+    case 'next_30':a=iso(t);z=iso(new Date(y,m,t.getDate()+30));break;
+    case 'last_30':a=iso(new Date(y,m,t.getDate()-30));z=iso(t);break;
+    case 'this_quarter':var q=Math.floor(m/3)*3;a=iso(new Date(y,q,1));z=iso(new Date(y,q+3,0));break;
+    case 'this_year':a=iso(new Date(y,0,1));z=iso(new Date(y,11,31));break;
+  }
+  F.date_from=a;F.date_to=z;load();b.classList.add('on');
+});});
+$('rpReset').addEventListener('click',function(){MULTI.forEach(function(k){F[k]=[];});SINGLE.forEach(function(k){F[k]='';});load();});
+
+function mk(id,cfg,empty){
+  if(CH[id]){CH[id].destroy();delete CH[id];}
+  var box=$(id).parentNode, nd=box.querySelector('.nodata');
+  nd.style.display=empty?'flex':'none';
+  if(empty)return;
+  cfg.options=Object.assign({responsive:true,maintainAspectRatio:false},cfg.options||{});
+  CH[id]=new Chart($(id).getContext('2d'),cfg);
+}
+function clickTo(key,labels){return function(evt,els){if(els.length){rpToggle(key,labels[els[0].index]);}};}
+var moneyAxis={ticks:{callback:function(v){return inrK(v);}},grid:{color:'#eef2f9'}};
+var moneyTip={callbacks:{label:function(c){return (c.dataset.label?c.dataset.label+': ':'')+inr(c.parsed.y);}}};
+
+function render(){
+  var d=DATA,c=d.charts;
+  $('rpSummary').innerHTML='🔎 <b>Filtered by:</b> '+d.summary.map(esc).join(' &nbsp;·&nbsp; ');
+  $('rpKpis').innerHTML=d.kpis.map(function(k){
+    var t=k[2],col=t.indexOf('red')>=0?'var(--red)':t.indexOf('green')>=0?'var(--green)':t.indexOf('amber')>=0?'var(--amber)':'var(--accent)';
+    var v=t.indexOf('inr')===0?inr(k[1]):Number(k[1]).toLocaleString('en-IN');
+    return '<div class="rp-kpi" style="border-color:'+col+'" data-view="'+k[3]+'"><div class="v" style="color:'+col+'">'+v+'</div><div class="l">'+esc(k[0])+'</div></div>';
+  }).join('');
+  document.querySelectorAll('.rp-kpi').forEach(function(el){el.addEventListener('click',function(){VIEW=el.dataset.view;renderTable();$('rpTables').scrollIntoView({behavior:'smooth'});});});
+
+  var sl=c.status.map(function(x){return x[0];});
+  mk('ch_status',{type:'doughnut',data:{labels:sl,datasets:[{data:c.status.map(function(x){return x[1];}),backgroundColor:PAL,borderColor:'#fff',borderWidth:2}]},
+    options:{onClick:clickTo('status',sl),plugins:{legend:{position:'right',labels:{boxWidth:12,font:{size:11}}}}}},!sl.length);
+  var vl=c.vtype.map(function(x){return x[0];});
+  mk('ch_vtype',{type:'bar',data:{labels:vl,datasets:[{label:'Loans',data:c.vtype.map(function(x){return x[1];}),backgroundColor:PAL,borderRadius:4}]},
+    options:{onClick:clickTo('vtype',vl),plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}},!vl.length);
+  var al=c.ageing.map(function(x){return x[0];});
+  mk('ch_age',{type:'bar',data:{labels:al.map(function(x){return x+' days';}),datasets:[{label:'Overdue amount',data:c.ageing.map(function(x){return x[1];}),
+      backgroundColor:['#facc15','#f97316','#ef4444','#991b1b'],borderRadius:4}]},
+    options:{onClick:clickTo('bucket',al),plugins:{legend:{display:false},tooltip:{callbacks:{label:function(t){return inr(t.parsed.y)+' · '+c.ageing[t.dataIndex][2]+' loan(s)';}}}},
+      scales:{y:moneyAxis}}},!c.ageing.some(function(x){return x[2];}));
+  var ml=c.months;
+  mk('ch_coll',{type:'bar',data:{labels:ml,datasets:[
+      {label:'Expected (EMIs due)',data:c.expected,backgroundColor:'rgba(26,79,173,.25)',borderColor:'#1a4fad',borderWidth:1,borderRadius:4},
+      {label:'Collected',data:c.collected,type:'line',borderColor:'#059669',backgroundColor:'#059669',tension:.3,pointRadius:3}]},
+    options:{plugins:{tooltip:moneyTip,legend:{labels:{boxWidth:12,font:{size:11}}}},scales:{y:moneyAxis}}},!ml.length);
+  mk('ch_profit',{type:'bar',data:{labels:ml,datasets:[
+      {label:'Interest expected',data:c.profit,backgroundColor:'rgba(124,58,237,.3)',borderRadius:4},
+      {label:'Interest collected',data:c.profit_got,backgroundColor:'#7c3aed',borderRadius:4}]},
+    options:{plugins:{tooltip:moneyTip,legend:{labels:{boxWidth:12,font:{size:11}}}},scales:{y:moneyAxis}}},!ml.length);
+  mk('ch_disb',{type:'bar',data:{labels:ml,datasets:[{label:'Disbursed',data:c.disb,backgroundColor:'#0ea5e9',borderRadius:4}]},
+    options:{plugins:{legend:{display:false},tooltip:{callbacks:{label:function(t){return inr(t.parsed.y)+' · '+c.disb_n[t.dataIndex]+' loan(s)';}}}},scales:{y:moneyAxis}}},
+    !c.disb.some(function(x){return x>0;}));
+  var fc=c.fu_cats, fcol={'Missed':'#dc2626','Due today':'#d97706','Pending':'#facc15','Awaiting ack':'#6366f1','Resolved':'#059669','Rescheduled':'#94a3b8'};
+  mk('ch_fu',{type:'bar',data:{labels:fc,datasets:Object.keys(c.fu).map(function(s){return {label:s,data:c.fu[s],backgroundColor:fcol[s]||'#64748b'};})
+      .filter(function(ds){return ds.data.some(function(x){return x;});})},
+    options:{onClick:clickTo('fu_cat',fc),plugins:{legend:{labels:{boxWidth:12,font:{size:11}}}},scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,ticks:{precision:0}}}}},!fc.length);
+  var pl=c.pen.map(function(x){return x[0];});
+  mk('ch_pen',{type:'doughnut',data:{labels:pl,datasets:[{data:c.pen.map(function(x){return x[1];}),backgroundColor:['#f59e0b','#7c3aed','#059669','#94a3b8','#dc2626','#0ea5e9'],borderColor:'#fff',borderWidth:2}]},
+    options:{plugins:{legend:{position:'right',labels:{boxWidth:12,font:{size:11}}},tooltip:{callbacks:{label:function(t){return t.label+': '+inr(t.parsed);}}}}}},!pl.length);
+  mk('ch_top',{type:'bar',data:{labels:c.top.map(function(x){return x[0];}),datasets:[{label:'Outstanding',data:c.top.map(function(x){return x[1];}),backgroundColor:'#dc2626',borderRadius:4}]},
+    options:{indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:function(t){return inr(t.parsed.x);}}}},scales:{x:moneyAxis,y:{ticks:{font:{size:10}}}}}},!c.top.length);
+  renderTable();
+}
+function cellHtml(v,t){
+  if(v===null||v===undefined||v==='')return '<span style="color:var(--muted);">—</span>';
+  if(t==='inr')return inr(v);
+  if(t==='date')return dmy(v);
+  if(t==='risk'){var cls={'High':'badge-overdue','Medium':'badge-partial','Low':'badge-paid','Upcoming':'badge-pending'}[v]||'badge-pending';return '<span class="badge '+cls+'">'+esc(v)+'</span>';}
+  if(t==='state'){var s={'Missed':'badge-overdue','Due today':'badge-pending','Pending':'badge-pending','Awaiting ack':'badge-partial','Resolved':'badge-paid','Approved':'badge-approved','Collected':'badge-paid','Waived':'badge-closed','Closed':'badge-closed','Rejected':'badge-rejected','Seized':'badge-rejected','PendingApproval':'badge-pending','WrittenOff':'badge-rejected'}[v]||'badge-closed';return '<span class="badge '+s+'">'+esc(v)+'</span>';}
+  return esc(v);
+}
+function renderTable(){
+  var d=DATA; if(!d)return;
+  $('rpTabs').innerHTML=d.views.map(function(v){return '<button type="button" class="rp-tab'+(v[0]===VIEW?' on':'')+'" data-v="'+v[0]+'">'+esc(v[1])+'<span class="n">('+d.tables[v[0]].rows.length+')</span></button>';}).join('');
+  document.querySelectorAll('.rp-tab').forEach(function(b){b.addEventListener('click',function(){VIEW=b.dataset.v;SORT={col:null,dir:1};renderTable();
+    history.replaceState(null,'','/report?'+qs({view:VIEW}));});});
+  var t=d.tables[VIEW], rows=t.rows.slice();
+  if(SORT.col!==null){rows.sort(function(a,b){var x=a[SORT.col],y=b[SORT.col];if(x===y)return 0;if(x===null||x==='')return 1;if(y===null||y==='')return -1;return (x>y?1:-1)*SORT.dir;});}
+  var shown=rows.slice(0,500);
+  $('rpTable').innerHTML='<tr>'+t.cols.map(function(c,i){return '<th data-i="'+i+'">'+esc(c[0])+(SORT.col===i?(SORT.dir>0?' ▲':' ▼'):'')+'</th>';}).join('')+'</tr>'+
+    (shown.length?shown.map(function(r){var risky=r.some(function(v,i){return t.cols[i][1]==='risk'&&v==='High';})||r.some(function(v,i){return t.cols[i][1]==='state'&&v==='Missed';});
+      return '<tr'+(risky?' class="row-overdue"':'')+'>'+r.map(function(v,i){var ty=t.cols[i][1];return '<td'+(t.cols[i][0]==='Remarks'?' class="wrap"':'')+'>'+cellHtml(v,ty)+'</td>';}).join('')+'</tr>';}).join('')
+     :'<tr><td colspan="'+t.cols.length+'" style="text-align:center;color:var(--muted);">No rows for these filters.</td></tr>');
+  document.querySelectorAll('#rpTable th').forEach(function(th){th.addEventListener('click',function(){var i=+th.dataset.i;SORT=SORT.col===i?{col:i,dir:-SORT.dir}:{col:i,dir:1};renderTable();});});
+  $('rpMore').textContent=rows.length>500?'Showing the first 500 of '+rows.length+' rows — the downloads include every row.':rows.length+' row(s).';
+  ['csv','xlsx','pdf'].forEach(function(f){$('dl_'+f).href='/report/export?'+qs({fmt:f,view:VIEW});});
+  $('dl_all').href='/report/export?'+qs({fmt:'xlsx',view:'all'});
+}
+window.rpPng=function(id,name){if(!CH[id])return;var a=document.createElement('a');a.href=CH[id].toBase64Image('image/png',1);a.download=name+'.png';a.click();};
+load();
+})();
+</script>"""
+
+def _report_chip_group(key, label, options):
+    chips = "".join(f'<button type="button" class="rp-chip" data-k="{key}" data-v="{html.escape(str(v), quote=True)}">{html.escape(str(l))}</button>'
+                    for v, l in options)
+    return f'<div class="rp-group"><div class="rp-lbl">{label}</div><div class="rp-chips">{chips or "<span style=font-size:12px;color:var(--muted);>—</span>"}</div></div>'
+
+def _report_chart_box(cid, title, hint):
+    return (f'<div class="rp-chart"><h3><span>{title}</span>'
+            f'<button type="button" class="btn btn-sm" style="background:var(--surface2);color:var(--text);padding:3px 8px;" '
+            f'onclick="rpPng(\'{cid}\',\'{cid}\')" title="Download this chart as a picture">⬇ PNG</button></h3>'
+            f'<div class="hint">{hint}</div><div class="cv"><canvas id="{cid}"></canvas><div class="nodata">No data for these filters</div></div></div>')
+
 @app.route("/report", methods=["GET","POST"])
 @login_required
-@role_required("superadmin","admin","manager","viewer","assocmgr")
+@role_required(*REPORT_ROLES)
 def report():
     if request.method == "POST":
         if not REPORTLAB_AVAILABLE:
@@ -7641,22 +8411,112 @@ def report():
             return send_file(path, as_attachment=True, download_name="tfc_loan_report.pdf", mimetype="application/pdf")
         except Exception as e:
             flash(str(e),"danger")
-    tl,tla,tr,tp = get_kpi_totals(); counts = get_loan_summary_counts()
-    content = f"""
-    <h1>📊 Report</h1>
-    <div class="kpi-grid" style="margin-bottom:16px;">
-      <div class="kpi"><div class="val">{counts['total']}</div><div class="lbl">Total Loans</div></div>
-      <div class="kpi"><div class="val">₹{tla:,.0f}</div><div class="lbl">Disbursed</div></div>
-      <div class="kpi" style="border-color:var(--green)"><div class="val" style="color:var(--green)">₹{tr:,.0f}</div><div class="lbl">Collected</div></div>
-      <div class="kpi" style="border-color:var(--red)"><div class="val" style="color:var(--red)">₹{tp:,.0f}</div><div class="lbl">Outstanding</div></div>
-    </div>
-    <div class="card">
-      <form method="POST">
-        <button class="btn btn-primary">📥 Download PDF Report</button>
-      </form>
-      {"<p style='color:var(--red);margin-top:8px;font-size:13px;'>reportlab not installed — PDF unavailable.</p>" if not REPORTLAB_AVAILABLE else ""}
+    c = get_cur()
+    c.execute("SELECT DISTINCT status FROM LoanEntry WHERE status IS NOT NULL ORDER BY status")
+    statuses = [r["status"] for r in c.fetchall()]
+    c.execute("SELECT DISTINCT vehicle_type FROM LoanEntry WHERE COALESCE(vehicle_type,'')!='' ORDER BY vehicle_type")
+    vtypes = [r["vehicle_type"] for r in c.fetchall()]
+    presets = "".join(f'<button type="button" class="rp-preset" data-p="{k}">{l}</button>' for k, l in (
+        ("today", "Today"), ("last_30", "Last 30 days"), ("next_30", "Next 30 days"), ("this_month", "This month"),
+        ("last_month", "Last month"), ("this_quarter", "This quarter"), ("this_year", "This year")))
+    status_lbl = {"PendingApproval": "Pending approval", "Approved": "Active"}
+    filters = f"""
+    <div class="card rp-filters" style="padding:14px 16px;">
+      <div class="rp-row">
+        <div class="form-group"><label>From</label><input type="date" id="rp_date_from"></div>
+        <div class="form-group"><label>To</label><input type="date" id="rp_date_to"></div>
+        <div class="form-group" style="flex:1;min-width:200px;"><label>Search (loan / customer / mobile / vehicle)</label><input id="rp_q" placeholder="Type to filter…"></div>
+        <div class="form-group"><label>Outstanding ≥ (₹)</label><input type="number" id="rp_min_out" min="0" step="100" placeholder="0"></div>
+        <button type="button" class="btn btn-sm" id="rpReset" style="background:var(--surface2);color:var(--text);">↺ Reset all</button>
+      </div>
+      <div class="rp-group"><div class="rp-lbl">Quick dates</div><div class="rp-chips">{presets}</div></div>
+      <details open><summary style="cursor:pointer;font-size:12px;font-weight:700;color:var(--accent);margin:6px 0;">Slicers</summary>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:4px 18px;">
+          {_report_chip_group("risk", "Risk", REPORT_RISKS)}
+          {_report_chip_group("bucket", "Overdue age (days)", [(b[0], b[0]) for b in REPORT_BUCKETS])}
+          {_report_chip_group("status", "Loan status", [(s, status_lbl.get(s, s)) for s in statuses])}
+          {_report_chip_group("vtype", "Vehicle type", [(v, v) for v in vtypes])}
+          {_report_chip_group("fu_cat", "Follow-up category", [(x, x) for x in FU_CATEGORIES])}
+          {_report_chip_group("fu_state", "Follow-up state", [(x, x) for x in REPORT_FU_STATES])}
+        </div>
+      </details>
+      <div class="rp-summary" id="rpSummary">Loading…</div>
     </div>"""
+    charts = "".join(_report_chart_box(*x) for x in (
+        ("ch_age", "🔴 Overdue ageing", "Overdue amount by how late it is · click a bar to filter"),
+        ("ch_coll", "💳 Collections vs expected", "Money collected each month against the EMIs falling due"),
+        ("ch_fu", "📞 Follow-ups", "By category and state · click a bar to filter the category"),
+        ("ch_top", "🏆 Top 10 outstanding loans", "Who owes the most right now"),
+        ("ch_profit", "📈 Interest income (profit)", "Interest part of the EMIs due each month, expected vs collected"),
+        ("ch_disb", "💰 Disbursements", "Loan amount given out each month"),
+        ("ch_status", "🍩 Loan status", "Click a slice to filter"),
+        ("ch_vtype", "🚗 Loans by vehicle type", "Click a bar to filter"),
+        ("ch_pen", "⚖️ Penalties by status", "Payable penalty amount"),
+    ))
+    content = (REPORT_CSS + f"""
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+      <h1 style="margin:0;">📊 Report</h1>
+      <form method="POST" style="margin:0;"><button class="btn btn-sm btn-primary">📥 Full PDF summary</button></form>
+    </div>
+    {filters}
+    <div id="rpBody">
+      <div class="rp-kpis" id="rpKpis"></div>
+      <div class="rp-charts">{charts}</div>
+      <div class="card" id="rpTables">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+          <h2 style="margin:0;">📋 Details</h2>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            <a class="btn btn-sm btn-success" id="dl_xlsx" href="#">⬇ Excel (this table)</a>
+            <a class="btn btn-sm btn-success" id="dl_csv" href="#">⬇ CSV</a>
+            <a class="btn btn-sm btn-danger" id="dl_pdf" href="#">⬇ PDF</a>
+            <a class="btn btn-sm btn-primary" id="dl_all" href="#">⬇ Everything (Excel, all tables)</a>
+          </div>
+        </div>
+        <div class="rp-tabs" id="rpTabs"></div>
+        <div class="table-wrap"><table id="rpTable"></table></div>
+        <div style="font-size:12px;color:var(--muted);margin-top:6px;" id="rpMore"></div>
+        <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">The date range applies to each table's own date: EMI due date (first EMI, overdue, upcoming),
+          follow-up date, payment date, penalty date and loan date. Upcoming dues show the next 30 days when no end date is set.</div>
+      </div>
+    </div>""" + REPORT_JS)
     return page("Report", content, "report")
+
+@app.route("/api/report")
+@login_required
+@role_required(*REPORT_ROLES)
+def api_report():
+    return jsonify(report_compute(report_filters(request.args)))
+
+@app.route("/report/export")
+@login_required
+@role_required(*REPORT_ROLES)
+def report_export():
+    f = report_filters(request.args)
+    data = report_compute(f)
+    fmt = request.args.get("fmt", "xlsx")
+    view = request.args.get("view", "first_emi")
+    views = [v for v, _ in REPORT_VIEWS] if view == "all" else ([view] if view in data["tables"] else ["first_emi"])
+    stamp = date.today().strftime("%Y%m%d")
+    if fmt == "pdf":
+        if not REPORTLAB_AVAILABLE:
+            flash("reportlab not installed — PDF unavailable.", "danger"); return redirect(url_for("report"))
+        return send_file(_rp_pdf(data["tables"][views[0]], data["summary"]), as_attachment=True,
+                         download_name=f"report_{views[0]}_{stamp}.pdf", mimetype="application/pdf")
+    if fmt == "xlsx":
+        try:
+            return send_file(_rp_xlsx(data, views), as_attachment=True,
+                             download_name=f"report_{'all' if view == 'all' else views[0]}_{stamp}.xlsx",
+                             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except ImportError:
+            fmt = "csv"     # openpyxl missing: fall back to CSV (a ZIP when several tables)
+    if len(views) == 1:
+        return send_file(io.BytesIO(_rp_csv(data["tables"][views[0]], data["summary"]).encode("utf-8-sig")), as_attachment=True,
+                         download_name=f"report_{views[0]}_{stamp}.csv", mimetype="text/csv")
+    zb = io.BytesIO()
+    with zipfile.ZipFile(zb, "w", zipfile.ZIP_DEFLATED) as zf:
+        for v in views: zf.writestr(f"{v}.csv", _rp_csv(data["tables"][v], data["summary"]).encode("utf-8-sig"))
+    zb.seek(0)
+    return send_file(zb, as_attachment=True, download_name=f"report_all_{stamp}.zip", mimetype="application/zip")
 
 # ── Users ──────────────────────────────────────────────────────────────────────
 @app.route("/users", methods=["GET","POST"])
