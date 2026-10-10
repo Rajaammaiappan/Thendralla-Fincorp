@@ -8143,6 +8143,9 @@ def report_compute(f):
         "fu_cats": sorted(fu_chart), "fu": {s: [fu_chart[c].get(s, 0) for c in sorted(fu_chart)] for s in REPORT_FU_STATES},
         "pen": sorted(pen_chart.items()),
         "top": [[x["loan_number"] + " · " + (x["customer_name"] or ""), round(x["outstanding"], 2)] for x in top if x["outstanding"] > 0],
+        "cust": [[x["id"], x["loan_number"], x["customer_name"], x["customer_mobile"], x["status"], round(x["outstanding"], 2),
+                  round(x["overdue_amt"], 2), x["n_od"], x["risk"]]
+                 for x in sorted(L, key=lambda x: ({"High": 0, "Medium": 1}.get(x["risk"], 2), -x["overdue_amt"], -x["outstanding"]))],
     }
     fu_rows = tables["followups"]["rows"]
     kpis = [
@@ -8159,7 +8162,7 @@ def report_compute(f):
         ["Penalty payable", round(sum(r[6] for r in tables["penalties"]["rows"] if r[7] in ("Pending", "Approved")), 2), "inr-red", "penalties"],
     ]
     return {"kpis": kpis, "charts": charts, "tables": tables, "summary": report_filter_summary(f),
-            "views": REPORT_VIEWS, "today": tod}
+            "views": REPORT_VIEWS, "today": tod, "loan_ids": {x["loan_number"]: x["id"] for x in L}}
 
 def _rp_cell(v, t):
     if v is None or v == "": return ""
@@ -8247,6 +8250,12 @@ REPORT_CSS = """<style>
 #rpTable td{white-space:nowrap;}
 #rpTable td.wrap{white-space:normal;min-width:200px;}
 .rp-loading{opacity:.55;pointer-events:none;}
+.rp-chart.wide{grid-column:span 2;}
+.rp-cust{max-height:262px;overflow:auto;}
+.rp-cust table{font-size:12px;}
+.rp-cust th{position:sticky;top:0;z-index:1;padding:7px 6px;}
+.rp-cust td{padding:6px;white-space:nowrap;}
+@media(max-width:900px){.rp-chart.wide{grid-column:auto;}}
 @media(max-width:768px){.rp-charts{grid-template-columns:1fr;}}
 </style>"""
 
@@ -8354,8 +8363,17 @@ function render(){
     options:{plugins:{legend:{position:'right',labels:{boxWidth:12,font:{size:11}}},tooltip:{callbacks:{label:function(t){return t.label+': '+inr(t.parsed);}}}}}},!pl.length);
   mk('ch_top',{type:'bar',data:{labels:c.top.map(function(x){return x[0];}),datasets:[{label:'Outstanding',data:c.top.map(function(x){return x[1];}),backgroundColor:'#dc2626',borderRadius:4}]},
     options:{indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:function(t){return inr(t.parsed.x);}}}},scales:{x:moneyAxis,y:{ticks:{font:{size:10}}}}}},!c.top.length);
+  var cu=c.cust;
+  $('rpCustN').textContent='('+cu.length+')';
+  $('rpCust').innerHTML='<tr><th>Loan #</th><th>Customer</th><th>Mobile</th><th>Status</th><th>Outstanding</th><th>Overdue</th><th>EMIs late</th><th>Risk</th></tr>'+
+    (cu.length?cu.slice(0,300).map(function(r){
+      return '<tr'+(r[8]==='High'?' class="row-overdue"':'')+'><td>'+loanLink(r[0],r[1])+'</td><td>'+esc(r[2])+'</td><td>'+cellHtml(r[3],'text')+'</td><td>'+cellHtml(r[4],'state')+
+        '</td><td>'+inr(r[5])+'</td><td>'+(r[6]>0?'<b style="color:var(--red);">'+inr(r[6])+'</b>':inr(0))+'</td><td style="text-align:center;">'+r[7]+'</td><td>'+cellHtml(r[8],'risk')+'</td></tr>';
+    }).join('')+(cu.length>300?'<tr><td colspan="8" style="color:var(--muted);">… '+(cu.length-300)+' more — see the All loans table / downloads</td></tr>':'')
+    :'<tr><td colspan="8" style="text-align:center;color:var(--muted);">No customers for these filters.</td></tr>');
   renderTable();
 }
+function loanLink(id,no){return id?'<a href="/emis/'+id+'" target="_blank" rel="noopener" style="color:var(--accent);font-weight:700;">'+esc(no)+'</a>':esc(no);}
 function cellHtml(v,t){
   if(v===null||v===undefined||v==='')return '<span style="color:var(--muted);">—</span>';
   if(t==='inr')return inr(v);
@@ -8374,7 +8392,7 @@ function renderTable(){
   var shown=rows.slice(0,500);
   $('rpTable').innerHTML='<tr>'+t.cols.map(function(c,i){return '<th data-i="'+i+'">'+esc(c[0])+(SORT.col===i?(SORT.dir>0?' ▲':' ▼'):'')+'</th>';}).join('')+'</tr>'+
     (shown.length?shown.map(function(r){var risky=r.some(function(v,i){return t.cols[i][1]==='risk'&&v==='High';})||r.some(function(v,i){return t.cols[i][1]==='state'&&v==='Missed';});
-      return '<tr'+(risky?' class="row-overdue"':'')+'>'+r.map(function(v,i){var ty=t.cols[i][1];return '<td'+(t.cols[i][0]==='Remarks'?' class="wrap"':'')+'>'+cellHtml(v,ty)+'</td>';}).join('')+'</tr>';}).join('')
+      return '<tr'+(risky?' class="row-overdue"':'')+'>'+r.map(function(v,i){var ty=t.cols[i][1];return '<td'+(t.cols[i][0]==='Remarks'?' class="wrap"':'')+'>'+(t.cols[i][0]==='Loan #'?loanLink(d.loan_ids[v],v):cellHtml(v,ty))+'</td>';}).join('')+'</tr>';}).join('')
      :'<tr><td colspan="'+t.cols.length+'" style="text-align:center;color:var(--muted);">No rows for these filters.</td></tr>');
   document.querySelectorAll('#rpTable th').forEach(function(th){th.addEventListener('click',function(){var i=+th.dataset.i;SORT=SORT.col===i?{col:i,dir:-SORT.dir}:{col:i,dir:1};renderTable();});});
   $('rpMore').textContent=rows.length>500?'Showing the first 500 of '+rows.length+' rows — the downloads include every row.':rows.length+' row(s).';
@@ -8452,7 +8470,10 @@ def report():
         ("ch_status", "🍩 Loan status", "Click a slice to filter"),
         ("ch_vtype", "🚗 Loans by vehicle type", "Click a bar to filter"),
         ("ch_pen", "⚖️ Penalties by status", "Payable penalty amount"),
-    ))
+    )) + ('<div class="rp-chart wide"><h3><span>👥 Customers in this filter <span id="rpCustN" style="color:var(--muted);font-weight:600;"></span></span>'
+          '<span style="font-size:11px;color:var(--muted);font-weight:500;">click a loan number for full details</span></h3>'
+          '<div class="hint">Riskiest first: high risk, then the biggest overdue amount</div>'
+          '<div class="rp-cust"><table id="rpCust"></table></div></div>')
     content = (REPORT_CSS + f"""
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
       <h1 style="margin:0;">📊 Report</h1>
