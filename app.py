@@ -2731,6 +2731,9 @@ def record_fine_check(loan_id, amounts, note, username, source="check"):
     status = "PendingReview" if source == "check" and level in ("High", "Medium") else "Recorded"
     now = datetime.now(timezone.utc).isoformat()
     c = get_cur()
+    # The fine is live data: the newest entry replaces any older check still waiting for the approver.
+    c.execute("""UPDATE PoliceFineChecks SET status='Superseded', decision=?, decided_at=? WHERE loan_id=? AND status='PendingReview'""",
+              (f"Replaced by the newer check on {fmt_date(date.today().isoformat())}", now, loan_id))
     c.execute("""INSERT INTO PoliceFineChecks (loan_id,total_fine,detail,outstanding,risk_level,risk_reasons,source,note,
                  checked_by,checked_at,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
               (loan_id, total, json.dumps([{"vehicle": vehicle_tag(v), "model": v.get("vehicle_model"), "fine": float(v.get("police_fine") or 0)} for v in vs]),
@@ -2824,12 +2827,22 @@ def fine_check_card_html(loan, can_pay):
     due = c.fetchone()
     months = int(fine_setting("fine_check_months") or 3)
     src = {"check": "Regular check", "seizure": "At seizure"}
+    last = (hist[0]["checked_at"] or "")[:10] if hist else ""
+    if due:
+        sched = f' · <b style="color:var(--red);">check due {fmt_date(due["follow_up_date"])}</b>'
+    elif last:
+        sched = (f' · latest check <b>{fmt_date(last)}</b> · next check '
+                 f'<b>{fmt_date(add_months(parse_date(last), months).isoformat())}</b>')
+    else:
+        sched = ""
+    latest_tag = ' <span class="badge badge-approved">Latest</span>'
     rows = "".join(
-        f'<tr><td>{fmt_date((h["checked_at"] or "")[:10])}</td><td>{fmt_inr(h["total_fine"])}</td><td>{fmt_inr(h["outstanding"])}</td>'
+        f'<tr{" style=background:#ecfeff;" if i == 0 else ""}><td>{fmt_date((h["checked_at"] or "")[:10])}'
+        f'{latest_tag if i == 0 else ""}</td><td>{fmt_inr(h["total_fine"])}</td><td>{fmt_inr(h["outstanding"])}</td>'
         f'<td><span class="badge {FINE_LEVEL_BADGE.get(h["risk_level"], "badge-closed")}">{html.escape(h["risk_level"] or "")}</span></td>'
         f'<td>{src.get(h["source"], h["source"] or "")}</td><td>{html.escape(h["checked_by"] or "")}</td>'
         f'<td style="white-space:normal;">{"⏳ Waiting for the approver" if h["status"] == "PendingReview" else html.escape(h.get("decision") or "Recorded")}'
-        f'{(" — " + html.escape(h["decision_remarks"])) if h.get("decision_remarks") else ""}</td></tr>' for h in hist)
+        f'{(" — " + html.escape(h["decision_remarks"])) if h.get("decision_remarks") else ""}</td></tr>' for i, h in enumerate(hist))
     form = ""
     if can_pay and loan.get("status") == "Approved":
         form = (f'<form method="POST" action="/finecheck/{lid}" class="form-grid" style="margin-top:10px;" '
@@ -2837,8 +2850,9 @@ def fine_check_card_html(loan, can_pay):
                 f'<div class="form-group"><label>Note (optional)</label><input name="note" placeholder="e.g. checked on the e-challan site"></div>'
                 f'<div class="form-group full"><button class="btn btn-primary btn-sm" style="width:fit-content;">🚓 Save police fine check</button></div></form>')
     return (f'<div class="card" id="finecheck" style="margin-bottom:12px;border-left:5px solid #0e7490;">'
-            f'<b>🚓 Police fine check</b> <span style="font-size:12px;color:var(--muted);">— every {months} months'
-            f'{(" · <b style=color:var(--red);>check due " + fmt_date(due["follow_up_date"]) + "</b>") if due else ""}</span>'
+            f'<b>🚓 Police fine check</b> <span style="font-size:12px;color:var(--muted);">— every {months} months{sched}</span>'
+            f'<div style="font-size:12px;color:var(--muted);margin-top:2px;">The fine is live data: enter it any time. The latest entry is taken as '
+            f'the current fine, closes any pending check task, and the next check is {months} months after it.</div>'
             f'<div style="font-size:13px;margin-top:6px;line-height:1.7;">{fine_status_html(loan)}</div>'
             + (f'<div class="table-wrap" style="margin-top:8px;"><table><tr><th>Checked on</th><th>Police fine</th><th>Pending loan</th><th>Risk</th>'
                f'<th>Type</th><th>By</th><th>Decision</th></tr>{rows}</table></div>' if rows else '')
@@ -8255,7 +8269,8 @@ REPORT_RISKS = [("first_emi", "First EMI unpaid"), ("overdue3", "3+ EMIs overdue
                 ("partial", "Part-paid EMI"), ("fine", "Police fine risk"), ("clean", "No overdue")]
 REPORT_BUCKETS = [("0-30", 0, 30), ("31-60", 31, 60), ("61-90", 61, 90), ("90+", 91, 10 ** 6)]
 REPORT_FU_STATES = ["Missed", "Due today", "Pending", "Awaiting ack", "Resolved", "Rescheduled"]
-REPORT_VIEWS = [("first_emi", "⚠️ First EMI pending"), ("overdue", "🔴 Overdue dues"), ("fine_risk", "🚓 Police fine risk"), ("upcoming", "🟡 Upcoming dues"),
+REPORT_VIEWS = [("first_emi", "⚠️ First EMI pending"), ("overdue", "🔴 Overdue dues"), ("fine_risk", "🚓 Police fine risk"),
+                ("fine_checks", "🚦 Police / traffic fine checks"), ("upcoming", "🟡 Upcoming dues"),
                 ("followups", "📞 Follow-ups"), ("collections", "💳 Collections"), ("penalties", "💰 Penalties"),
                 ("loans", "📋 All loans")]
 UNPAID_DONE = ("Paid", "PreClosed", "Seized")
@@ -8304,13 +8319,13 @@ def report_compute(f):
         ("SELECT loan_id,emi_id,amount,bill_number,paid_at,paid_by,penalty_part FROM EMIPayments", ()),
         ("SELECT loan_id,settlement_amount,paid_on,bill_number,closed_by FROM PreClosure WHERE status='Completed'", ()),
         ("SELECT loan_id,police_fine,vehicle_model FROM LoanVehicles", ()),
-        ("SELECT loan_id,MAX(checked_at) as last FROM PoliceFineChecks GROUP BY loan_id", ()),
+        ("SELECT * FROM PoliceFineChecks ORDER BY check_id", ()),
     ])
     loans_raw, emis_raw, fus_raw, pens_raw, pays_raw, pcs_raw, xv_raw, chk_raw = [[dict(r) for r in x] for x in res]
     fcfg = {k: fine_setting(k) for k in FINE_RISK_DEFAULTS}
     xv_by = {}
     for v in xv_raw: xv_by.setdefault(v["loan_id"], []).append(v)
-    last_chk = {r["loan_id"]: (r["last"] or "")[:10] for r in chk_raw}
+    last_chk = {r["loan_id"]: r for r in chk_raw}   # ordered by check_id, so the newest check wins
     lo, hi = f["date_from"], f["date_to"]
     def rng(d):
         d = (d or "")[:10]
@@ -8468,16 +8483,49 @@ def report_compute(f):
                                     ["Raised on", "date"]], "rows": rows}
     # 6b. police fine risk (current fines against what is still pending)
     rank = {"High": 0, "Medium": 1, "Low": 2}
-    rows = [[x["loan_number"], x["customer_name"], x["customer_mobile"], veh(x), x["model_year"],
-             (today.year - x["model_year"]) if x["model_year"] else None, x["fine"], round(x["outstanding"], 2),
-             round(x["fine"] / x["outstanding"] * 100, 1) if x["outstanding"] > 0 else None, x["fine_level"],
-             "; ".join(x["fine_reasons"]), last_chk.get(x["id"])]
-            for x in L if x["fine"] > 0 and x["status"] == "Approved"]
+    def approval_of(ck):
+        if not ck: return "Not checked yet"
+        if ck["status"] == "PendingReview": return "Waiting for approver"
+        if ck["status"] == "Reviewed": return "Approver: " + (ck.get("decision") or "reviewed")
+        if ck["status"] == "Superseded": return "Replaced by newer check"
+        return "Not needed (low risk)" if ck["source"] == "check" else "Recorded at seizure"
+    rows = []
+    for x in L:
+        if x["fine"] <= 0 or x["status"] != "Approved": continue
+        ck = last_chk.get(x["id"])
+        rows.append([x["loan_number"], x["customer_name"], x["customer_mobile"], veh(x), x["model_year"],
+                     (today.year - x["model_year"]) if x["model_year"] else None, x["fine"], round(x["outstanding"], 2),
+                     round(x["fine"] / x["outstanding"] * 100, 1) if x["outstanding"] > 0 else None, x["fine_level"],
+                     "; ".join(x["fine_reasons"]), (ck["checked_at"] or "")[:10] if ck else None, approval_of(ck)])
     rows.sort(key=lambda r: (rank.get(r[9], 3), -(r[6] or 0)))
     tables["fine_risk"] = {"cols": [["Loan #", "text"], ["Customer", "text"], ["Mobile", "text"], ["Vehicle", "text"],
                                     ["Model year", "int"], ["Vehicle age (yrs)", "int"], ["Police fine", "inr"], ["Pending loan", "inr"],
-                                    ["Fine % of pending", "num"], ["Fine risk", "risk"], ["Why", "text"], ["Last fine check", "date"]],
+                                    ["Fine % of pending", "num"], ["Fine risk", "risk"], ["Why", "text"], ["Last fine check", "date"],
+                                    ["Approval", "text"]],
                            "rows": rows}
+    # 6c. every police / traffic fine check entered (history; date range = checked date)
+    src_lbl = {"check": "Regular check", "seizure": "At seizure"}
+    rows, fine_chart = [], {}
+    for ck in chk_raw:
+        x = lmap.get(ck["loan_id"])
+        if not x or not rng(ck["checked_at"]): continue
+        try: det = json.loads(ck["detail"] or "[]")
+        except ValueError: det = []
+        per_veh = "; ".join(f"{d.get('vehicle') or 'Vehicle'}: {fmt_inr(d.get('fine') or 0)}" for d in det)
+        tot, out_ = num(ck["total_fine"]), num(ck["outstanding"])
+        rows.append([(ck["checked_at"] or "")[:10], x["loan_number"], x["customer_name"], x["customer_mobile"], per_veh,
+                     round(tot, 2), round(out_, 2), round(tot / out_ * 100, 1) if out_ > 0 else None, ck["risk_level"],
+                     ck["risk_reasons"].replace("\n", "; ") if ck["risk_reasons"] else None, src_lbl.get(ck["source"], ck["source"]),
+                     approval_of(ck), ck.get("decided_by"), ck.get("decision_remarks"), ck.get("note"), ck["checked_by"]])
+    rows.reverse()      # newest check first
+    tables["fine_checks"] = {"cols": [["Checked on", "date"], ["Loan #", "text"], ["Customer", "text"], ["Mobile", "text"],
+                                      ["Fine per vehicle", "text"], ["Total fine", "inr"], ["Pending loan", "inr"],
+                                      ["Fine % of pending", "num"], ["Fine risk", "risk"], ["Why", "text"], ["Type", "text"],
+                                      ["Approval", "text"], ["Decided by", "text"], ["Approver remarks", "text"],
+                                      ["Note", "text"], ["Checked by", "text"]], "rows": rows}
+    for x in L:
+        if x["status"] == "Approved" and x["fine"] > 0:
+            fc = fine_chart.setdefault(x["fine_level"], [0, 0.0]); fc[0] += 1; fc[1] += x["fine"]
     # 7. all loans (date range = loan date)
     rows = [[x["loan_number"], x["customer_name"], x["customer_mobile"], veh(x), x["vehicle_type"], num(x["loan_amount"]),
              round(num(x["interest_rate"]) * 100, 2), x["tenure"], x["status"], x["loan_date"], round(x["paid"], 2),
@@ -8523,6 +8571,7 @@ def report_compute(f):
         "disb": [round(mon[m]["disb"], 2) for m in months], "disb_n": [mon[m]["disb_n"] for m in months],
         "fu_cats": sorted(fu_chart), "fu": {s: [fu_chart[c].get(s, 0) for c in sorted(fu_chart)] for s in REPORT_FU_STATES},
         "pen": sorted(pen_chart.items()),
+        "fine": [[lv, fine_chart[lv][0], round(fine_chart[lv][1], 2)] for lv in ("High", "Medium", "Low") if lv in fine_chart],
         "top": [[x["loan_number"] + " · " + (x["customer_name"] or ""), round(x["outstanding"], 2)] for x in top if x["outstanding"] > 0],
         "cust": [[x["id"], x["loan_number"], x["customer_name"], x["customer_mobile"], x["status"], round(x["outstanding"], 2),
                   round(x["overdue_amt"], 2), x["n_od"], x["risk"]]
@@ -8541,6 +8590,8 @@ def report_compute(f):
         ["Follow-ups missed", sum(1 for r in fu_rows if r[5] == "Missed"), "red", "followups"],
         ["Follow-ups open", sum(1 for r in fu_rows if r[5] in ("Pending", "Due today", "Missed")), "amber", "followups"],
         ["Police-fine risk loans", sum(1 for r in tables["fine_risk"]["rows"] if r[9] in ("High", "Medium")), "red", "fine_risk"],
+        ["Police / traffic fines (now)", round(sum(r[6] for r in tables["fine_risk"]["rows"]), 2), "inr-red", "fine_risk"],
+        ["Fine checks waiting for approver", sum(1 for r in tables["fine_checks"]["rows"] if r[11] == "Waiting for approver"), "amber", "fine_checks"],
         ["Penalty payable", round(sum(r[6] for r in tables["penalties"]["rows"] if r[7] in ("Pending", "Approved")), 2), "inr-red", "penalties"],
     ]
     return {"kpis": kpis, "charts": charts, "tables": tables, "summary": report_filter_summary(f),
@@ -8559,14 +8610,69 @@ def _rp_csv(tbl, summary):
     for r in tbl["rows"]: w.writerow([_rp_cell(v, c[1]) for v, c in zip(r, tbl["cols"])])
     return buf.getvalue()
 
-def _rp_xlsx(data, views):
+def _rp_chart_blocks(data):
+    """The Report page's charts as plain data: (title, kind, header, rows, value columns to plot)."""
+    c = data["charts"]; ms = c["months"]
+    fu_states = [s for s in REPORT_FU_STATES if any(c["fu"].get(s, []))]
+    return [
+        ("Overdue ageing", "bar", ["Overdue age (days)", "Overdue amount", "Loans"], [list(x) for x in c["ageing"]], [1]),
+        ("Collections vs expected", "bar", ["Month", "Expected (EMIs due)", "Collected"],
+         [[m, c["expected"][i], c["collected"][i]] for i, m in enumerate(ms)], [1, 2]),
+        ("Follow-ups by category and state", "bar", ["Category"] + fu_states,
+         [[cat] + [c["fu"][s][i] for s in fu_states] for i, cat in enumerate(c["fu_cats"])], list(range(1, len(fu_states) + 1))),
+        ("Top 10 outstanding loans", "bar", ["Loan", "Outstanding"], [list(x) for x in c["top"]], [1]),
+        ("Interest income (profit)", "bar", ["Month", "Interest expected", "Interest collected"],
+         [[m, c["profit"][i], c["profit_got"][i]] for i, m in enumerate(ms)], [1, 2]),
+        ("Disbursements", "bar", ["Month", "Disbursed", "Loans"], [[m, c["disb"][i], c["disb_n"][i]] for i, m in enumerate(ms)], [1]),
+        ("Loan status", "pie", ["Status", "Loans"], [list(x) for x in c["status"]], [1]),
+        ("Loans by vehicle type", "bar", ["Vehicle type", "Loans"], [list(x) for x in c["vtype"]], [1]),
+        ("Penalties by status", "pie", ["Status", "Payable penalty"], [list(x) for x in c["pen"]], [1]),
+        ("Police / traffic fine risk", "pie", ["Fine risk", "Loans", "Total fine"], [list(x) for x in c["fine"]], [1]),
+    ]
+
+RP_CUST_COLS = [["Loan #", "text"], ["Customer", "text"], ["Mobile", "text"], ["Status", "state"], ["Outstanding", "inr"],
+                ["Overdue", "inr"], ["EMIs late", "int"], ["Risk", "risk"]]
+
+def _rp_xlsx(data, views, full=False):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
     wb = Workbook(); ws = wb.active; ws.title = "Summary"
     ws.append(["Thendralla Fincorp — Report", datetime.now().strftime("%d/%m/%Y %H:%M")])
     ws.append(["Filters", " | ".join(data["summary"])]); ws.append([])
     for k in data["kpis"]: ws.append([k[0], k[1]])
+    ws.column_dimensions["A"].width = 36; ws.column_dimensions["B"].width = 22
     head = PatternFill("solid", fgColor="1A4FAD")
+    if full:
+        from openpyxl.chart import BarChart, PieChart, Reference
+        ch = wb.create_sheet("Charts"); r0 = 1
+        for title, kind, hdr, rows, vcols in _rp_chart_blocks(data):
+            ch.cell(r0, 1, title).font = Font(bold=True, size=13)
+            for i, h in enumerate(hdr, 1):
+                cl = ch.cell(r0 + 1, i, h); cl.font = Font(bold=True, color="FFFFFF"); cl.fill = head
+            for j, row in enumerate(rows):
+                for i, v in enumerate(row, 1): ch.cell(r0 + 2 + j, i, v)
+            if not rows: ch.cell(r0 + 2, 1, "No data for these filters")
+            elif kind == "pie":
+                pc = PieChart(); pc.title = title; pc.height, pc.width = 7, 12
+                pc.add_data(Reference(ch, min_col=2, min_row=r0 + 1, max_row=r0 + 1 + len(rows)), titles_from_data=True)
+                pc.set_categories(Reference(ch, min_col=1, min_row=r0 + 2, max_row=r0 + 1 + len(rows)))
+                ch.add_chart(pc, f"G{r0}")
+            else:
+                bc = BarChart(); bc.title = title; bc.height, bc.width = 7, 16
+                if title.startswith("Top"): bc.type = "bar"
+                if title.startswith("Follow-ups"): bc.grouping = "stacked"; bc.overlap = 100
+                for vc in vcols:
+                    bc.add_data(Reference(ch, min_col=vc + 1, min_row=r0 + 1, max_row=r0 + 1 + len(rows)), titles_from_data=True)
+                bc.set_categories(Reference(ch, min_col=1, min_row=r0 + 2, max_row=r0 + 1 + len(rows)))
+                ch.add_chart(bc, f"G{r0}")
+            r0 += max(len(rows) + 4, 16)
+        for col in "ABCDEF": ch.column_dimensions[col].width = 22
+        cs = wb.create_sheet("Customers in this filter")
+        cs.append([c[0] for c in RP_CUST_COLS])
+        for cell in cs[1]: cell.font = Font(bold=True, color="FFFFFF"); cell.fill = head
+        for r in data["charts"]["cust"]: cs.append([_rp_cell(x, c[1]) for x, c in zip(r[1:], RP_CUST_COLS)])
+        for i in range(1, len(RP_CUST_COLS) + 1): cs.column_dimensions[cs.cell(1, i).column_letter].width = 18
+        cs.freeze_panes = "A2"
     for v in views:
         t = data["tables"][v]
         sh = wb.create_sheet(re.sub(r"[^A-Za-z0-9 ]", "", dict(REPORT_VIEWS)[v]).strip()[:30] or v)
@@ -8579,23 +8685,89 @@ def _rp_xlsx(data, views):
     out = io.BytesIO(); wb.save(out); out.seek(0)
     return out
 
-def _rp_pdf(tbl, summary):
-    buf = io.BytesIO()
-    styles = getSampleStyleSheet()
-    cell = ParagraphStyle("c", parent=styles["Normal"], fontSize=6.8, leading=8)
-    story = [Paragraph(f"Thendralla Fincorp — {re.sub(r'[^A-Za-z0-9 &()+-]', '', tbl['title']).strip()}", styles["Title"]),
-             Paragraph(f"Generated {datetime.now().strftime('%d/%m/%Y %H:%M')} · {len(tbl['rows'])} row(s)", styles["Normal"]),
-             Paragraph("Filters: " + html.escape(" | ".join(summary).replace("₹", "Rs ")), styles["Normal"]), Spacer(1, 0.3 * cm)]
-    data = [[Paragraph(f"<b>{html.escape(c[0])}</b>", cell) for c in tbl["cols"]]]
-    for r in tbl["rows"][:3000]:
-        data.append([Paragraph(html.escape(str(_rp_cell(v, c[1])) if c[1] != "inr" or v in (None, "") else f"{float(v):,.2f}"), cell)
-                     for v, c in zip(r, tbl["cols"])])
-    if len(data) == 1: data.append([Paragraph("No rows for these filters.", cell)] + [""] * (len(tbl["cols"]) - 1))
+def _rp_pdf_clean(s):
+    return re.sub(r"[^\w &()+/%·.,:;#≥'\"@—-]", "", str(s).replace("₹", "Rs ")).strip()
+
+def _rp_pdf_table(cols, rows, cell):
+    data = [[Paragraph(f"<b>{html.escape(c[0])}</b>", cell) for c in cols]]
+    for r in rows[:3000]:
+        data.append([Paragraph(html.escape(_rp_pdf_clean(_rp_cell(v, c[1])) if c[1] != "inr" or v in (None, "") else f"{float(v):,.2f}"), cell)
+                     for v, c in zip(r, cols)])
+    if len(data) == 1: data.append([Paragraph("No rows for these filters.", cell)] + [""] * (len(cols) - 1))
     t = Table(data, repeatRows=1)
     t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a4fad")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#e8f0fb")]),
                            ("GRID", (0, 0), (-1, -1), 0.3, colors.grey), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
-    story.append(t)
+    return t
+
+def _rp_pdf_chart(kind, hdr, rows, vcols):
+    """A small reportlab drawing of one Report chart."""
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.charts.barcharts import VerticalBarChart
+    from reportlab.graphics.charts.piecharts import Pie
+    from reportlab.graphics.charts.legends import Legend
+    pal = [colors.HexColor(x) for x in ("#1a4fad", "#059669", "#d97706", "#dc2626", "#6366f1", "#0ea5e9", "#7c3aed", "#db2777")]
+    d = Drawing(560, 170)
+    labels = [_rp_pdf_clean(r[0])[:22] for r in rows]
+    if kind == "pie":
+        p = Pie(); p.x, p.y, p.width, p.height = 20, 10, 150, 150
+        p.data = [max(0.0, float(r[1] or 0)) for r in rows]
+        if not any(p.data): return None
+        risk_col = {"High": "#dc2626", "Medium": "#f59e0b", "Low": "#059669"}
+        if all(r[0] in risk_col for r in rows): pal = [colors.HexColor(risk_col[r[0]]) for r in rows]
+        for i in range(len(rows)): p.slices[i].fillColor = pal[i % len(pal)]
+        d.add(p)
+        lg = Legend(); lg.x, lg.y, lg.fontSize = 200, 140, 8
+        lg.colorNamePairs = [(pal[i % len(pal)], f"{labels[i]}: {rows[i][1]:,}" if isinstance(rows[i][1], int) else f"{labels[i]}: {float(rows[i][1]):,.2f}")
+                             for i in range(len(rows))]
+        d.add(lg)
+        return d
+    b = VerticalBarChart(); b.x, b.y, b.width, b.height = 50, 35, 380, 125
+    b.data = [[float(r[vc] or 0) for r in rows] for vc in vcols]
+    if not any(any(s) for s in b.data): return None
+    b.categoryAxis.categoryNames = labels
+    b.categoryAxis.labels.fontSize = 6; b.categoryAxis.labels.angle = 30 if len(rows) > 6 else 0
+    b.categoryAxis.labels.boxAnchor = "ne" if len(rows) > 6 else "n"
+    b.valueAxis.labels.fontSize = 6; b.valueAxis.valueMin = 0
+    for i in range(len(vcols)): b.bars[i].fillColor = pal[i % len(pal)]
+    d.add(b)
+    lg = Legend(); lg.x, lg.y, lg.fontSize = 445, 150, 7
+    lg.colorNamePairs = [(pal[i % len(pal)], hdr[vc]) for i, vc in enumerate(vcols)]
+    d.add(lg)
+    return d
+
+def _rp_pdf(tbl, summary, data=None):
+    """One table, or (with data) the full report: KPIs, charts, customers and every table."""
+    buf = io.BytesIO()
+    styles = getSampleStyleSheet()
+    cell = ParagraphStyle("c", parent=styles["Normal"], fontSize=6.8, leading=8)
+    title = "Full report" if data else re.sub(r'[^A-Za-z0-9 &()+/-]', '', tbl['title']).strip()
+    story = [Paragraph(f"Thendralla Fincorp — {title}", styles["Title"]),
+             Paragraph(f"Generated {datetime.now().strftime('%d/%m/%Y %H:%M')}" + ("" if data else f" · {len(tbl['rows'])} row(s)"), styles["Normal"]),
+             Paragraph("Filters: " + html.escape(" | ".join(summary).replace("₹", "Rs ")), styles["Normal"]), Spacer(1, 0.3 * cm)]
+    if not data:
+        story.append(_rp_pdf_table(tbl["cols"], tbl["rows"], cell))
+    else:
+        kp = [[k[0], (f"Rs {float(k[1]):,.2f}" if str(k[2]).startswith("inr") else f"{k[1]:,}")] for k in data["kpis"]]
+        half = (len(kp) + 1) // 2
+        grid = [kp[i] + (kp[i + half] if i + half < len(kp) else ["", ""]) for i in range(half)]
+        kt = Table([["Key figure", "Value", "Key figure", "Value"]] + grid, colWidths=[6.5 * cm, 4.5 * cm, 6.5 * cm, 4.5 * cm])
+        kt.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a4fad")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                                ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+                                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#e8f0fb")])]))
+        story += [Paragraph("Key figures", styles["Heading2"]), kt, PageBreak(), Paragraph("Charts", styles["Heading2"])]
+        for ttl, kind, hdr, rows, vcols in _rp_chart_blocks(data):
+            story.append(Paragraph(html.escape(ttl), styles["Heading3"]))
+            dr = _rp_pdf_chart(kind, hdr, rows, vcols) if rows else None
+            if dr: story.append(dr)
+            story += [_rp_pdf_table([[h, "inr" if isinstance(rows[0][i] if rows else None, float) else "text"] for i, h in enumerate(hdr)],
+                                    rows, cell), Spacer(1, 0.4 * cm)]
+        story += [PageBreak(), Paragraph(f"Customers in this filter ({len(data['charts']['cust'])})", styles["Heading2"]),
+                  _rp_pdf_table(RP_CUST_COLS, [r[1:] for r in data["charts"]["cust"]], cell)]
+        for v, lab in REPORT_VIEWS:
+            t = data["tables"][v]
+            story += [PageBreak(), Paragraph(f"{re.sub(r'[^A-Za-z0-9 &()+/-]', '', lab).strip()} ({len(t['rows'])})", styles["Heading2"]),
+                      _rp_pdf_table(t["cols"], t["rows"], cell)]
     SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=1 * cm, rightMargin=1 * cm,
                       topMargin=1.2 * cm, bottomMargin=1.2 * cm).build(story)
     buf.seek(0)
@@ -8743,6 +8915,10 @@ function render(){
   var pl=c.pen.map(function(x){return x[0];});
   mk('ch_pen',{type:'doughnut',data:{labels:pl,datasets:[{data:c.pen.map(function(x){return x[1];}),backgroundColor:['#f59e0b','#7c3aed','#059669','#94a3b8','#dc2626','#0ea5e9'],borderColor:'#fff',borderWidth:2}]},
     options:{plugins:{legend:{position:'right',labels:{boxWidth:12,font:{size:11}}},tooltip:{callbacks:{label:function(t){return t.label+': '+inr(t.parsed);}}}}}},!pl.length);
+  var fl=c.fine.map(function(x){return x[0];}),fcl={'High':'#dc2626','Medium':'#f59e0b','Low':'#059669'};
+  mk('ch_fine',{type:'doughnut',data:{labels:fl,datasets:[{data:c.fine.map(function(x){return x[1];}),backgroundColor:fl.map(function(l){return fcl[l]||'#94a3b8';}),borderColor:'#fff',borderWidth:2}]},
+    options:{onClick:function(){if(F.risk.indexOf('fine')<0)rpToggle('risk','fine');VIEW='fine_risk';},
+      plugins:{legend:{position:'right',labels:{boxWidth:12,font:{size:11}}},tooltip:{callbacks:{label:function(t){var r=c.fine[t.dataIndex];return r[0]+': '+r[1]+' loan(s) · fine '+inr(r[2]);}}}}}},!fl.length);
   mk('ch_top',{type:'bar',data:{labels:c.top.map(function(x){return x[0];}),datasets:[{label:'Outstanding',data:c.top.map(function(x){return x[1];}),backgroundColor:'#dc2626',borderRadius:4}]},
     options:{indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:function(t){return inr(t.parsed.x);}}}},scales:{x:moneyAxis,y:{ticks:{font:{size:10}}}}}},!c.top.length);
   var cu=c.cust;
@@ -8774,12 +8950,13 @@ function renderTable(){
   var shown=rows.slice(0,500);
   $('rpTable').innerHTML='<tr>'+t.cols.map(function(c,i){return '<th data-i="'+i+'">'+esc(c[0])+(SORT.col===i?(SORT.dir>0?' ▲':' ▼'):'')+'</th>';}).join('')+'</tr>'+
     (shown.length?shown.map(function(r){var risky=r.some(function(v,i){return t.cols[i][1]==='risk'&&v==='High';})||r.some(function(v,i){return t.cols[i][1]==='state'&&v==='Missed';});
-      return '<tr'+(risky?' class="row-overdue"':'')+'>'+r.map(function(v,i){var ty=t.cols[i][1];return '<td'+((t.cols[i][0]==='Remarks'||t.cols[i][0]==='Why')?' class="wrap"':'')+'>'+(t.cols[i][0]==='Loan #'?loanLink(d.loan_ids[v],v):cellHtml(v,ty))+'</td>';}).join('')+'</tr>';}).join('')
+      return '<tr'+(risky?' class="row-overdue"':'')+'>'+r.map(function(v,i){var ty=t.cols[i][1];return '<td'+(['Remarks','Why','Fine per vehicle','Approver remarks','Note'].indexOf(t.cols[i][0])>=0?' class="wrap"':'')+'>'+(t.cols[i][0]==='Loan #'?loanLink(d.loan_ids[v],v):cellHtml(v,ty))+'</td>';}).join('')+'</tr>';}).join('')
      :'<tr><td colspan="'+t.cols.length+'" style="text-align:center;color:var(--muted);">No rows for these filters.</td></tr>');
   document.querySelectorAll('#rpTable th').forEach(function(th){th.addEventListener('click',function(){var i=+th.dataset.i;SORT=SORT.col===i?{col:i,dir:-SORT.dir}:{col:i,dir:1};renderTable();});});
   $('rpMore').textContent=rows.length>500?'Showing the first 500 of '+rows.length+' rows — the downloads include every row.':rows.length+' row(s).';
   ['csv','xlsx','pdf'].forEach(function(f){$('dl_'+f).href='/report/export?'+qs({fmt:f,view:VIEW});});
   $('dl_all').href='/report/export?'+qs({fmt:'xlsx',view:'all'});
+  $('dl_allpdf').href='/report/export?'+qs({fmt:'pdf',view:'all'});
 }
 window.rpPng=function(id,name){if(!CH[id])return;var a=document.createElement('a');a.href=CH[id].toBase64Image('image/png',1);a.download=name+'.png';a.click();};
 load();
@@ -8852,6 +9029,7 @@ def report():
         ("ch_status", "🍩 Loan status", "Click a slice to filter"),
         ("ch_vtype", "🚗 Loans by vehicle type", "Click a bar to filter"),
         ("ch_pen", "⚖️ Penalties by status", "Payable penalty amount"),
+        ("ch_fine", "🚓 Police / traffic fine risk", "Active loans with a fine, by fine risk · click to see them"),
     )) + ('<div class="rp-chart wide"><h3><span>👥 Customers in this filter <span id="rpCustN" style="color:var(--muted);font-weight:600;"></span></span>'
           '<span style="font-size:11px;color:var(--muted);font-weight:500;">click a loan number for full details</span></h3>'
           '<div class="hint">Riskiest first: high risk, then the biggest overdue amount</div>'
@@ -8872,7 +9050,8 @@ def report():
             <a class="btn btn-sm btn-success" id="dl_xlsx" href="#">⬇ Excel (this table)</a>
             <a class="btn btn-sm btn-success" id="dl_csv" href="#">⬇ CSV</a>
             <a class="btn btn-sm btn-danger" id="dl_pdf" href="#">⬇ PDF</a>
-            <a class="btn btn-sm btn-primary" id="dl_all" href="#">⬇ Everything (Excel, all tables)</a>
+            <a class="btn btn-sm btn-primary" id="dl_all" href="#" title="KPIs, chart data with charts, customers and every table">⬇ Full report (Excel)</a>
+            <a class="btn btn-sm btn-primary" id="dl_allpdf" href="#" title="KPIs, charts, customers and every table">⬇ Full report (PDF)</a>
           </div>
         </div>
         <div class="rp-tabs" id="rpTabs"></div>
@@ -8903,11 +9082,12 @@ def report_export():
     if fmt == "pdf":
         if not REPORTLAB_AVAILABLE:
             flash("reportlab not installed — PDF unavailable.", "danger"); return redirect(url_for("report"))
-        return send_file(_rp_pdf(data["tables"][views[0]], data["summary"]), as_attachment=True,
-                         download_name=f"report_{views[0]}_{stamp}.pdf", mimetype="application/pdf")
+        full = view == "all"
+        return send_file(_rp_pdf(data["tables"][views[0]], data["summary"], data if full else None), as_attachment=True,
+                         download_name=f"report_{'full' if full else views[0]}_{stamp}.pdf", mimetype="application/pdf")
     if fmt == "xlsx":
         try:
-            return send_file(_rp_xlsx(data, views), as_attachment=True,
+            return send_file(_rp_xlsx(data, views, full=view == "all"), as_attachment=True,
                              download_name=f"report_{'all' if view == 'all' else views[0]}_{stamp}.xlsx",
                              mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except ImportError:
